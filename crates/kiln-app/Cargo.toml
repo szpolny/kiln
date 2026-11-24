@@ -1,0 +1,11 @@
+[package]
+name = "kiln-app"
+version = "0.0.1"
+edition.workspace = true
+
+[[bin]]
+name = "kiln"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
