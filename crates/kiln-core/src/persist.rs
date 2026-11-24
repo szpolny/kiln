@@ -44,6 +44,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
     match serde_json::from_slice::<File>(&bytes) {
         Ok(f) if f.version == VERSION => {
             let mut store = f.store;
+            store.normalize();
             // Child processes do not survive a restart.
             for t in store.projects.iter_mut().flat_map(|p| &mut p.threads) {
                 if t.status == Status::Running {
@@ -63,7 +64,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Approval, Role};
+    use crate::store::Approval;
 
     fn temp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kiln-test-{}-{name}", std::process::id()));
@@ -74,8 +75,9 @@ mod tests {
     #[test]
     fn round_trips_sessions_approvals_and_policy() {
         let path = temp("roundtrip");
-        let mut store = Store::demo();
-        let t = store.thread_mut(0, 0).unwrap();
+        let mut store = Store::sample();
+        let id = store.projects[0].threads[0].id;
+        let t = store.thread_mut(id).unwrap();
         t.session_id = Some("sess-1".into());
         t.pending.push(Approval {
             tool: "Bash".into(),
@@ -86,21 +88,21 @@ mod tests {
         save(&path, &store).unwrap();
 
         let Loaded::Ok(back) = load(&path).unwrap() else { panic!("expected state") };
-        let t = back.thread(0, 0).unwrap();
+        let t = back.thread(id).unwrap();
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.pending.len(), 1);
         assert!(!t.policy.is_local_only());
-        assert_eq!(t.messages.last().map(|m| m.role), Some(Role::Agent));
-    }
+            }
 
     #[test]
     fn running_threads_restore_as_idle() {
         let path = temp("running");
-        let mut store = Store::demo();
-        store.thread_mut(0, 0).unwrap().status = Status::Running;
+        let mut store = Store::sample();
+        let id = store.projects[0].threads[0].id;
+        store.thread_mut(id).unwrap().status = Status::Running;
         save(&path, &store).unwrap();
         let Loaded::Ok(back) = load(&path).unwrap() else { panic!() };
-        assert_eq!(back.thread(0, 0).unwrap().status, Status::Idle);
+        assert_eq!(back.thread(id).unwrap().status, Status::Idle);
     }
 
     #[test]

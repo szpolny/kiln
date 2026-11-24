@@ -5,4 +5,4 @@ pub mod persist;
 pub mod policy;
 pub mod store;
 
-pub use store::{Approval, Message, Project, Role, Status, Store, Thread};
+pub use store::{Agent, Approval, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE};
