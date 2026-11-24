@@ -13,7 +13,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| workspace::Workspace::demo()),
+            |_, cx| cx.new(workspace::Workspace::new),
         )
         .expect("failed to open window");
         cx.activate(true);

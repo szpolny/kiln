@@ -1,38 +1,56 @@
 use crate::theme;
-use gpui::{div, prelude::*, px, Context, IntoElement, Render, SharedString, Window};
-
-#[derive(Clone, Copy, PartialEq)]
-enum Status { Running, NeedsInput, Idle }
-
-struct Thread { title: &'static str, agent: &'static str, status: Status }
-struct Project { name: &'static str, threads: Vec<Thread> }
-struct Message { from_user: bool, body: &'static str }
+use gpui::{
+    div, prelude::*, px, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
+    SharedString, Window,
+};
+use kiln_core::{Message, Role, Status, Store};
 
 pub struct Workspace {
-    projects: Vec<Project>,
+    store: Store,
     selected: (usize, usize),
-    messages: Vec<Message>,
+    draft: String,
+    focus: FocusHandle,
 }
 
 impl Workspace {
-    /// Mock data until the control-plane core exists.
-    pub fn demo() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            projects: vec![
-                Project { name: "kiln", threads: vec![
-                    Thread { title: "Scaffold GPUI shell", agent: "claude", status: Status::Running },
-                    Thread { title: "Sandbox policy draft", agent: "codex", status: Status::NeedsInput },
-                ]},
-                Project { name: "nix", threads: vec![
-                    Thread { title: "Tidy home-manager", agent: "claude", status: Status::Idle },
-                ]},
-            ],
+            store: Store::demo(),
             selected: (0, 0),
-            messages: vec![
-                Message { from_user: true, body: "Set up the app shell." },
-                Message { from_user: false, body: "Done. Sidebar, thread view and composer are in place. All data stays on this machine." },
-            ],
+            draft: String::new(),
+            focus: cx.focus_handle(),
         }
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        if ks.modifiers.platform || ks.modifiers.control {
+            return;
+        }
+        match ks.key.as_str() {
+            "enter" => self.submit(),
+            "backspace" => {
+                self.draft.pop();
+            }
+            _ => {
+                if let Some(ch) = &ks.key_char {
+                    self.draft.push_str(ch);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit(&mut self) {
+        let body = self.draft.trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let (p, t) = self.selected;
+        if let Some(thread) = self.store.thread_mut(p, t) {
+            thread.messages.push(Message { role: Role::User, body });
+        }
+        self.draft.clear();
     }
 
     fn dot(status: Status) -> impl IntoElement {
@@ -48,9 +66,10 @@ impl Workspace {
         let mut col = div().flex().flex_col().gap_3().p_3().w(px(260.)).h_full()
             .bg(theme::sidebar()).border_r_1().border_color(theme::border())
             .child(div().px_2().pt_6().text_sm().text_color(theme::text()).child("Kiln"));
-        for (pi, p) in self.projects.iter().enumerate() {
-            let mut group = div().flex().flex_col().gap_0p5()
-                .child(div().px_2().py_1().text_xs().text_color(theme::muted()).child(p.name));
+        for (pi, p) in self.store.projects.iter().enumerate() {
+            let mut group = div().flex().flex_col().gap_0p5().child(
+                div().px_2().py_1().text_xs().text_color(theme::muted()).child(p.name.clone()),
+            );
             for (ti, t) in p.threads.iter().enumerate() {
                 let active = self.selected == (pi, ti);
                 group = group.child(
@@ -60,13 +79,14 @@ impl Workspace {
                         .when(active, |d| d.bg(theme::hover()))
                         .hover(|d| d.bg(theme::hover()))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected = (pi, ti);
+                            window.focus(&this.focus);
                             cx.notify();
                         }))
                         .child(Self::dot(t.status))
-                        .child(div().flex_1().child(t.title))
-                        .child(div().text_xs().text_color(theme::muted()).child(t.agent)),
+                        .child(div().flex_1().child(t.title.clone()))
+                        .child(div().text_xs().text_color(theme::muted()).child(t.agent.clone())),
                 );
             }
             col = col.child(group);
@@ -74,42 +94,61 @@ impl Workspace {
         col
     }
 
-    fn thread(&self) -> impl IntoElement {
-        let t = &self.projects[self.selected.0].threads[self.selected.1];
+    fn thread(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (p, t) = self.selected;
+        let thread = self.store.thread(p, t).expect("selected thread exists");
         let mut msgs = div().flex().flex_col().gap_4().flex_1().p_6();
-        for m in &self.messages {
+        for m in &thread.messages {
+            let user = m.role == Role::User;
             msgs = msgs.child(
-                div().flex().when(m.from_user, |d| d.justify_end()).child(
+                div().flex().when(user, |d| d.justify_end()).child(
                     div().max_w(px(560.)).px_3().py_2().rounded_lg().text_sm()
                         .text_color(theme::text())
-                        .when(m.from_user, |d| d.bg(theme::surface()))
-                        .child(m.body),
+                        .when(user, |d| d.bg(theme::surface()))
+                        .child(m.body.clone()),
                 ),
             );
         }
+        let composer_text = if self.draft.is_empty() {
+            div().text_color(theme::muted()).child("Ask anything…")
+        } else {
+            div().text_color(theme::text()).child(format!("{}▏", self.draft))
+        };
+        let badge = if thread.policy.is_local_only() { "● local only" } else { "○ network allowed" };
         div().flex().flex_col().flex_1().h_full()
             .child(
                 div().flex().items_center().gap_2().px_4().h(px(44.))
                     .border_b_1().border_color(theme::border())
-                    .text_sm().text_color(theme::text()).child(t.title)
-                    .child(div().text_xs().text_color(theme::ok()).child("● local only")),
+                    .text_sm().text_color(theme::text()).child(thread.title.clone())
+                    .child(div().text_xs().text_color(theme::ok()).child(badge)),
             )
             .child(msgs)
             .child(
                 div().p_4().child(
-                    div().px_4().py_3().rounded_xl().bg(theme::surface())
+                    div().id("composer").track_focus(&self.focus)
+                        .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
+                        .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
+                        .px_4().py_3().rounded_xl().bg(theme::surface())
                         .border_1().border_color(theme::border())
-                        .text_sm().text_color(theme::muted())
-                        .child("Ask anything, or @mention a file…"),
+                        .text_sm().child(composer_text),
                 ),
             )
     }
 }
 
+impl Focusable for Workspace {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for Workspace {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
         div().flex().size_full().bg(theme::bg()).text_color(theme::text())
             .child(self.sidebar(cx))
-            .child(self.thread())
+            .child(self.thread(cx))
     }
 }

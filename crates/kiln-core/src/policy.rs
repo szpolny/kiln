@@ -1,0 +1,69 @@
+//! Privacy policy. Default is deny: an agent gets nothing it was not granted.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Read or write files inside the project directory.
+    ProjectFiles,
+    /// Read or write files outside the project directory.
+    OutsideFiles,
+    /// Any outbound network connection.
+    Network,
+    /// Run a shell command.
+    Exec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub project_files: Decision,
+    pub outside_files: Decision,
+    pub network: Decision,
+    pub exec: Decision,
+}
+
+impl Default for Policy {
+    /// Local-only: project files are fine, everything else needs a human.
+    fn default() -> Self {
+        Self {
+            project_files: Decision::Allow,
+            outside_files: Decision::Deny,
+            network: Decision::Deny,
+            exec: Decision::Ask,
+        }
+    }
+}
+
+impl Policy {
+    pub fn decide(&self, cap: Capability) -> Decision {
+        match cap {
+            Capability::ProjectFiles => self.project_files,
+            Capability::OutsideFiles => self.outside_files,
+            Capability::Network => self.network,
+            Capability::Exec => self.exec,
+        }
+    }
+
+    pub fn is_local_only(&self) -> bool {
+        self.network == Decision::Deny
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_is_local_only() {
+        let p = Policy::default();
+        assert!(p.is_local_only());
+        assert_eq!(p.decide(Capability::Network), Decision::Deny);
+        assert_eq!(p.decide(Capability::OutsideFiles), Decision::Deny);
+        assert_eq!(p.decide(Capability::Exec), Decision::Ask);
+    }
+}

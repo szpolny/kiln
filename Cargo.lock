@@ -2857,7 +2857,12 @@ name = "kiln-app"
 version = "0.0.1"
 dependencies = [
  "gpui",
+ "kiln-core",
 ]
+
+[[package]]
+name = "kiln-core"
+version = "0.0.1"
 
 [[package]]
 name = "kurbo"
