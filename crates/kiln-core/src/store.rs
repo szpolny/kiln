@@ -1,26 +1,27 @@
+use serde::{Deserialize, Serialize};
 use crate::policy::Policy;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Running,
     NeedsInput,
     Idle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
     Agent,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub body: String,
 }
 
 /// An action the agent was denied and a human must decide on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
     pub tool: String,
     /// What the user sees, e.g. the shell command.
@@ -29,7 +30,7 @@ pub struct Approval {
     pub rule: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     pub title: String,
     pub agent: String,
@@ -44,14 +45,14 @@ pub struct Thread {
     pub auto_allow: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
     pub dir: std::path::PathBuf,
     pub threads: Vec<Thread>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
     pub projects: Vec<Project>,
 }

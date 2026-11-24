@@ -5,10 +5,13 @@ use gpui::{
 };
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
+use kiln_core::persist::{self, Loaded};
 use kiln_core::{Approval, Message, Role, Status, Store};
 
 pub struct Workspace {
     store: Store,
+    /// None disables saving (e.g. the existing file could not be read).
+    state_path: Option<std::path::PathBuf>,
     selected: (usize, usize),
     draft: String,
     focus: FocusHandle,
@@ -16,11 +19,33 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let path = state_path();
+        let (store, state_path) = match persist::load(&path) {
+            Ok(Loaded::Ok(store)) if !store.projects.is_empty() => (store, Some(path)),
+            Ok(Loaded::Corrupt(aside)) => {
+                eprintln!("kiln: unreadable state moved to {}", aside.display());
+                (Store::demo(), Some(path))
+            }
+            Ok(_) => (Store::demo(), Some(path)),
+            Err(e) => {
+                eprintln!("kiln: cannot read {}: {e}; saving disabled", path.display());
+                (Store::demo(), None)
+            }
+        };
         Self {
-            store: Store::demo(),
+            store,
+            state_path,
             selected: (0, 0),
             draft: String::new(),
             focus: cx.focus_handle(),
+        }
+    }
+
+    fn save(&self) {
+        if let Some(path) = &self.state_path {
+            if let Err(e) = persist::save(path, &self.store) {
+                eprintln!("kiln: could not save state: {e}");
+            }
         }
     }
 
@@ -59,6 +84,7 @@ impl Workspace {
         thread.pending.clear();
         thread.messages.push(Message { role: Role::User, body: body.clone() });
         self.draft.clear();
+        self.save();
         self.start_turn(p, t, body, vec![], cx);
     }
 
@@ -90,7 +116,12 @@ impl Workspace {
             while let Ok(ev) = rx.recv().await {
                 let done = matches!(ev, AgentEvent::Done { .. });
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(rules) = this.apply(p, t, ev) {
+                    let finished = matches!(ev, AgentEvent::Done { .. });
+                    let retry = this.apply(p, t, ev);
+                    if finished {
+                        this.save();
+                    }
+                    if let Some(rules) = retry {
                         let go = "Permission granted for the denied action. Continue.".to_string();
                         this.start_turn(p, t, go, rules, cx);
                     }
@@ -146,6 +177,7 @@ impl Workspace {
         let a = thread.pending.remove(idx);
         thread.messages.push(Message { role: Role::User, body: format!("✓ Allowed: {}", a.summary) });
         let go = "Permission granted for the denied action. Continue.".to_string();
+        self.save();
         self.start_turn(p, t, go, vec![a.rule], cx);
     }
 
@@ -161,6 +193,7 @@ impl Workspace {
         if thread.pending.is_empty() {
             thread.status = Status::Idle;
         }
+        self.save();
         cx.notify();
     }
 
@@ -293,4 +326,21 @@ impl Render for Workspace {
             .child(self.sidebar(cx))
             .child(self.thread(cx))
     }
+}
+
+/// `KILN_STATE_DIR` overrides the location so dev and test runs never touch real data.
+fn state_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(dir) = std::env::var_os("KILN_STATE_DIR") {
+        return PathBuf::from(dir).join("state.json");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Kiln")
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(|d| PathBuf::from(d).join("kiln"))
+            .unwrap_or_else(|| home.join(".local/share/kiln"))
+    };
+    base.join("state.json")
 }

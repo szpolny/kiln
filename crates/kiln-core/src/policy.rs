@@ -1,6 +1,8 @@
 //! Privacy policy. Default is deny: an agent gets nothing it was not granted.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     /// Read or write files inside the project directory.
     ProjectFiles,
@@ -12,14 +14,14 @@ pub enum Capability {
     Exec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Allow,
     Ask,
     Deny,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub project_files: Decision,
     pub outside_files: Decision,
