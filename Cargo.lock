@@ -2853,10 +2853,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-agent"
+version = "0.0.1"
+dependencies = [
+ "async-channel 2.5.0",
+ "serde_json",
+]
+
+[[package]]
 name = "kiln-app"
 version = "0.0.1"
 dependencies = [
  "gpui",
+ "kiln-agent",
  "kiln-core",
 ]
 

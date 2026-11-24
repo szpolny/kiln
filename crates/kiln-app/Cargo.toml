@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 gpui = "0.2.2"
 kiln-core = { path = "../kiln-core" }
+kiln-agent = { path = "../kiln-agent" }

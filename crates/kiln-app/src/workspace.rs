@@ -3,6 +3,7 @@ use gpui::{
     div, prelude::*, px, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
     SharedString, Window,
 };
+use kiln_agent::{claude, AgentEvent};
 use kiln_core::{Message, Role, Status, Store};
 
 pub struct Workspace {
@@ -28,7 +29,7 @@ impl Workspace {
             return;
         }
         match ks.key.as_str() {
-            "enter" => self.submit(),
+            "enter" => self.submit(cx),
             "backspace" => {
                 self.draft.pop();
             }
@@ -41,16 +42,61 @@ impl Workspace {
         cx.notify();
     }
 
-    fn submit(&mut self) {
+    fn submit(&mut self, cx: &mut Context<Self>) {
         let body = self.draft.trim().to_string();
+        let (p, t) = self.selected;
         if body.is_empty() {
             return;
         }
-        let (p, t) = self.selected;
-        if let Some(thread) = self.store.thread_mut(p, t) {
-            thread.messages.push(Message { role: Role::User, body });
+        let Some(project_dir) = self.store.projects.get(p).map(|pr| pr.dir.clone()) else {
+            return;
+        };
+        let Some(thread) = self.store.thread_mut(p, t) else {
+            return;
+        };
+        if thread.status == Status::Running {
+            return; // one turn at a time per thread
         }
+        thread.messages.push(Message { role: Role::User, body: body.clone() });
+        thread.status = Status::Running;
+        let rx = claude::run(claude::Turn {
+            dir: project_dir,
+            prompt: body,
+            resume: thread.session_id.clone(),
+        });
         self.draft.clear();
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = rx.recv().await {
+                let done = matches!(ev, AgentEvent::Done { .. });
+                let _ = this.update(cx, |this, cx| {
+                    this.apply(p, t, ev);
+                    cx.notify();
+                });
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply(&mut self, p: usize, t: usize, ev: AgentEvent) {
+        let Some(thread) = self.store.thread_mut(p, t) else {
+            return;
+        };
+        let agent_msg = |body: String| Message { role: Role::Agent, body };
+        match ev {
+            AgentEvent::Session(id) => thread.session_id = Some(id),
+            AgentEvent::Text(text) => thread.messages.push(agent_msg(text)),
+            AgentEvent::Tool(name) => thread.messages.push(agent_msg(format!("⚙ {name}"))),
+            AgentEvent::Done { error } => {
+                thread.status = if error.is_some() { Status::NeedsInput } else { Status::Idle };
+                if let Some(e) = error {
+                    thread.messages.push(agent_msg(format!("Error: {e}")));
+                }
+            }
+        }
     }
 
     fn dot(status: Status) -> impl IntoElement {

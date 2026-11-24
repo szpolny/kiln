@@ -11,6 +11,8 @@ Kiln is a privacy-first control plane for coding agents, written in Rust with GP
 
 ## Layout
 
+- `crates/kiln-core`: pure domain model and privacy policy (no I/O).
+- `crates/kiln-agent`: agent adapters that run providers as local child processes.
 - `crates/kiln-app`: the GPUI application (binary `kiln`).
 
 ## Commands

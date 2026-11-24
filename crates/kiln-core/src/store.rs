@@ -26,11 +26,14 @@ pub struct Thread {
     pub status: Status,
     pub policy: Policy,
     pub messages: Vec<Message>,
+    /// Provider session id, used to resume the conversation.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Project {
     pub name: String,
+    pub dir: std::path::PathBuf,
     pub threads: Vec<Thread>,
 }
 
@@ -47,15 +50,18 @@ impl Store {
             agent: agent.into(),
             status,
             policy: Policy::default(),
+            session_id: None,
             messages: msgs
                 .iter()
                 .map(|(role, b)| Message { role: *role, body: (*b).into() })
                 .collect(),
         };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
         Self {
             projects: vec![
                 Project {
                     name: "kiln".into(),
+                    dir: home.join("source/kiln"),
                     threads: vec![
                         t("Scaffold GPUI shell", "claude", Status::Running, &[
                             (Role::User, "Set up the app shell."),
@@ -68,6 +74,7 @@ impl Store {
                 },
                 Project {
                     name: "nix".into(),
+                    dir: home.join("nix"),
                     threads: vec![t("Tidy home-manager", "claude", Status::Idle, &[])],
                 },
             ],
