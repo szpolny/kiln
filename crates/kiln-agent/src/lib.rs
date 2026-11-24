@@ -8,6 +8,8 @@ pub enum AgentEvent {
     Session(String),
     Text(String),
     Tool(String),
+    /// The provider refused an action pending human approval.
+    Denied { tool: String, summary: String, rule: String },
     /// The turn finished. `error` carries a message when it failed.
     Done { error: Option<String> },
 }

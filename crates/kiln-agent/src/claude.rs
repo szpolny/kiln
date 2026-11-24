@@ -36,6 +36,12 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             }
         }
         Some("result") => {
+            for d in v["permission_denials"].as_array().into_iter().flatten() {
+                if let Some(tool) = d["tool_name"].as_str() {
+                    let (summary, rule) = describe_denial(tool, &d["tool_input"]);
+                    out.push(AgentEvent::Denied { tool: tool.to_string(), summary, rule });
+                }
+            }
             let error = (v["is_error"] == true)
                 .then(|| v["result"].as_str().unwrap_or("agent failed").to_string());
             out.push(AgentEvent::Done { error });
@@ -45,10 +51,25 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     out
 }
 
+/// Human-readable summary plus the narrowest allow rule for a denied call.
+fn describe_denial(tool: &str, input: &Value) -> (String, String) {
+    if let Some(cmd) = input["command"].as_str() {
+        return (cmd.to_string(), format!("{tool}({cmd})"));
+    }
+    if let Some(path) = input["file_path"].as_str() {
+        return (format!("{tool} {path}"), format!("{tool}({path})"));
+    }
+    let mut detail = input.to_string();
+    detail.truncate(120);
+    (format!("{tool} {detail}"), tool.to_string())
+}
+
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
     pub resume: Option<String>,
+    /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
+    pub allowed_tools: Vec<String>,
 }
 
 /// Start a turn. Events arrive on the returned channel; it closes when the
@@ -67,6 +88,9 @@ pub fn run(turn: Turn) -> async_channel::Receiver<AgentEvent> {
             .stdin(Stdio::null());
         if let Some(id) = &turn.resume {
             cmd.args(["--resume", id]);
+        }
+        if !turn.allowed_tools.is_empty() {
+            cmd.arg("--allowedTools").args(&turn.allowed_tools);
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -124,6 +148,32 @@ mod tests {
     }
 
     #[test]
+    fn denials_become_scoped_rules() {
+        let evs = parse_line(
+            r#"{"type":"result","is_error":false,"permission_denials":[
+              {"tool_name":"Bash","tool_input":{"command":"touch a.txt"}},
+              {"tool_name":"Edit","tool_input":{"file_path":"/p/x.rs"}}]}"#,
+        );
+        assert_eq!(
+            evs[0],
+            AgentEvent::Denied {
+                tool: "Bash".into(),
+                summary: "touch a.txt".into(),
+                rule: "Bash(touch a.txt)".into()
+            }
+        );
+        assert_eq!(
+            evs[1],
+            AgentEvent::Denied {
+                tool: "Edit".into(),
+                summary: "Edit /p/x.rs".into(),
+                rule: "Edit(/p/x.rs)".into()
+            }
+        );
+        assert_eq!(evs[2], AgentEvent::Done { error: None });
+    }
+
+    #[test]
     fn ignores_noise() {
         assert!(parse_line("not json").is_empty());
         assert!(parse_line(r#"{"type":"rate_limit_event"}"#).is_empty());
@@ -132,6 +182,48 @@ mod tests {
 
 #[cfg(test)]
 mod live {
+    /// Deny, then approve with a scoped rule and resume: the file appears.
+    #[test]
+    #[ignore]
+    fn live_denial_then_scoped_approval() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("kiln-approval-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collect = |t: Turn| -> Vec<AgentEvent> {
+            let rx = run(t);
+            std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
+        };
+        let first = collect(Turn {
+            dir: dir.clone(),
+            prompt: "run the shell command: touch approved.txt".into(),
+            resume: None,
+            allowed_tools: vec![],
+        });
+        let session = first.iter().find_map(|e| match e {
+            AgentEvent::Session(id) => Some(id.clone()),
+            _ => None,
+        });
+        let rule = first.iter().find_map(|e| match e {
+            AgentEvent::Denied { rule, .. } => Some(rule.clone()),
+            _ => None,
+        });
+        let Some(rule) = rule else {
+            // Claude's own rules decided not to ask in this directory; nothing to approve.
+            eprintln!("no denial in this directory; skipping approval half");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert!(!dir.join("approved.txt").exists());
+        collect(Turn {
+            dir: dir.clone(),
+            prompt: "Permission granted. Run it now.".into(),
+            resume: session,
+            allowed_tools: vec![rule],
+        });
+        assert!(dir.join("approved.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// Needs the `claude` CLI and network: `cargo test -p kiln-agent -- --ignored`.
@@ -142,6 +234,7 @@ mod live {
             dir: std::env::temp_dir(),
             prompt: "reply with the single word: ok".into(),
             resume: None,
+            allowed_tools: vec![],
         });
         let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Session(_))));

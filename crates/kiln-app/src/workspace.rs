@@ -4,7 +4,8 @@ use gpui::{
     SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
-use kiln_core::{Message, Role, Status, Store};
+use kiln_core::policy::{capability_for_tool, Decision};
+use kiln_core::{Approval, Message, Role, Status, Store};
 
 pub struct Workspace {
     store: Store,
@@ -48,29 +49,51 @@ impl Workspace {
         if body.is_empty() {
             return;
         }
-        let Some(project_dir) = self.store.projects.get(p).map(|pr| pr.dir.clone()) else {
-            return;
-        };
         let Some(thread) = self.store.thread_mut(p, t) else {
             return;
         };
         if thread.status == Status::Running {
             return; // one turn at a time per thread
         }
+        // A new message supersedes anything still waiting for approval.
+        thread.pending.clear();
         thread.messages.push(Message { role: Role::User, body: body.clone() });
+        self.draft.clear();
+        self.start_turn(p, t, body, vec![], cx);
+    }
+
+    /// Run one agent turn and fold its events into the thread.
+    fn start_turn(
+        &mut self,
+        p: usize,
+        t: usize,
+        prompt: String,
+        allowed_tools: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = self.store.projects.get(p).map(|pr| pr.dir.clone()) else {
+            return;
+        };
+        let Some(thread) = self.store.thread_mut(p, t) else {
+            return;
+        };
         thread.status = Status::Running;
         let rx = claude::run(claude::Turn {
-            dir: project_dir,
-            prompt: body,
+            dir,
+            prompt,
             resume: thread.session_id.clone(),
+            allowed_tools,
         });
-        self.draft.clear();
+        cx.notify();
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 let done = matches!(ev, AgentEvent::Done { .. });
                 let _ = this.update(cx, |this, cx| {
-                    this.apply(p, t, ev);
+                    if let Some(rules) = this.apply(p, t, ev) {
+                        let go = "Permission granted for the denied action. Continue.".to_string();
+                        this.start_turn(p, t, go, rules, cx);
+                    }
                     cx.notify();
                 });
                 if done {
@@ -81,22 +104,94 @@ impl Workspace {
         .detach();
     }
 
-    fn apply(&mut self, p: usize, t: usize, ev: AgentEvent) {
-        let Some(thread) = self.store.thread_mut(p, t) else {
-            return;
-        };
+    /// Returns rules to retry with when the policy pre-approved denied actions.
+    fn apply(&mut self, p: usize, t: usize, ev: AgentEvent) -> Option<Vec<String>> {
+        let thread = self.store.thread_mut(p, t)?;
         let agent_msg = |body: String| Message { role: Role::Agent, body };
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
             AgentEvent::Text(text) => thread.messages.push(agent_msg(text)),
             AgentEvent::Tool(name) => thread.messages.push(agent_msg(format!("⚙ {name}"))),
+            AgentEvent::Denied { tool, summary, rule } => {
+                match thread.policy.decide(capability_for_tool(&tool)) {
+                    Decision::Allow => thread.auto_allow.push(rule),
+                    Decision::Deny => thread
+                        .messages
+                        .push(agent_msg(format!("Blocked by policy: {summary}"))),
+                    Decision::Ask => thread.pending.push(Approval { tool, summary, rule }),
+                }
+            }
             AgentEvent::Done { error } => {
-                thread.status = if error.is_some() { Status::NeedsInput } else { Status::Idle };
                 if let Some(e) = error {
+                    thread.status = Status::NeedsInput;
                     thread.messages.push(agent_msg(format!("Error: {e}")));
+                } else if !thread.auto_allow.is_empty() {
+                    return Some(std::mem::take(&mut thread.auto_allow));
+                } else {
+                    thread.status =
+                        if thread.pending.is_empty() { Status::Idle } else { Status::NeedsInput };
                 }
             }
         }
+        None
+    }
+
+    fn approve(&mut self, p: usize, t: usize, idx: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(p, t) else {
+            return;
+        };
+        if idx >= thread.pending.len() {
+            return;
+        }
+        let a = thread.pending.remove(idx);
+        thread.messages.push(Message { role: Role::User, body: format!("✓ Allowed: {}", a.summary) });
+        let go = "Permission granted for the denied action. Continue.".to_string();
+        self.start_turn(p, t, go, vec![a.rule], cx);
+    }
+
+    fn deny(&mut self, p: usize, t: usize, idx: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(p, t) else {
+            return;
+        };
+        if idx >= thread.pending.len() {
+            return;
+        }
+        let a = thread.pending.remove(idx);
+        thread.messages.push(Message { role: Role::User, body: format!("✗ Denied: {}", a.summary) });
+        if thread.pending.is_empty() {
+            thread.status = Status::Idle;
+        }
+        cx.notify();
+    }
+
+    fn approval_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (p, t) = self.selected;
+        let mut col = div().flex().flex_col().gap_2().px_4();
+        let pending = self.store.thread(p, t).map(|th| th.pending.clone()).unwrap_or_default();
+        for (i, a) in pending.into_iter().enumerate() {
+            let button = |id: String, label: &'static str, primary: bool| {
+                div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
+                    .cursor_pointer().border_1().border_color(theme::border())
+                    .when(primary, |d| d.bg(theme::accent()).text_color(theme::bg()))
+                    .when(!primary, |d| d.text_color(theme::text()).hover(|h| h.bg(theme::hover())))
+                    .child(label)
+            };
+            col = col.child(
+                div().flex().items_center().gap_3().px_3().py_2().rounded_lg()
+                    .bg(theme::surface()).border_1().border_color(theme::warn())
+                    .child(
+                        div().flex().flex_col().flex_1().gap_0p5()
+                            .child(div().text_xs().text_color(theme::warn())
+                                .child(format!("{} needs approval", a.tool)))
+                            .child(div().text_sm().text_color(theme::text()).child(a.summary)),
+                    )
+                    .child(button(format!("allow{i}"), "Allow", true)
+                        .on_click(cx.listener(move |this, _, _, cx| this.approve(p, t, i, cx))))
+                    .child(button(format!("deny{i}"), "Deny", false)
+                        .on_click(cx.listener(move |this, _, _, cx| this.deny(p, t, i, cx)))),
+            );
+        }
+        col
     }
 
     fn dot(status: Status) -> impl IntoElement {
@@ -169,6 +264,7 @@ impl Workspace {
                     .child(div().text_xs().text_color(theme::ok()).child(badge)),
             )
             .child(msgs)
+            .child(self.approval_cards(cx))
             .child(
                 div().p_4().child(
                     div().id("composer").track_focus(&self.focus)

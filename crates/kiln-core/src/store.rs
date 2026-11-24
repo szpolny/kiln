@@ -19,6 +19,16 @@ pub struct Message {
     pub body: String,
 }
 
+/// An action the agent was denied and a human must decide on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    pub tool: String,
+    /// What the user sees, e.g. the shell command.
+    pub summary: String,
+    /// Narrow allow rule used if the user approves.
+    pub rule: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Thread {
     pub title: String,
@@ -28,6 +38,10 @@ pub struct Thread {
     pub messages: Vec<Message>,
     /// Provider session id, used to resume the conversation.
     pub session_id: Option<String>,
+    /// Denied actions waiting for the user.
+    pub pending: Vec<Approval>,
+    /// Rules the policy already allows; sent with the automatic retry.
+    pub auto_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +65,8 @@ impl Store {
             status,
             policy: Policy::default(),
             session_id: None,
+            pending: vec![],
+            auto_allow: vec![],
             messages: msgs
                 .iter()
                 .map(|(role, b)| Message { role: *role, body: (*b).into() })

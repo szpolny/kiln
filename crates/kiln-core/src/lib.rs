@@ -4,4 +4,4 @@
 pub mod policy;
 pub mod store;
 
-pub use store::{Message, Project, Role, Status, Store, Thread};
+pub use store::{Approval, Message, Project, Role, Status, Store, Thread};

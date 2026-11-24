@@ -54,9 +54,29 @@ impl Policy {
     }
 }
 
+/// Which capability a provider tool needs. Unknown tools are treated as
+/// `Exec`, the strictest default that still lets a human decide.
+pub fn capability_for_tool(tool: &str) -> Capability {
+    match tool {
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Glob" | "Grep" => {
+            Capability::ProjectFiles
+        }
+        "WebFetch" | "WebSearch" => Capability::Network,
+        _ => Capability::Exec,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_map_to_capabilities() {
+        assert_eq!(capability_for_tool("Bash"), Capability::Exec);
+        assert_eq!(capability_for_tool("Edit"), Capability::ProjectFiles);
+        assert_eq!(capability_for_tool("WebFetch"), Capability::Network);
+        assert_eq!(capability_for_tool("SomethingNew"), Capability::Exec);
+    }
 
     #[test]
     fn default_policy_is_local_only() {
