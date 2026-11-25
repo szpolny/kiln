@@ -17,6 +17,7 @@ Kiln is a privacy-first control plane for coding agents, written in Rust with GP
 
 ## Commands
 
+- With Nix, run `direnv allow` once (or `nix develop`) to get the toolchain and Linux system libraries from `flake.nix`.
 - `cargo build` / `cargo run -p kiln-app`: build and launch. macOS needs Xcode's Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 - `cargo clippy --all-targets` and `cargo test`: run before committing.
 
