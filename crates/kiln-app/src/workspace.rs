@@ -90,6 +90,10 @@ pub struct Workspace {
     transcript_built: Option<(usize, bool)>,
     /// Expanded work, by thread id and the index of its first message.
     open_work: HashSet<(u64, usize)>,
+    /// Expanded groups of consecutive tool calls, by thread and first message.
+    open_tool_groups: HashSet<(u64, usize)>,
+    /// Expanded tool calls, by thread id and message index.
+    open_tools: HashSet<(u64, usize)>,
     /// Parsed replies of that thread by message index, so frames do not reparse.
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
     /// The dropdown menu that is open, if any.
@@ -175,6 +179,8 @@ impl Workspace {
             transcript_thread: None,
             transcript_built: None,
             open_work: HashSet::new(),
+            open_tool_groups: HashSet::new(),
+            open_tools: HashSet::new(),
             parsed: HashMap::new(),
             menu: None,
             model_scroll: ScrollHandle::new(),
@@ -256,14 +262,23 @@ impl Workspace {
             return;
         }
         let entries = thread.map_or_else(Vec::new, |t| {
-            transcript::entries(&t.messages, built.1, |at| self.open_work.contains(&(t.id, at)))
+            transcript::entries(
+                &t.messages,
+                built.1,
+                |at| self.open_work.contains(&(t.id, at)),
+                |at| self.open_tool_groups.contains(&(t.id, at)),
+            )
         });
         if switched {
             self.transcript.reset(entries.len());
             self.parsed.clear();
             self.transcript_thread = self.selected;
         } else {
-            let same = |(a, b): &(&Entry, &Entry)| a == b;
+            let same = |(a, b): &(&Entry, &Entry)| match (a, b) {
+                // A running group can grow without moving the existing rows.
+                (Entry::ToolGroup { start: a, .. }, Entry::ToolGroup { start: b, .. }) => a == b,
+                _ => a == b,
+            };
             let head = self.entries.iter().zip(&entries).take_while(same).count();
             let tail = self.entries[head..].iter().rev()
                 .zip(entries[head..].iter().rev())
@@ -284,14 +299,17 @@ impl Workspace {
         if !self.open_work.remove(&(id, at)) {
             self.open_work.insert((id, at));
         }
-        // A list resting at the end would grow upwards and carry the clicked row
-        // away. Anchor it at the row now at the top instead.
+        self.anchor_transcript();
+        self.transcript_built = None;
+        cx.notify();
+    }
+
+    /// Keep a disclosure header in view when opening it in a bottom-aligned list.
+    fn anchor_transcript(&self) {
         if self.transcript.logical_scroll_top().item_ix >= self.transcript.item_count() {
             let view = self.transcript.viewport_bounds().size.height;
             self.transcript.scroll_by(px(TRANSCRIPT_PADDING * 2.) - view);
         }
-        self.transcript_built = None;
-        cx.notify();
     }
 
     pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
@@ -342,6 +360,8 @@ impl Workspace {
 
     pub(crate) fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
         if self.store.delete_thread(id) {
+            self.open_tools.retain(|&(thread, _)| thread != id);
+            self.open_tool_groups.retain(|&(thread, _)| thread != id);
             if self.selected == Some(id) {
                 self.selected = self.store.first_thread_id();
             }
@@ -352,6 +372,8 @@ impl Workspace {
 
     pub(crate) fn remove_project(&mut self, p: usize, cx: &mut Context<Self>) {
         if self.store.remove_project(p) {
+            self.open_tools.retain(|&(id, _)| self.store.locate(id).is_some());
+            self.open_tool_groups.retain(|&(id, _)| self.store.locate(id).is_some());
             if self.selected.is_some_and(|id| self.store.locate(id).is_none()) {
                 self.selected = self.store.first_thread_id();
             }
@@ -1181,11 +1203,38 @@ impl Workspace {
 
     fn entry(&mut self, id: u64, row: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         match self.entries.get(row) {
-            Some(&Entry::Message(ix)) => self.message(id, ix),
+            Some(&Entry::Message(ix)) => self.message(id, ix, false, cx),
+            Some(&Entry::GroupedTool(ix)) => self.message(id, ix, true, cx),
+            Some(&Entry::ToolGroup { start, count }) => self.tool_group_row(id, start, count, cx),
             Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
             Some(&Entry::Activity) => self.turn_activity(id).into_any_element(),
             None => div().into_any_element(),
         }
+    }
+
+    fn tool_group_row(&self, id: u64, start: usize, count: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let open = self.open_tool_groups.contains(&(id, start));
+        let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
+        centered(
+            div().id(("tool-group", start)).flex().items_center().gap_2().px_3().py_1p5()
+                .rounded(px(8.)).bg(theme.fill).border_1().border_color(theme.border)
+                .text_xs().text_color(theme.muted).cursor_pointer()
+                .hover(|h| h.bg(theme.hover))
+                .child(assets::icon(assets::Icon::Layers, 13.))
+                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text).child(format!("{count} tool calls")))
+                .child(assets::icon(chevron, 13.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.open_tool_groups.remove(&(id, start)) {
+                        this.open_tool_groups.insert((id, start));
+                    }
+                    this.anchor_transcript();
+                    this.transcript_built = None;
+                    cx.notify();
+                })),
+        )
+        .px_6().py_1p5().into_any_element()
     }
 
     /// Stands for what the agent did before it replied; a click shows or hides
@@ -1225,14 +1274,14 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn message(&mut self, id: u64, ix: usize) -> gpui::AnyElement {
+    fn message(&mut self, id: u64, ix: usize, grouped: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
             return div().into_any_element();
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
         let content = match (&m.tool, m.role) {
-            (Some(name), _) => self.tool_call(name, &m.body).into_any_element(),
+            (Some(name), _) => self.tool_call(id, ix, name, &m.body, cx).into_any_element(),
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
                     .bg(theme.accent).text_color(theme.on_accent)
@@ -1246,17 +1295,59 @@ impl Workspace {
                 .child(m.body.clone())
                 .into_any_element(),
         };
-        centered(content).px_6().py_1p5().into_any_element()
+        centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6().py_1p5().into_any_element()
     }
 
-    /// The exact tool name and its input, as the agent sent them.
-    fn tool_call(&self, name: &str, input: &str) -> impl IntoElement {
+    fn tool_call(
+        &self,
+        id: u64,
+        ix: usize,
+        name: &str,
+        input: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
-        div().flex().flex_col().w_full().min_w_0().rounded(px(10.)).bg(theme.fill)
+        let open = self.open_tools.contains(&(id, ix));
+        let preview = input.lines().next().unwrap_or_default().trim();
+        let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
+        let header = div().flex().items_center().gap_2().min_w_0().px_3().py_1p5().text_xs()
+            .child(assets::icon(assets::Icon::Wrench, 13.))
+            .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text).child(name.to_string()))
+            .child(div().flex_1().min_w_0().truncate().font_family(MONO)
+                .when(!open && !preview.is_empty(), |d| {
+                    let mut chars = preview.chars();
+                    let mut summary: String = chars.by_ref().take(120).collect();
+                    if chars.next().is_some() {
+                        summary.push('…');
+                    }
+                    d.child(summary)
+                }));
+        let header = if input.is_empty() {
+            header.into_any_element()
+        } else {
+            header.id(("tool", ix))
+                .cursor_pointer().hover(|h| h.bg(theme.hover))
+                .child(assets::icon(chevron, 13.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.open_tools.remove(&(id, ix)) {
+                        this.open_tools.insert((id, ix));
+                    }
+                    this.anchor_transcript();
+                    if let Some(row) = this.entries.iter().position(|entry| {
+                        matches!(*entry, Entry::Message(index) | Entry::GroupedTool(index) if index == ix)
+                    }) {
+                        this.transcript.remeasure_items(row..row + 1);
+                    }
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        div().flex().flex_col().w_full().min_w_0().rounded(px(8.)).overflow_hidden().bg(theme.fill)
             .border_1().border_color(theme.border)
-            .child(div().px_3().py_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted).child(name.to_string()))
-            .when(!input.is_empty(), |d| {
+            .text_color(theme.muted)
+            .child(header)
+            .when(open, |d| {
                 d.child(div().px_3().py_2().border_t_1().border_color(theme.border)
                     .font_family(MONO).text_xs().line_height(relative(1.6))
                     .text_color(theme.text).child(input.to_string()))

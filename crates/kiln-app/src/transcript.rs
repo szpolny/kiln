@@ -12,6 +12,9 @@ pub enum Entry {
     /// The row that opens and closes the work starting at message `start`.
     /// `reply` is the last message of the reply it led to.
     Work { start: usize, reply: usize },
+    /// A contiguous run of tool calls. Its children remain virtualized.
+    ToolGroup { start: usize, count: usize },
+    GroupedTool(usize),
     /// Live turn status after the latest message.
     Activity,
 }
@@ -50,9 +53,14 @@ where
 }
 
 /// The rows for `messages`. `running` says a turn is in progress, which keeps
-/// the latest turn's work in view and adds an activity row at the end. `open` says
-/// whether the work starting at an index is expanded.
-pub fn entries(messages: &[Message], running: bool, open: impl Fn(usize) -> bool) -> Vec<Entry> {
+/// the latest turn's work in view and adds an activity row at the end. The
+/// disclosure callbacks take the first message index of the work or tool group.
+pub fn entries(
+    messages: &[Message],
+    running: bool,
+    work_open: impl Fn(usize) -> bool,
+    group_open: impl Fn(usize) -> bool,
+) -> Vec<Entry> {
     let mut out = Vec::with_capacity(messages.len() + usize::from(running));
     let mut start = 0;
     // What the agent did between one user message and the next.
@@ -63,11 +71,23 @@ pub fn entries(messages: &[Message], running: bool, open: impl Fn(usize) -> bool
         let mut shown = start;
         if let Some((first, last)) = reply.filter(|&(first, _)| first > 0) {
             out.push(Entry::Work { start, reply: start + last });
-            if !open(start) {
+            if !work_open(start) {
                 shown = start + first;
             }
         }
-        out.extend((shown..end).map(Entry::Message));
+        let mut index = shown;
+        for run in messages[shown..end].chunk_by(|a, b| a.tool.is_some() && b.tool.is_some()) {
+            let count = run.len();
+            if count > 1 {
+                out.push(Entry::ToolGroup { start: index, count });
+                if group_open(index) {
+                    out.extend((index..index + count).map(Entry::GroupedTool));
+                }
+            } else {
+                out.push(Entry::Message(index));
+            }
+            index += count;
+        }
         start = end;
     }
     if running {
@@ -138,12 +158,12 @@ mod tests {
 
     #[test]
     fn work_before_the_reply_is_folded() {
-        assert_eq!(entries(&turn(), false, |_| false), [M(0), work(1, 3), M(3)]);
+        assert_eq!(entries(&turn(), false, |_| false, |_| false), [M(0), work(1, 3), M(3)]);
     }
 
     #[test]
     fn opened_work_is_shown_under_its_row() {
-        assert_eq!(entries(&turn(), false, |at| at == 1), [M(0), work(1, 3), M(1), M(2), M(3)]);
+        assert_eq!(entries(&turn(), false, |at| at == 1, |_| false), [M(0), work(1, 3), M(1), M(2), M(3)]);
     }
 
     #[test]
@@ -151,11 +171,11 @@ mod tests {
         let mut messages = turn();
         messages.extend(turn());
         assert_eq!(
-            entries(&messages, true, |_| false),
+            entries(&messages, true, |_| false, |_| false),
             [M(0), work(1, 3), M(3), M(4), M(5), M(6), M(7), Activity]
         );
         assert_eq!(
-            entries(&messages, false, |_| false),
+            entries(&messages, false, |_| false, |_| false),
             [M(0), work(1, 3), M(3), M(4), work(5, 7), M(7)]
         );
     }
@@ -163,18 +183,45 @@ mod tests {
     #[test]
     fn activity_follows_the_latest_message_until_the_turn_ends() {
         let mut messages = vec![Message::user("go")];
-        assert_eq!(entries(&messages, true, |_| false), [M(0), Activity]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), Activity]);
         messages.push(Message::agent("Looking."));
-        assert_eq!(entries(&messages, true, |_| false), [M(0), M(1), Activity]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), M(1), Activity]);
         messages.push(Message::agent("Done."));
-        assert_eq!(entries(&messages, true, |_| false), [M(0), M(1), M(2), Activity]);
-        assert_eq!(entries(&messages, false, |_| false), [M(0), M(1), M(2)]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), M(1), M(2), Activity]);
+        assert_eq!(entries(&messages, false, |_| false, |_| false), [M(0), M(1), M(2)]);
+    }
+
+    #[test]
+    fn consecutive_calls_form_a_group_inside_the_work_disclosure() {
+        let messages = [
+            Message::user("go"),
+            tool(),
+            tool(),
+            Message::agent("Looking."),
+            tool(),
+            Message::agent("Done."),
+        ];
+        let group = Entry::ToolGroup { start: 1, count: 2 };
+        assert_eq!(entries(&messages, false, |_| false, |_| true), [M(0), work(1, 5), M(5)]);
+        assert_eq!(
+            entries(&messages, false, |_| true, |_| false),
+            [M(0), work(1, 5), group, M(3), M(4), M(5)],
+        );
+        assert_eq!(
+            entries(&messages, true, |_| false, |start| start == 1),
+            [M(0), group, Entry::GroupedTool(1), Entry::GroupedTool(2), M(3), M(4), M(5), Activity],
+        );
+        assert_eq!(
+            entries(&messages[..3], true, |_| false, |_| false),
+            [M(0), group, Activity],
+        );
+        assert_eq!(entries(&messages[..2], true, |_| false, |_| false), [M(0), M(1), Activity]);
     }
 
     #[test]
     fn a_reply_without_work_has_no_row() {
         let messages = [Message::user("hi"), Message::agent("Hello.")];
-        assert_eq!(entries(&messages, false, |_| false), [M(0), M(1)]);
+        assert_eq!(entries(&messages, false, |_| false, |_| false), [M(0), M(1)]);
     }
 
     #[test]
@@ -185,7 +232,7 @@ mod tests {
             tool(),
             Message::notice("Stopped"),
         ];
-        assert_eq!(entries(&messages, false, |_| false), [M(0), M(1), M(2), M(3)]);
+        assert_eq!(entries(&messages, false, |_| false, |_| false), [M(0), M(1), M(2), M(3)]);
     }
 
     #[test]
@@ -195,7 +242,7 @@ mod tests {
         messages.push(Message::notice("Blocked by policy"));
         messages.push(Message::user("thanks"));
         assert_eq!(
-            entries(&messages, false, |_| false),
+            entries(&messages, false, |_| false, |_| false),
             [M(0), work(1, 4), M(3), M(4), M(5), M(6)]
         );
     }
