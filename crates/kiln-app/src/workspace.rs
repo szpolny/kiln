@@ -1,7 +1,7 @@
 use crate::theme;
 use gpui::{
-    div, prelude::*, px, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    PathPromptOptions, Render, SharedString, Window,
+    div, list, prelude::*, px, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
@@ -15,6 +15,10 @@ pub struct Workspace {
     selected: Option<u64>,
     draft: String,
     focus: FocusHandle,
+    /// Virtualized message list. It follows new output until the user scrolls up.
+    transcript: ListState,
+    /// Thread `transcript` was built for; `None` forces a jump to the latest message.
+    transcript_thread: Option<u64>,
 }
 
 impl Workspace {
@@ -39,6 +43,8 @@ impl Workspace {
             selected,
             draft: String::new(),
             focus: cx.focus_handle(),
+            transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            transcript_thread: None,
         }
     }
 
@@ -47,6 +53,21 @@ impl Workspace {
             if let Err(e) = persist::save(path, &self.store) {
                 eprintln!("kiln: could not save state: {e}");
             }
+        }
+    }
+
+    /// Tell the list about messages added since the last frame.
+    fn sync_transcript(&mut self) {
+        let count = self
+            .selected
+            .and_then(|id| self.store.thread(id))
+            .map_or(0, |t| t.messages.len());
+        let known = self.transcript.item_count();
+        if self.transcript_thread != self.selected || count < known {
+            self.transcript.reset(count);
+            self.transcript_thread = self.selected;
+        } else if count > known {
+            self.transcript.splice(known..known, count - known);
         }
     }
 
@@ -139,6 +160,7 @@ impl Workspace {
         }
         thread.messages.push(Message { role: Role::User, body: body.clone() });
         self.draft.clear();
+        self.transcript_thread = None; // show what was just sent
         self.save();
         self.start_turn(id, body, vec![], cx);
     }
@@ -252,7 +274,8 @@ impl Workspace {
     }
 
     fn approval_cards(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut col = div().flex().flex_col().gap_2().px_4();
+        let mut col = div().id("approvals").flex().flex_col().flex_shrink_0().gap_2().px_4()
+            .max_h(px(240.)).overflow_y_scroll();
         let pending = self.store.thread(id).map(|th| th.pending.clone()).unwrap_or_default();
         for (i, a) in pending.into_iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
@@ -263,10 +286,10 @@ impl Workspace {
                     .child(label)
             };
             col = col.child(
-                div().flex().items_center().gap_3().px_3().py_2().rounded_lg()
+                div().flex().flex_shrink_0().items_center().gap_3().px_3().py_2().rounded_lg()
                     .bg(theme::surface()).border_1().border_color(theme::warn())
                     .child(
-                        div().flex().flex_col().flex_1().gap_0p5()
+                        div().flex().flex_col().flex_1().min_w_0().gap_0p5()
                             .child(div().text_xs().text_color(theme::warn())
                                 .child(format!("{} needs approval", a.tool)))
                             .child(div().text_sm().text_color(theme::text()).child(a.summary)),
@@ -296,16 +319,14 @@ impl Workspace {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut col = div().flex().flex_col().gap_3().p_3().w(px(260.)).h_full()
-            .bg(theme::sidebar()).border_r_1().border_color(theme::border())
-            .child(
-                div().flex().items_center().px_2().pt_6()
-                    .child(div().flex_1().text_sm().text_color(theme::text()).child("Kiln"))
-                    .child(Self::small_button("add-project", "+ Project")
-                        .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)))),
-            );
+        let header = div().flex().flex_shrink_0().items_center().px_2().pt_6()
+            .child(div().flex_1().text_sm().text_color(theme::text()).child("Kiln"))
+            .child(Self::small_button("add-project", "+ Project")
+                .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
+        let mut projects = div().id("projects").flex().flex_col().flex_1().min_h_0().gap_3()
+            .overflow_y_scroll();
         for (pi, p) in self.store.projects.iter().enumerate() {
-            let mut group = div().flex().flex_col().gap_0p5().child(
+            let mut group = div().flex().flex_col().flex_shrink_0().gap_0p5().child(
                 div().flex().items_center().px_2().py_1()
                     .child(div().flex_1().text_xs().text_color(theme::muted()).child(p.name.clone()))
                     .child(Self::small_button(format!("new-thread-{pi}"), "+")
@@ -338,9 +359,12 @@ impl Workspace {
                             }))),
                 );
             }
-            col = col.child(group);
+            projects = projects.child(group);
         }
-        col
+        div().flex().flex_col().flex_shrink_0().gap_3().p_3().w(px(260.)).h_full()
+            .bg(theme::sidebar()).border_r_1().border_color(theme::border())
+            .child(header)
+            .child(projects)
     }
 
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -360,39 +384,49 @@ impl Workspace {
             })
     }
 
+    fn message(&self, id: u64, ix: usize) -> gpui::AnyElement {
+        let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
+            return div().into_any_element();
+        };
+        let user = m.role == Role::User;
+        div().flex().w_full().px_6().py_2().when(user, |d| d.justify_end())
+            .child(
+                div().max_w(px(560.)).min_w_0().px_3().py_2().rounded_lg().text_sm()
+                    .text_color(theme::text())
+                    .when(user, |d| d.bg(theme::surface()))
+                    .child(m.body.clone()),
+            )
+            .into_any_element()
+    }
+
     fn thread(&self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(thread) = self.store.thread(id) else {
             return self.empty_state(cx).into_any_element();
         };
-        let mut msgs = div().flex().flex_col().gap_4().flex_1().p_6();
-        for m in &thread.messages {
-            let user = m.role == Role::User;
-            msgs = msgs.child(
-                div().flex().when(user, |d| d.justify_end()).child(
-                    div().max_w(px(560.)).px_3().py_2().rounded_lg().text_sm()
-                        .text_color(theme::text())
-                        .when(user, |d| d.bg(theme::surface()))
-                        .child(m.body.clone()),
-                ),
-            );
-        }
         let composer_text = if self.draft.is_empty() {
             div().text_color(theme::muted()).child("Ask anything…")
         } else {
             div().text_color(theme::text()).child(format!("{}▏", self.draft))
         };
         let badge = if thread.policy.is_local_only() { "● local only" } else { "○ network allowed" };
-        div().flex().flex_col().flex_1().h_full()
+        let this = cx.entity();
+        let messages = list(self.transcript.clone(), move |ix, _, cx| {
+            this.read(cx).message(id, ix)
+        })
+        .flex_1()
+        .min_h_0()
+        .py_3();
+        div().flex().flex_col().flex_1().min_w_0().h_full()
             .child(
-                div().flex().items_center().gap_2().px_4().h(px(44.))
+                div().flex().flex_shrink_0().items_center().gap_2().px_4().h(px(44.))
                     .border_b_1().border_color(theme::border())
                     .text_sm().text_color(theme::text()).child(thread.title.clone())
                     .child(div().text_xs().text_color(theme::ok()).child(badge)),
             )
-            .child(msgs)
+            .child(messages)
             .child(self.approval_cards(id, cx))
             .child(
-                div().p_4().child(
+                div().flex_shrink_0().p_4().child(
                     div().id("composer").track_focus(&self.focus)
                         .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
                         .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
@@ -416,6 +450,7 @@ impl Render for Workspace {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
+        self.sync_transcript();
         div().flex().size_full().bg(theme::bg()).text_color(theme::text())
             .child(self.sidebar(cx))
             .child(match self.selected {
