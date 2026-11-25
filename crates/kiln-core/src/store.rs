@@ -61,6 +61,14 @@ impl Agent {
             Agent::Claude => "claude",
         }
     }
+
+    /// Model aliases this agent accepts. Aliases follow the provider's latest
+    /// release, so the list needs no remote lookup.
+    pub fn models(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["fable", "opus", "sonnet", "haiku"],
+        }
+    }
 }
 
 pub const NEW_THREAD_TITLE: &str = "New thread";
@@ -73,6 +81,12 @@ pub struct Thread {
     pub title: String,
     #[serde(default)]
     pub agent: Agent,
+    /// Model requested for the next turn; `None` leaves it to the agent.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Model the agent reported for its most recent turn.
+    #[serde(default)]
+    pub reported_model: Option<String>,
     pub status: Status,
     pub policy: Policy,
     pub messages: Vec<Message>,
@@ -90,6 +104,8 @@ impl Thread {
             id,
             title: NEW_THREAD_TITLE.into(),
             agent,
+            model: None,
+            reported_model: None,
             status: Status::Idle,
             policy: Policy::default(),
             messages: vec![],

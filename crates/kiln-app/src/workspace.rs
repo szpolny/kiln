@@ -6,7 +6,7 @@ use gpui::{
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
 use kiln_core::persist::{self, Loaded};
-use kiln_core::{Agent, Approval, Message, Role, Status, Store, NEW_THREAD_TITLE};
+use kiln_core::{Agent, Approval, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE};
 
 const MONO: &str = if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" };
 
@@ -186,6 +186,7 @@ impl Workspace {
             dir,
             prompt,
             resume: thread.session_id.clone(),
+            model: thread.model.clone(),
             allowed_tools,
         });
         cx.notify();
@@ -218,6 +219,7 @@ impl Workspace {
         let thread = self.store.thread_mut(id)?;
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
+            AgentEvent::Model(model) => thread.reported_model = Some(model),
             AgentEvent::Text(text) => thread.messages.push(Message::agent(text)),
             AgentEvent::Tool { name, input } => {
                 thread.messages.push(Message::tool_call(name, input))
@@ -307,6 +309,41 @@ impl Workspace {
             );
         }
         col
+    }
+
+    fn set_model(&mut self, id: u64, model: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.model = model.map(str::to_string);
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// One button per model; the choice applies from the next turn.
+    fn model_chooser(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = thread.id;
+        let mut row = div().flex().flex_wrap().items_center().gap_1().px_1().pt_2()
+            .child(div().pr_1().text_xs().text_color(theme::muted()).child("Model"));
+        let choices = std::iter::once(None).chain(thread.agent.models().iter().copied().map(Some));
+        for choice in choices {
+            let label = choice.unwrap_or("default");
+            let active = thread.model.as_deref() == choice;
+            row = row.child(
+                div().id(SharedString::from(format!("model-{label}")))
+                    .px_2().py_0p5().rounded_md().text_xs().cursor_pointer()
+                    .border_1()
+                    .border_color(if active { theme::accent() } else { theme::border() })
+                    .text_color(if active { theme::text() } else { theme::muted() })
+                    .hover(|h| h.bg(theme::hover()))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_model(id, choice, cx))),
+            );
+        }
+        row.when_some(thread.reported_model.clone(), |row, model| {
+            row.child(div().flex_1()).child(
+                div().text_xs().text_color(theme::muted()).child(format!("last turn ran {model}")),
+            )
+        })
     }
 
     fn dot(status: Status) -> impl IntoElement {
@@ -456,7 +493,8 @@ impl Workspace {
                         .px_4().py_3().rounded_xl().bg(theme::surface())
                         .border_1().border_color(theme::border())
                         .text_sm().child(composer_text),
-                ),
+                )
+                .child(self.model_chooser(thread, cx)),
             )
             .into_any_element()
     }

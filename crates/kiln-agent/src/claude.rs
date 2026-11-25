@@ -17,6 +17,9 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             if let Some(id) = v["session_id"].as_str() {
                 out.push(AgentEvent::Session(id.to_string()));
             }
+            if let Some(model) = v["model"].as_str() {
+                out.push(AgentEvent::Model(model.to_string()));
+            }
         }
         Some("assistant") => {
             for block in v["message"]["content"].as_array().into_iter().flatten() {
@@ -106,6 +109,8 @@ pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
     pub resume: Option<String>,
+    /// Model alias or full name; `None` uses the agent's configured default.
+    pub model: Option<String>,
     /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
     pub allowed_tools: Vec<String>,
 }
@@ -126,6 +131,9 @@ pub fn run(turn: Turn) -> async_channel::Receiver<AgentEvent> {
             .stdin(Stdio::null());
         if let Some(id) = &turn.resume {
             cmd.args(["--resume", id]);
+        }
+        if let Some(model) = &turn.model {
+            cmd.args(["--model", model]);
         }
         if !turn.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").args(&turn.allowed_tools);
@@ -168,8 +176,8 @@ mod tests {
     #[test]
     fn parses_init_text_tool_and_result() {
         assert_eq!(
-            parse_line(r#"{"type":"system","subtype":"init","session_id":"abc"}"#),
-            vec![AgentEvent::Session("abc".into())]
+            parse_line(r#"{"type":"system","subtype":"init","session_id":"abc","model":"m-1"}"#),
+            vec![AgentEvent::Session("abc".into()), AgentEvent::Model("m-1".into())]
         );
         assert_eq!(
             parse_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls -la","description":"List files"}}]}}"#),
@@ -253,6 +261,7 @@ mod live {
             dir: dir.clone(),
             prompt: "run the shell command: touch approved.txt".into(),
             resume: None,
+            model: None,
             allowed_tools: vec![],
         });
         let session = first.iter().find_map(|e| match e {
@@ -274,6 +283,7 @@ mod live {
             dir: dir.clone(),
             prompt: "Permission granted. Run it now.".into(),
             resume: session,
+            model: None,
             allowed_tools: vec![rule],
         });
         assert!(dir.join("approved.txt").exists());
@@ -290,6 +300,7 @@ mod live {
             dir: std::env::temp_dir(),
             prompt: "reply with the single word: ok".into(),
             resume: None,
+            model: None,
             allowed_tools: vec![],
         });
         let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
