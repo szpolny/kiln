@@ -93,8 +93,8 @@ mod tests {
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.model.as_deref(), Some("opus"));
         assert_eq!(t.pending.len(), 1);
-        assert!(!t.policy.is_local_only());
-            }
+        assert_eq!(t.policy.network, crate::policy::Decision::Allow);
+    }
 
     #[test]
     fn running_threads_restore_as_idle() {

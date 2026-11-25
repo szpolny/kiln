@@ -30,12 +30,12 @@ pub struct Policy {
 }
 
 impl Default for Policy {
-    /// Local-only: project files are fine, everything else needs a human.
+    /// Project files are fine; web tools and commands need a human.
     fn default() -> Self {
         Self {
             project_files: Decision::Allow,
             outside_files: Decision::Deny,
-            network: Decision::Deny,
+            network: Decision::Ask,
             exec: Decision::Ask,
         }
     }
@@ -51,10 +51,19 @@ impl Policy {
         }
     }
 
-    pub fn is_local_only(&self) -> bool {
-        self.network == Decision::Deny
+    /// Web tools to allow and to disable for a whole turn. Both are empty
+    /// when each use needs approval.
+    pub fn web_tool_rules(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        match self.network {
+            Decision::Allow => (&WEB_TOOLS, &[]),
+            Decision::Ask => (&[], &[]),
+            Decision::Deny => (&[], &WEB_TOOLS),
+        }
     }
 }
+
+/// Provider tools that reach the web.
+pub const WEB_TOOLS: [&str; 2] = ["WebFetch", "WebSearch"];
 
 /// Which capability a provider tool needs. Unknown tools are treated as
 /// `Exec`, the strictest default that still lets a human decide.
@@ -63,7 +72,7 @@ pub fn capability_for_tool(tool: &str) -> Capability {
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Glob" | "Grep" => {
             Capability::ProjectFiles
         }
-        "WebFetch" | "WebSearch" => Capability::Network,
+        tool if WEB_TOOLS.contains(&tool) => Capability::Network,
         _ => Capability::Exec,
     }
 }
@@ -81,11 +90,19 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_is_local_only() {
+    fn default_policy_asks_before_using_the_web() {
         let p = Policy::default();
-        assert!(p.is_local_only());
-        assert_eq!(p.decide(Capability::Network), Decision::Deny);
+        assert_eq!(p.decide(Capability::Network), Decision::Ask);
         assert_eq!(p.decide(Capability::OutsideFiles), Decision::Deny);
         assert_eq!(p.decide(Capability::Exec), Decision::Ask);
+    }
+
+    #[test]
+    fn web_choice_sets_the_turn_rules() {
+        let rules = |network| Policy { network, ..Policy::default() }.web_tool_rules();
+        let (web, none): (&[&str], &[&str]) = (&WEB_TOOLS, &[]);
+        assert_eq!(rules(Decision::Allow), (web, none));
+        assert_eq!(rules(Decision::Ask), (none, none));
+        assert_eq!(rules(Decision::Deny), (none, web));
     }
 }

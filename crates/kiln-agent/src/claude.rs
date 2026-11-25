@@ -113,6 +113,8 @@ pub struct Turn {
     pub model: Option<String>,
     /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
     pub allowed_tools: Vec<String>,
+    /// Tools the agent may not use this turn, whatever its own settings say.
+    pub disallowed_tools: Vec<String>,
 }
 
 /// Start a turn. Events arrive on the returned channel; it closes when the
@@ -137,6 +139,9 @@ pub fn run(turn: Turn) -> async_channel::Receiver<AgentEvent> {
         }
         if !turn.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").args(&turn.allowed_tools);
+        }
+        if !turn.disallowed_tools.is_empty() {
+            cmd.arg("--disallowedTools").args(&turn.disallowed_tools);
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -263,6 +268,7 @@ mod live {
             resume: None,
             model: None,
             allowed_tools: vec![],
+            disallowed_tools: vec![],
         });
         let session = first.iter().find_map(|e| match e {
             AgentEvent::Session(id) => Some(id.clone()),
@@ -285,6 +291,7 @@ mod live {
             resume: session,
             model: None,
             allowed_tools: vec![rule],
+            disallowed_tools: vec![],
         });
         assert!(dir.join("approved.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -302,6 +309,7 @@ mod live {
             resume: None,
             model: None,
             allowed_tools: vec![],
+            disallowed_tools: vec![],
         });
         let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Session(_))));

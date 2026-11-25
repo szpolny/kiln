@@ -241,12 +241,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_threads_are_local_only_with_unique_ids() {
+    fn new_threads_get_the_default_policy_and_unique_ids() {
         let s = Store::sample();
         let ids: Vec<_> = s.projects[0].threads.iter().map(|t| t.id).collect();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
-        assert!(s.projects[0].threads.iter().all(|t| t.policy.is_local_only()));
+        let asks = |t: &Thread| t.policy.network == crate::policy::Decision::Ask;
+        assert!(s.projects[0].threads.iter().all(asks));
     }
 
     #[test]

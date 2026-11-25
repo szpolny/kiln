@@ -1,8 +1,9 @@
 use crate::markdown;
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
-    div, list, prelude::*, px, relative, Context, FocusHandle, Focusable, FontWeight, IntoElement,
-    KeyDownEvent, ListAlignment, ListState, PathPromptOptions, Render, SharedString, Window,
+    anchored, deferred, div, list, point, prelude::*, px, relative, AnchoredPositionMode, Context,
+    Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
+    ListState, MouseButton, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
@@ -31,6 +32,13 @@ pub struct Workspace {
     transcript_thread: Option<u64>,
     /// Parsed replies of that thread by message index, so frames do not reparse.
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
+    /// The dropdown menu that is open, if any.
+    menu: Option<Menu>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Menu {
+    Web,
 }
 
 impl Workspace {
@@ -61,6 +69,7 @@ impl Workspace {
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
             transcript_thread: None,
             parsed: HashMap::new(),
+            menu: None,
         }
     }
 
@@ -141,6 +150,13 @@ impl Workspace {
 
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        if self.menu.is_some() {
+            if ks.key == "escape" {
+                self.menu = None;
+                cx.notify();
+            }
+            return;
+        }
         if self.selected.is_none() || ks.modifiers.platform || ks.modifiers.control {
             return;
         }
@@ -197,12 +213,16 @@ impl Workspace {
             return;
         };
         thread.status = Status::Running;
+        let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
+        let mut granted = allowed_tools;
+        granted.extend(web_allowed.iter().map(|t| t.to_string()));
         let rx = claude::run(claude::Turn {
             dir,
             prompt,
             resume: thread.session_id.clone(),
             model: thread.model.clone(),
-            allowed_tools,
+            allowed_tools: granted.clone(),
+            disallowed_tools: web_disallowed.iter().map(|t| t.to_string()).collect(),
         });
         cx.notify();
 
@@ -211,7 +231,7 @@ impl Workspace {
                 let done = matches!(ev, AgentEvent::Done { .. });
                 let _ = this.update(cx, |this, cx| {
                     let finished = matches!(ev, AgentEvent::Done { .. });
-                    let retry = this.apply(id, ev);
+                    let retry = this.apply(id, ev, &granted);
                     if finished {
                         this.save();
                     }
@@ -230,7 +250,8 @@ impl Workspace {
     }
 
     /// Returns rules to retry with when the policy pre-approved denied actions.
-    fn apply(&mut self, id: u64, ev: AgentEvent) -> Option<Vec<String>> {
+    /// `granted` holds the allow rules the turn was started with.
+    fn apply(&mut self, id: u64, ev: AgentEvent, granted: &[String]) -> Option<Vec<String>> {
         let thread = self.store.thread_mut(id)?;
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
@@ -238,6 +259,13 @@ impl Workspace {
             AgentEvent::Text(text) => thread.messages.push(Message::agent(text)),
             AgentEvent::Tool { name, input } => {
                 thread.messages.push(Message::tool_call(name, input))
+            }
+            // Already granted, so something outside Kiln refused it and a
+            // retry would only be refused again.
+            AgentEvent::Denied { tool, summary, rule } if granted.contains(&rule) => {
+                thread.messages.push(Message::notice(format!(
+                    "Blocked by the agent's own settings: {tool}\n{summary}"
+                )))
             }
             AgentEvent::Denied { tool, summary, rule } => {
                 match thread.policy.decide(capability_for_tool(&tool)) {
@@ -362,6 +390,113 @@ impl Workspace {
             );
         }
         track
+    }
+
+    fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu = (self.menu != Some(menu)).then_some(menu);
+        cx.notify();
+    }
+
+    /// A see-through layer under an open menu. It catches clicks outside the
+    /// menu, including on its button, so one click only closes the menu.
+    fn backdrop(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let layer = div().id("menu-backdrop").w(viewport.width).h(viewport.height).occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }));
+        deferred(
+            anchored().position_mode(AnchoredPositionMode::Window).position(point(px(0.), px(0.)))
+                .child(layer),
+        )
+        .with_priority(1)
+    }
+
+    fn menu_panel(&self, id: &'static str, title: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        div().id(id).flex().flex_col().w(px(220.)).p_1().rounded(px(10.)).bg(theme.card)
+            .border_1().border_color(theme.border).shadow_lg().occlude()
+            .child(div().px_2().pt_1().pb_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted).child(title.into()))
+    }
+
+    fn menu_item(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        hint: Option<&'static str>,
+        active: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        div().id(id.into()).flex().items_center().gap_2().h(px(28.)).px_2().rounded_md().text_sm()
+            .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
+            .child(div().flex_1().child(label.into()))
+            .when_some(hint, |d, hint| {
+                d.child(div().text_xs().text_color(theme.muted).child(hint))
+            })
+            .child(div().w(px(12.)).text_xs().text_color(theme.accent)
+                .child(if active { "✓" } else { "" }))
+    }
+
+    fn set_web_access(&mut self, id: u64, access: Decision, cx: &mut Context<Self>) {
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.policy.network = access;
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// Toolbar button for the thread's web tools; the choice applies from the
+    /// next turn.
+    fn web_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let open = self.menu == Some(Menu::Web);
+        let current = thread.policy.network;
+        let (label, color) = match current {
+            Decision::Ask => ("Web: ask first", theme.ok),
+            Decision::Allow => ("Web: allowed", theme.warn),
+            Decision::Deny => ("Web: blocked", theme.ok),
+        };
+        let button = div().id("web-picker").flex().items_center().gap_1p5().px_2p5().py_1()
+            .rounded_full().text_xs().text_color(theme.muted).cursor_pointer()
+            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
+            .when(!open, |d| d.bg(theme.fill).hover(|h| h.bg(theme.hover).text_color(theme.text)))
+            .child(div().size(px(6.)).rounded_full().bg(color))
+            .child(label)
+            .child("▾")
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Web, cx)));
+        let picker = div().relative().child(button);
+        if !open {
+            return picker;
+        }
+        let id = thread.id;
+        let mut menu = self.menu_panel("web-menu", "Web search and fetch").mt_2();
+        for (access, label) in [
+            (Decision::Ask, "Ask first"),
+            (Decision::Allow, "Allow"),
+            (Decision::Deny, "Block"),
+        ] {
+            let key = SharedString::from(format!("web-{label}"));
+            menu = menu.child(
+                self.menu_item(key, label, None, current == access)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.set_web_access(id, access, cx);
+                    })),
+            );
+        }
+        menu = menu.child(
+            div().px_2().pt_1p5().pb_1().text_xs().text_color(theme.muted)
+                .child("Applies from the next turn. Commands and the model connection are not covered."),
+        );
+        // Anchored at the button's bottom-right corner, so the menu opens below it.
+        picker
+            .child(self.backdrop(window, cx))
+            .child(div().absolute().bottom_0().right_0().child(
+                deferred(anchored().anchor(Corner::TopRight).snap_to_window().child(menu))
+                    .with_priority(2),
+            ))
     }
 
     fn status_mark(&self, status: Status) -> impl IntoElement {
@@ -545,14 +680,9 @@ impl Workspace {
         )
     }
 
-    fn toolbar(&self, id: u64, thread: &Thread) -> impl IntoElement {
+    fn toolbar(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let project = self.store.locate(id).map(|(p, _)| self.store.projects[p].name.clone());
-        let (badge, color) = if thread.policy.is_local_only() {
-            ("Local only", theme.ok)
-        } else {
-            ("Network allowed", theme.warn)
-        };
+        let project = self.store.locate(thread.id).map(|(p, _)| self.store.projects[p].name.clone());
         div().flex().flex_shrink_0().items_center().gap_3().px_5().h(px(TOOLBAR))
             .border_b_1().border_color(theme.border)
             .child(
@@ -563,15 +693,10 @@ impl Workspace {
                         d.child(div().truncate().text_xs().text_color(theme.muted).child(name))
                     }),
             )
-            .child(
-                div().flex().items_center().gap_1p5().px_2p5().py_1().rounded_full()
-                    .bg(theme.fill).text_xs().text_color(theme.muted)
-                    .child(div().size(px(6.)).rounded_full().bg(color))
-                    .child(badge),
-            )
+            .child(self.web_picker(thread, window, cx))
     }
 
-    fn thread(&self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn thread(&self, id: u64, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(thread) = self.store.thread(id) else {
             return self.empty_state(cx).into_any_element();
         };
@@ -583,7 +708,7 @@ impl Workspace {
         .min_h_0()
         .py_3();
         div().flex().flex_col().flex_1().min_w_0().h_full().bg(self.theme.window)
-            .child(self.toolbar(id, thread))
+            .child(self.toolbar(thread, window, cx))
             .child(messages)
             .child(self.approval_cards(id, cx))
             .child(self.composer(thread, cx))
@@ -613,7 +738,7 @@ impl Render for Workspace {
         div().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .child(self.sidebar(cx))
             .child(match self.selected {
-                Some(id) => self.thread(id, cx),
+                Some(id) => self.thread(id, window, cx),
                 None => self.empty_state(cx).into_any_element(),
             })
     }
