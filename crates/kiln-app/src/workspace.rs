@@ -3,7 +3,7 @@ use crate::markdown;
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
-    anchored, deferred, div, list, point, prelude::*, px, relative, rgb, svg, AnchoredPositionMode, Context,
+    anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, AnchoredPositionMode, Context,
     Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
     ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
@@ -588,8 +588,13 @@ impl Workspace {
             .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
             .child("+").child("Add Project")
             .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)));
+        // Lines up with the project names below.
+        let (width, height) = assets::LOCKUP_SIZE;
+        let brand = div().flex().flex_shrink_0().px(px(18.)).pb_2()
+            .child(img(theme.lockup).flex_shrink_0().w(px(width)).h(px(height)));
         div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
             .bg(theme.sidebar).border_r_1().border_color(theme.border)
+            .child(brand)
             .child(projects)
             .child(add)
     }
@@ -603,6 +608,7 @@ impl Workspace {
         };
         div().flex().flex_col().flex_1().h_full().items_center().justify_center().gap_3()
             .bg(theme.window)
+            .child(img(theme.logo).flex_shrink_0().size(px(assets::LOGO_SIZE)))
             .child(div().text_sm().text_color(theme.muted).child(msg))
             .when(!action.is_empty(), |d| {
                 d.child(

@@ -38,6 +38,9 @@ pub struct Theme {
     pub on_accent: Rgba,
     pub ok: Rgba,
     pub warn: Rgba,
+    /// The Kiln mark and lockup assets that read on this palette.
+    pub logo: &'static str,
+    pub lockup: &'static str,
 }
 
 impl Theme {
@@ -59,6 +62,8 @@ impl Theme {
                 on_accent: rgb(0xffffff),
                 ok: rgb(0x248a3d),
                 warn: rgb(0xc25e00),
+                logo: crate::assets::LOGO_LIGHT,
+                lockup: crate::assets::LOCKUP_LIGHT,
             },
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self {
                 font,
@@ -75,6 +80,8 @@ impl Theme {
                 on_accent: rgb(0xffffff),
                 ok: rgb(0x30d158),
                 warn: rgb(0xff9f0a),
+                logo: crate::assets::LOGO_DARK,
+                lockup: crate::assets::LOCKUP_DARK,
             },
         }
     }

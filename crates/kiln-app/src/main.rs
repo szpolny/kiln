@@ -28,6 +28,8 @@ fn main() {
                 } else {
                     WindowBackgroundAppearance::Opaque
                 },
+                // Lets Linux desktops match the window to an installed icon.
+                app_id: Some("kiln".into()),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| workspace::Workspace::new(window, cx)),
