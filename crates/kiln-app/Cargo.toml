@@ -9,6 +9,7 @@ name = "kiln"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.30.2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.30.2", features = ["font-kit", "wayland", "x11"] }
 lucide-icons = "=1.80.0"

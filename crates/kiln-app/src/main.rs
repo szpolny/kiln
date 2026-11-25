@@ -4,6 +4,7 @@ mod sidebar;
 mod text_edit;
 mod text_input;
 mod theme;
+mod transcript;
 mod workspace;
 
 use gpui::{

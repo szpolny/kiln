@@ -13,7 +13,7 @@ Kiln runs agents as local processes and gives you one place to start, watch, app
 - One thread list across projects, with each thread's branch. Settle the threads you are done with to move them out of the way; sending a message brings one back.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the agent. Support for others, such as Codex, is planned.
 - A model, a reasoning level, and a web access setting for each thread.
-- Markdown replies, with the tool calls and commands the agent runs.
+- Markdown replies, with the tool calls and commands the agent runs. Once the agent has replied, the work before the reply folds under **Worked for …**, which also shows when the reply arrived; click it to see the work again.
 - Approving or denying actions the agent was refused.
 - Stopping a running turn with the stop button or Escape.
 

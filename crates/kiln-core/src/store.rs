@@ -1,6 +1,7 @@
 use crate::policy::Policy;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
@@ -24,23 +25,43 @@ pub struct Message {
     /// Set when this is a tool call: the tool's name, with `body` its input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// When it arrived, in Unix seconds; 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
+    /// On a user message, how long the agent has run to answer it, in
+    /// milliseconds; 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub worked_ms: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Message {
+    fn new(role: Role, body: impl Into<String>) -> Self {
+        Self { role, body: body.into(), tool: None, at: 0, worked_ms: 0 }
+    }
+
     pub fn user(body: impl Into<String>) -> Self {
-        Self { role: Role::User, body: body.into(), tool: None }
+        Self::new(Role::User, body)
     }
 
     pub fn agent(body: impl Into<String>) -> Self {
-        Self { role: Role::Agent, body: body.into(), tool: None }
+        Self::new(Role::Agent, body)
     }
 
     pub fn notice(body: impl Into<String>) -> Self {
-        Self { role: Role::Notice, body: body.into(), tool: None }
+        Self::new(Role::Notice, body)
     }
 
     pub fn tool_call(name: impl Into<String>, input: impl Into<String>) -> Self {
         Self { tool: Some(name.into()), ..Self::agent(input) }
+    }
+
+    /// The same message, arrived at `now`.
+    pub fn at(self, now: u64) -> Self {
+        Self { at: now, ..self }
     }
 }
 
@@ -242,6 +263,15 @@ impl Thread {
         true
     }
 
+    /// Count time the agent ran toward the latest user message. A turn that
+    /// resumes after an approval adds to it.
+    pub fn record_work(&mut self, ran: Duration) {
+        if let Some(m) = self.messages.iter_mut().rev().find(|m| m.role == Role::User) {
+            let ms = u64::try_from(ran.as_millis()).unwrap_or(u64::MAX);
+            m.worked_ms = m.worked_ms.saturating_add(ms);
+        }
+    }
+
     /// End a turn the user stopped. Nothing it asked for stays waiting.
     pub fn stop_turn(&mut self) {
         self.status = Status::Idle;
@@ -414,6 +444,25 @@ mod tests {
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.messages.len(), 2);
         assert_eq!(t.messages[1].role, Role::Notice);
+    }
+
+    #[test]
+    fn work_adds_up_on_the_latest_user_message() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        t.messages.push(Message::user("first"));
+        t.messages.push(Message::user("second"));
+        t.messages.push(Message::agent("ok"));
+        t.record_work(Duration::from_millis(1500));
+        t.record_work(Duration::from_millis(700));
+        assert_eq!((t.messages[0].worked_ms, t.messages[1].worked_ms), (0, 2200));
+    }
+
+    #[test]
+    fn messages_saved_without_times_still_load() {
+        let saved = serde_json::json!({"role": "User", "body": "hi"});
+        let m: Message = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!((m.at, m.worked_ms), (0, 0));
+        assert_eq!(serde_json::to_value(m).unwrap(), saved);
     }
 
     #[test]

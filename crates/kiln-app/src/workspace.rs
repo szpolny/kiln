@@ -3,6 +3,8 @@ use crate::markdown;
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
+use crate::transcript::{self, Entry};
+use chrono::{Local, TimeZone};
 use gpui::{
     anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, Anchor, AnchoredPositionMode, Context,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
@@ -14,25 +16,33 @@ use kiln_core::persist::{self, Loaded};
 use kiln_core::{
     Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Widest the conversation and composer grow; they stay centered beyond it.
 const COLUMN: f32 = 760.;
+/// Space above and below the conversation.
+const TRANSCRIPT_PADDING: f32 = 12.;
 /// Height of the title bar row shared by the sidebar and the thread.
 pub(crate) const TOOLBAR: f32 = 52.;
 /// How often the sidebar's ages and branches are brought up to date.
 const REFRESH: Duration = Duration::from_secs(30);
+
+/// A turn in progress.
+struct RunningTurn {
+    process: Process,
+    started: Instant,
+}
 
 pub struct Workspace {
     pub(crate) store: Store,
     /// None disables saving (e.g. the existing file could not be read).
     state_path: Option<std::path::PathBuf>,
     pub(crate) selected: Option<u64>,
-    /// Process of each running turn, by thread id.
-    turns: HashMap<u64, Process>,
+    /// Each running turn, by thread id.
+    turns: HashMap<u64, RunningTurn>,
     pub(crate) input: Entity<TextInput>,
     focus: FocusHandle,
     /// Palette for the current system appearance, refreshed every render.
@@ -43,10 +53,18 @@ pub struct Workspace {
     pub(crate) thread_list: ListState,
     /// Checked-out branch of each project folder that is in a repository.
     pub(crate) branches: HashMap<PathBuf, String>,
-    /// Virtualized message list. It follows new output until the user scrolls up.
+    /// Virtualized list over `entries`. It follows new output until the user
+    /// scrolls up.
     transcript: ListState,
+    /// The conversation's rows, in the order shown.
+    entries: Vec<Entry>,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
     transcript_thread: Option<u64>,
+    /// Message count and whether a turn was running when `entries` was built;
+    /// `None` forces a rebuild.
+    transcript_built: Option<(usize, bool)>,
+    /// Expanded work, by thread id and the index of its first message.
+    open_work: HashSet<(u64, usize)>,
     /// Parsed replies of that thread by message index, so frames do not reparse.
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
     /// The dropdown menu that is open, if any.
@@ -111,7 +129,10 @@ impl Workspace {
             thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
             branches: HashMap::new(),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            entries: Vec::new(),
             transcript_thread: None,
+            transcript_built: None,
+            open_work: HashSet::new(),
             parsed: HashMap::new(),
             menu: None,
         };
@@ -142,20 +163,52 @@ impl Workspace {
         }
     }
 
-    /// Tell the list about messages added since the last frame.
+    /// Bring the rows up to date with the shown thread, telling the list only
+    /// about those that changed so it keeps its place.
     fn sync_transcript(&mut self) {
-        let count = self
-            .selected
-            .and_then(|id| self.store.thread(id))
-            .map_or(0, |t| t.messages.len());
-        let known = self.transcript.item_count();
-        if self.transcript_thread != self.selected || count < known {
-            self.transcript.reset(count);
+        let thread = self.selected.and_then(|id| self.store.thread(id));
+        let built = thread.map_or((0, false), |t| (t.messages.len(), t.status == Status::Running));
+        let switched = self.transcript_thread != self.selected;
+        if !switched && self.transcript_built == Some(built) {
+            return;
+        }
+        let entries = thread.map_or_else(Vec::new, |t| {
+            transcript::entries(&t.messages, built.1, |at| self.open_work.contains(&(t.id, at)))
+        });
+        if switched {
+            self.transcript.reset(entries.len());
             self.parsed.clear();
             self.transcript_thread = self.selected;
-        } else if count > known {
-            self.transcript.splice(known..known, count - known);
+        } else {
+            let same = |(a, b): &(&Entry, &Entry)| a == b;
+            let head = self.entries.iter().zip(&entries).take_while(same).count();
+            let tail = self.entries[head..].iter().rev()
+                .zip(entries[head..].iter().rev())
+                .take_while(same)
+                .count();
+            let old = head..self.entries.len() - tail;
+            let new = entries.len() - tail - head;
+            if !old.is_empty() || new > 0 {
+                self.transcript.splice(old, new);
+            }
         }
+        self.entries = entries;
+        self.transcript_built = Some(built);
+    }
+
+    /// Expand or collapse the work starting at message `at`.
+    fn toggle_work(&mut self, id: u64, at: usize, cx: &mut Context<Self>) {
+        if !self.open_work.remove(&(id, at)) {
+            self.open_work.insert((id, at));
+        }
+        // A list resting at the end would grow upwards and carry the clicked row
+        // away. Anchor it at the row now at the top instead.
+        if self.transcript.logical_scroll_top().item_ix >= self.transcript.item_count() {
+            let view = self.transcript.viewport_bounds().size.height;
+            self.transcript.scroll_by(px(TRANSCRIPT_PADDING * 2.) - view);
+        }
+        self.transcript_built = None;
+        cx.notify();
     }
 
     pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
@@ -240,8 +293,8 @@ impl Workspace {
 
     /// Stop the thread's turn. It stays running until the process has exited.
     fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(process) = self.turns.get(&id) {
-            process.stop();
+        if let Some(turn) = self.turns.get(&id) {
+            turn.process.stop();
             cx.notify();
         }
     }
@@ -308,14 +361,17 @@ impl Workspace {
                 return;
             }
         };
-        self.turns.insert(id, process);
+        self.turns.insert(id, RunningTurn { process, started: Instant::now() });
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 let done = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Stopped);
                 let _ = this.update(cx, |this, cx| {
                     if done {
-                        this.turns.remove(&id);
+                        let turn = this.turns.remove(&id);
+                        if let (Some(turn), Some(thread)) = (turn, this.store.thread_mut(id)) {
+                            thread.record_work(turn.started.elapsed());
+                        }
                     }
                     let retry = this.apply(id, ev, &granted);
                     if done {
@@ -345,7 +401,7 @@ impl Workspace {
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
             AgentEvent::Model(model) => thread.reported_model = Some(model),
-            AgentEvent::Text(text) => thread.messages.push(Message::agent(text)),
+            AgentEvent::Text(text) => thread.messages.push(Message::agent(text).at(now())),
             AgentEvent::Tool { name, input } => {
                 thread.messages.push(Message::tool_call(name, input))
             }
@@ -697,6 +753,51 @@ impl Workspace {
             })
     }
 
+    fn entry(&mut self, id: u64, row: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.entries.get(row) {
+            Some(&Entry::Message(ix)) => self.message(id, ix),
+            Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
+            None => div().into_any_element(),
+        }
+    }
+
+    /// Stands for what the agent did before it replied; a click shows or hides
+    /// it. Shows how long that took and when the reply arrived.
+    fn work_row(&self, id: u64, start: usize, reply: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let messages = self.store.thread(id).map_or(&[][..], |t| &t.messages);
+        // The user message the work answers is the one just before it.
+        let ran = start.checked_sub(1).and_then(|i| messages.get(i)).map_or(0, |m| m.worked_ms);
+        let replied = messages.get(reply)
+            .filter(|m| m.at > 0)
+            .and_then(|m| Local.timestamp_opt(i64::try_from(m.at).ok()?, 0).single())
+            .map(|at| transcript::clock(at, Local::now()));
+        let chevron = if self.open_work.contains(&(id, start)) {
+            assets::Icon::ChevronDown
+        } else {
+            assets::Icon::ChevronRight
+        };
+        // Pulled left by its padding, so the title lines up with the reply.
+        let button = div().id(("work", start)).flex().items_center().gap_1().ml(px(-6.))
+            .px_1p5().py_0p5().rounded_md().cursor_pointer()
+            .hover(|h| h.bg(theme.hover).text_color(theme.text))
+            .child(transcript::worked(ran))
+            .child(assets::icon(chevron, 13.))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_work(id, start, cx)));
+        centered(
+            div().flex().flex_col().w_full().gap_1p5().text_xs().text_color(theme.muted)
+                .child(
+                    div().flex().items_center().justify_between()
+                        .child(button)
+                        .when_some(replied, |d, time| d.child(time)),
+                )
+                .child(div().w_full().h(px(1.)).bg(theme.border)),
+        )
+        .px_6()
+        .py_1p5()
+        .into_any_element()
+    }
+
     fn message(&mut self, id: u64, ix: usize) -> gpui::AnyElement {
         let theme = self.theme;
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
@@ -769,7 +870,7 @@ impl Workspace {
     fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let running = thread.status == Status::Running;
-        let stopping = self.turns.get(&thread.id).is_some_and(Process::stop_requested);
+        let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
         let note = match (running, stopping) {
             (_, true) => Some("Stopping…".to_string()),
             (true, false) => Some("Working… Esc to stop".to_string()),
@@ -828,12 +929,12 @@ impl Workspace {
             return self.empty_state(cx).into_any_element();
         };
         let this = cx.entity();
-        let messages = list(self.transcript.clone(), move |ix, _, cx| {
-            this.update(cx, |this, _| this.message(id, ix))
+        let messages = list(self.transcript.clone(), move |row, _, cx| {
+            this.update(cx, |this, cx| this.entry(id, row, cx))
         })
         .flex_1()
         .min_h_0()
-        .py_3();
+        .py(px(TRANSCRIPT_PADDING));
         div().flex().flex_col().flex_1().min_w_0().h_full().bg(self.theme.window)
             .child(self.toolbar(thread, window, cx))
             .child(messages)
