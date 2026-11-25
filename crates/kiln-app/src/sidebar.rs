@@ -6,7 +6,7 @@ use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
     Focusable, FontWeight, IntoElement, SharedString, Stateful, Window,
 };
-use kiln_core::{Status, Thread};
+use kiln_core::{Project, Status, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
@@ -99,7 +99,7 @@ impl Workspace {
                         this.new_thread(p, cx);
                         window.focus(&this.input.focus_handle(cx), cx);
                     }))
-                    .child(project_mark(&project.name))
+                    .child(self.project_mark(project))
                     .child(div().flex_1().min_w_0().truncate().child(project.name.clone()))
                     .when(!busy, |d| {
                         d.child(
@@ -155,7 +155,7 @@ impl Workspace {
         let age = age(thread.updated_at, now());
         let row = if thread.settled {
             base.flex().items_center().gap_2().h(px(30.))
-                .child(project_mark(&project.name))
+                .child(self.project_mark(project))
                 .child(div().flex_1().min_w_0().truncate().text_sm().text_color(theme.muted)
                     .child(thread.title.clone()))
                 .child(self.row_end(thread, age, theme.muted, cx))
@@ -171,7 +171,7 @@ impl Workspace {
             base.flex().flex_col().gap_1().py_2()
                 .child(
                     div().flex().items_center().gap_2()
-                        .child(project_mark(&project.name))
+                        .child(self.project_mark(project))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).child(project.name.clone()))
                         .child(self.row_end(thread, state, color, cx)),
@@ -236,6 +236,15 @@ impl Workspace {
             .child(actions)
     }
 
+    /// The project's own icon, or else its initials.
+    fn project_mark(&self, project: &Project) -> Div {
+        let mark = div().flex().flex_shrink_0().items_center().justify_center().size(px(16.));
+        match self.icons.get(&project.dir) {
+            Some(icon) => mark.child(img(icon.clone()).size_full().rounded(px(4.))),
+            None => initials_mark(mark, &project.name),
+        }
+    }
+
     /// A borderless square button holding one icon.
     fn icon_button(&self, id: impl Into<ElementId>, icon: Icon, size: f32) -> Stateful<Div> {
         let theme = self.theme;
@@ -247,12 +256,12 @@ impl Workspace {
 }
 
 /// A project's initials on a color that stays the same for its name.
-fn project_mark(name: &str) -> Div {
+fn initials_mark(mark: Div, name: &str) -> Div {
     const COLORS: [u32; 8] = [
         0xc2255c, 0x9c36b5, 0x6741d9, 0x3b5bdb, 0x1971c2, 0x0c8599, 0x2f9e44, 0xe8590c,
     ];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
-    div().flex().flex_shrink_0().items_center().justify_center().size(px(16.)).rounded(px(4.))
+    mark.rounded(px(4.))
         .bg(rgb(COLORS[hash as usize % COLORS.len()])).text_color(rgb(0xffffff))
         .text_size(px(8.)).font_weight(FontWeight::BOLD)
         .child(initials(name))

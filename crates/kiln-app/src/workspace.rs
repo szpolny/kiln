@@ -1,5 +1,6 @@
 use crate::assets;
 use crate::markdown;
+use crate::project_icon;
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
@@ -8,7 +9,8 @@ use chrono::{Local, TimeZone};
 use gpui::{
     anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, Anchor, AnchoredPositionMode, Context,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
-    ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
+    ListState, MouseButton, Entity, PathPromptOptions, Render, RenderImage, SharedString, Task,
+    Window,
 };
 use kiln_agent::{claude, process::Process, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, Place};
@@ -19,6 +21,7 @@ use kiln_core::{
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Widest the conversation and composer grow; they stay centered beyond it.
@@ -27,7 +30,7 @@ const COLUMN: f32 = 760.;
 const TRANSCRIPT_PADDING: f32 = 12.;
 /// Height of the title bar row shared by the sidebar and the thread.
 pub(crate) const TOOLBAR: f32 = 52.;
-/// How often the sidebar's ages and branches are brought up to date.
+/// How often the sidebar's ages, branches, and icons are brought up to date.
 const REFRESH: Duration = Duration::from_secs(30);
 
 /// A turn in progress.
@@ -53,6 +56,10 @@ pub struct Workspace {
     pub(crate) thread_list: ListState,
     /// Checked-out branch of each project folder that is in a repository.
     pub(crate) branches: HashMap<PathBuf, String>,
+    /// Icon of each project folder that ships one.
+    pub(crate) icons: HashMap<PathBuf, Arc<RenderImage>>,
+    /// The icon lookup in progress; starting another cancels it.
+    icon_load: Task<()>,
     /// Virtualized list over `entries`. It follows new output until the user
     /// scrolls up.
     transcript: ListState,
@@ -128,6 +135,8 @@ impl Workspace {
             rows: Vec::new(),
             thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
             branches: HashMap::new(),
+            icons: HashMap::new(),
+            icon_load: Task::ready(()),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
             entries: Vec::new(),
             transcript_thread: None,
@@ -142,6 +151,7 @@ impl Workspace {
     }
 
     /// Reread the branches and redraw, which also brings the ages up to date.
+    /// The icons follow once they are read.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.branches = self
             .store
@@ -149,7 +159,43 @@ impl Workspace {
             .iter()
             .filter_map(|p| Some((p.dir.clone(), project::branch(&p.dir)?)))
             .collect();
+        self.load_icons(cx);
         cx.notify();
+    }
+
+    /// Reread the project icons away from the UI thread.
+    fn load_icons(&mut self, cx: &mut Context<Self>) {
+        let dirs: Vec<PathBuf> = self.store.projects.iter().map(|p| p.dir.clone()).collect();
+        let load = cx.background_executor().spawn(async move {
+            dirs.into_iter()
+                .filter_map(|dir| {
+                    let icon = project_icon::load(&dir)?;
+                    Some((dir, icon))
+                })
+                .collect::<HashMap<_, _>>()
+        });
+        self.icon_load = cx.spawn(async move |this, cx| {
+            let icons = load.await;
+            let _ = this.update(cx, |this, cx| this.set_icons(icons, cx));
+        });
+    }
+
+    fn set_icons(&mut self, mut icons: HashMap<PathBuf, Arc<RenderImage>>, cx: &mut Context<Self>) {
+        let mut changed = icons.len() != self.icons.len();
+        for (dir, old) in self.icons.drain() {
+            match icons.get_mut(&dir) {
+                // Keep the image already uploaded to the GPU.
+                Some(new) if project_icon::same(&old, new) => *new = old,
+                _ => {
+                    changed = true;
+                    cx.drop_image(old, None);
+                }
+            }
+        }
+        self.icons = icons;
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Write the state to disk. Every change to the thread list ends here, so

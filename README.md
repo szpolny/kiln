@@ -9,7 +9,7 @@ Kiln runs agents as local processes and gives you one place to start, watch, app
 
 ## What works today
 
-- Projects added from local folders, each with its own threads.
+- Projects added from local folders, each with its own threads. A project shows the icon found in its folder, such as `favicon.svg`, `assets/logo.png`, or the one its `index.html` links to, and its initials otherwise.
 - One thread list across projects, with each thread's branch. Settle the threads you are done with to move them out of the way; sending a message brings one back.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the agent. Support for others, such as Codex, is planned.
 - A model, a reasoning level, and a web access setting for each thread.
