@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui = "0.2.2"
+lucide-static-svg = "=1.80.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-segmentation = "1"
 kiln-core = { path = "../kiln-core" }

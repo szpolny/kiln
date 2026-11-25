@@ -1,5 +1,9 @@
 //! Icons compiled into the binary, so nothing is loaded from disk or the network.
+//!
+//! Interface icons come from Lucide: draw one with `svg().path(Icon::X.asset_path())`.
+//! Brand marks are local files.
 use gpui::{AssetSource, Result, SharedString};
+pub use lucide_static_svg::Icon;
 use std::borrow::Cow;
 
 pub const CLAUDE: &str = "icons/claude.svg";
@@ -31,7 +35,7 @@ impl AssetSource for Assets {
             LOGO_LIGHT => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-mark-light.svg"))),
             LOCKUP_DARK => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-lockup-dark.svg"))),
             LOCKUP_LIGHT => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-lockup-light.svg"))),
-            _ => None,
+            _ => lucide_static_svg::asset_bytes(path).map(Cow::Borrowed),
         })
     }
 
@@ -49,6 +53,12 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lucide_icons_load_by_their_asset_path() {
+        assert!(Assets.load(Icon::Brain.asset_path()).unwrap().is_some());
+        assert!(Assets.load("icons/missing.svg").unwrap().is_none());
+    }
 
     #[test]
     fn brand_files_declare_the_size_they_are_drawn_at() {

@@ -10,7 +10,9 @@ use gpui::{
 use kiln_agent::{claude, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, Place};
 use kiln_core::persist::{self, Loaded};
-use kiln_core::{Agent, Approval, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE};
+use kiln_core::{
+    Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -41,6 +43,7 @@ pub struct Workspace {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     Model,
+    Effort,
     Web,
 }
 
@@ -212,6 +215,7 @@ impl Workspace {
             prompt,
             resume: thread.session_id.clone(),
             model: Some(thread.model().to_string()),
+            effort: Some(thread.effort().id().to_string()),
             allowed_tools: granted.clone(),
             disallowed_tools: web_disallowed.iter().map(|t| t.to_string()).collect(),
         });
@@ -368,25 +372,25 @@ impl Workspace {
         }
     }
 
+    fn set_effort(&mut self, id: u64, effort: Effort, cx: &mut Context<Self>) {
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.effort = Some(effort);
+            self.save();
+            cx.notify();
+        }
+    }
+
     /// Compact picker in the composer footer; the choice applies from the next turn.
     fn model_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let open = self.menu == Some(Menu::Model);
-        let button = div().id("model-picker").flex().items_center().gap_1p5().h(px(26.)).px_2()
-            .rounded_md().text_xs().cursor_pointer()
-            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
-            .when(!open, |d| d.text_color(theme.muted).hover(|h| h.bg(theme.hover).text_color(theme.text)))
+        let button = self.footer_button("model-picker", Menu::Model, cx)
             .child(agent_icon(thread.agent, 13.))
             .child(div().font_weight(FontWeight::MEDIUM)
-                .child(thread.agent.model_name(thread.model()).to_string()))
-            .child(div().text_color(theme.muted).child("▾"))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Model, cx)));
-        let mut picker = div().relative().child(button);
-        if !open {
-            return picker;
+                .child(thread.agent.model_name(thread.model()).to_string()));
+        if self.menu != Some(Menu::Model) {
+            return self.footer_picker(button, None, window, cx);
         }
         let id = thread.id;
-        let mut menu = self.menu_panel("model-menu", capitalized(thread.agent.label())).mb_2();
+        let mut menu = self.menu_panel("model-menu", capitalized(thread.agent.label()));
         for model in thread.agent.models() {
             let (model_id, active) = (model.id, thread.model() == model.id);
             let key = SharedString::from(format!("model-{model_id}"));
@@ -398,14 +402,69 @@ impl Workspace {
                     })),
             );
         }
+        self.footer_picker(button, Some(menu), window, cx)
+    }
+
+    /// Reasoning level picker beside the model; applies from the next turn.
+    fn effort_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = self.footer_button("effort-picker", Menu::Effort, cx)
+            .child(svg().path(assets::Icon::Brain.asset_path()).flex_shrink_0().size(px(13.))
+                .text_color(self.theme.muted))
+            .child(div().font_weight(FontWeight::MEDIUM).child(thread.effort().name()));
+        if self.menu != Some(Menu::Effort) {
+            return self.footer_picker(button, None, window, cx);
+        }
+        let id = thread.id;
+        let mut menu = self.menu_panel("effort-menu", "Reasoning");
+        for &effort in thread.agent.efforts() {
+            let key = SharedString::from(format!("effort-{}", effort.id()));
+            menu = menu.child(
+                self.menu_item(key, None, effort.name(), None, thread.effort() == effort)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.set_effort(id, effort, cx);
+                    })),
+            );
+        }
+        self.footer_picker(button, Some(menu), window, cx)
+    }
+
+    /// A dropdown button in the composer footer. The caller adds its label.
+    fn footer_button(
+        &self,
+        id: &'static str,
+        menu: Menu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        let open = self.menu == Some(menu);
+        div().id(id).flex().flex_shrink_0().items_center().gap_1p5().h(px(26.)).px_2()
+            .rounded_md().text_xs().cursor_pointer()
+            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
+            .when(!open, |d| d.text_color(theme.muted).hover(|h| h.bg(theme.hover).text_color(theme.text)))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(menu, cx)))
+    }
+
+    /// Finish a footer dropdown, showing `menu` above its button when open.
+    fn footer_picker(
+        &self,
+        button: gpui::Stateful<gpui::Div>,
+        menu: Option<gpui::Stateful<gpui::Div>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let button = button.child(div().text_color(self.theme.muted).child("▾"));
+        let picker = div().relative().child(button);
+        let Some(menu) = menu else {
+            return picker;
+        };
         // Anchored at the button's top-left corner, so the menu opens above it.
-        picker = picker
+        picker
             .child(self.backdrop(window, cx))
             .child(div().absolute().top_0().left_0().child(
-                deferred(anchored().anchor(Corner::BottomLeft).snap_to_window().child(menu))
+                deferred(anchored().anchor(Corner::BottomLeft).snap_to_window().child(menu.mb_2()))
                     .with_priority(2),
-            ));
-        picker
+            ))
     }
 
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
@@ -688,7 +747,9 @@ impl Workspace {
                 )
                 .child(
                     div().flex().items_center().gap_3().pl_0p5()
-                        .child(self.model_picker(thread, window, cx))
+                        .child(div().flex().items_center().gap_0p5()
+                            .child(self.model_picker(thread, window, cx))
+                            .child(self.effort_picker(thread, window, cx)))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
                             .when_some(note, |d, note| d.child(note)))

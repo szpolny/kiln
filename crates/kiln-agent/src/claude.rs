@@ -163,6 +163,8 @@ pub struct Turn {
     pub resume: Option<String>,
     /// Model alias or full name; `None` uses the agent's configured default.
     pub model: Option<String>,
+    /// Reasoning level; `None` uses the agent's configured default.
+    pub effort: Option<String>,
     /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
     pub allowed_tools: Vec<String>,
     /// Tools the agent may not use this turn, whatever its own settings say.
@@ -188,6 +190,10 @@ pub fn run(turn: Turn) -> async_channel::Receiver<AgentEvent> {
         }
         if let Some(model) = &turn.model {
             cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &turn.effort {
+            // The variable outranks the flag and would silently undo the choice.
+            cmd.args(["--effort", effort]).env_remove("CLAUDE_CODE_EFFORT_LEVEL");
         }
         if !turn.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").args(&turn.allowed_tools);
@@ -345,6 +351,7 @@ mod live {
             prompt: "run the shell command: touch approved.txt".into(),
             resume: None,
             model: None,
+            effort: None,
             allowed_tools: vec![],
             disallowed_tools: vec![],
         });
@@ -368,6 +375,7 @@ mod live {
             prompt: "Permission granted. Run it now.".into(),
             resume: session,
             model: None,
+            effort: None,
             allowed_tools: vec![rule],
             disallowed_tools: vec![],
         });
@@ -395,6 +403,7 @@ mod live {
                 prompt: prompt.clone(),
                 resume: None,
                 model: None,
+                effort: None,
                 allowed_tools,
                 disallowed_tools: vec![],
             });
@@ -425,6 +434,7 @@ mod live {
             prompt: "reply with the single word: ok".into(),
             resume: None,
             model: None,
+            effort: None,
             allowed_tools: vec![],
             disallowed_tools: vec![],
         });

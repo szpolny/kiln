@@ -88,6 +88,22 @@ impl Agent {
         }
     }
 
+    /// Reasoning levels this agent accepts, lowest first.
+    pub fn efforts(self) -> &'static [Effort] {
+        match self {
+            Agent::Claude => {
+                &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max]
+            }
+        }
+    }
+
+    /// Reasoning level used until the user picks one.
+    pub fn default_effort(self) -> Effort {
+        match self {
+            Agent::Claude => Effort::Medium,
+        }
+    }
+
     /// Display name for a model id, or the id itself when it is not listed.
     pub fn model_name(self, id: &str) -> &str {
         self.models().iter().find(|m| m.id == id).map_or(id, |m| m.name)
@@ -103,6 +119,40 @@ pub struct Model {
     pub alias: &'static str,
 }
 
+/// How much the model reasons before it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    /// Value passed to the agent.
+    pub fn id(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::XHigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Effort::Low => "Low",
+            Effort::Medium => "Medium",
+            Effort::High => "High",
+            Effort::XHigh => "Extra high",
+            Effort::Max => "Max",
+        }
+    }
+}
+
 pub const NEW_THREAD_TITLE: &str = "New thread";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +166,10 @@ pub struct Thread {
     /// Model requested for the next turn; `None` means the agent's default model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning level requested for the next turn; `None` means the agent's
+    /// default level.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Model the agent reported for its most recent turn.
     #[serde(default)]
     pub reported_model: Option<String>,
@@ -137,6 +191,7 @@ impl Thread {
             title: NEW_THREAD_TITLE.into(),
             agent,
             model: None,
+            effort: None,
             reported_model: None,
             status: Status::Idle,
             policy: Policy::default(),
@@ -150,6 +205,11 @@ impl Thread {
     /// Model the next turn runs with.
     pub fn model(&self) -> &str {
         self.model.as_deref().unwrap_or(self.agent.default_model())
+    }
+
+    /// Reasoning level the next turn runs with.
+    pub fn effort(&self) -> Effort {
+        self.effort.unwrap_or(self.agent.default_effort())
     }
 }
 
@@ -282,6 +342,22 @@ mod tests {
         assert_eq!(t.model(), "claude-haiku-5-5");
         assert_eq!(t.agent.model_name(t.model()), "Haiku 5.5");
         assert_eq!(t.agent.model_name("claude-mystery-9"), "claude-mystery-9");
+    }
+
+    #[test]
+    fn effort_is_stored_as_the_value_the_agent_takes() {
+        for &effort in Agent::Claude.efforts() {
+            let stored = serde_json::to_value(effort).unwrap();
+            assert_eq!(stored, effort.id());
+        }
+    }
+
+    #[test]
+    fn threads_saved_without_an_effort_still_load() {
+        let mut value = serde_json::to_value(Thread::new(1, Agent::Claude)).unwrap();
+        value.as_object_mut().unwrap().remove("effort");
+        let thread: Thread = serde_json::from_value(value).unwrap();
+        assert_eq!(thread.effort(), Effort::Medium);
     }
 
     #[test]
