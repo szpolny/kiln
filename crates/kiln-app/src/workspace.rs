@@ -1,3 +1,4 @@
+use crate::markdown;
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
     div, list, prelude::*, px, relative, Context, FocusHandle, Focusable, FontWeight, IntoElement,
@@ -7,6 +8,8 @@ use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{Agent, Approval, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Widest the conversation and composer grow; they stay centered beyond it.
 const COLUMN: f32 = 760.;
@@ -26,6 +29,8 @@ pub struct Workspace {
     transcript: ListState,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
     transcript_thread: Option<u64>,
+    /// Parsed replies of that thread by message index, so frames do not reparse.
+    parsed: HashMap<usize, Rc<[markdown::Block]>>,
 }
 
 impl Workspace {
@@ -55,6 +60,7 @@ impl Workspace {
             theme: Theme::new(window.appearance(), font),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
             transcript_thread: None,
+            parsed: HashMap::new(),
         }
     }
 
@@ -75,6 +81,7 @@ impl Workspace {
         let known = self.transcript.item_count();
         if self.transcript_thread != self.selected || count < known {
             self.transcript.reset(count);
+            self.parsed.clear();
             self.transcript_thread = self.selected;
         } else if count > known {
             self.transcript.splice(known..known, count - known);
@@ -454,7 +461,7 @@ impl Workspace {
             })
     }
 
-    fn message(&self, id: u64, ix: usize) -> gpui::AnyElement {
+    fn message(&mut self, id: u64, ix: usize) -> gpui::AnyElement {
         let theme = self.theme;
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
             return div().into_any_element();
@@ -467,7 +474,10 @@ impl Workspace {
                     .bg(theme.accent).text_color(theme.on_accent)
                     .child(m.body.clone()))
                 .into_any_element(),
-            (None, Role::Agent) => body.child(m.body.clone()).into_any_element(),
+            (None, Role::Agent) => {
+                let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse(&m.body).into());
+                body.child(markdown::render(blocks, theme, ix)).into_any_element()
+            }
             (None, Role::Notice) => body.text_xs().text_color(theme.muted)
                 .child(m.body.clone())
                 .into_any_element(),
@@ -567,7 +577,7 @@ impl Workspace {
         };
         let this = cx.entity();
         let messages = list(self.transcript.clone(), move |ix, _, cx| {
-            this.read(cx).message(id, ix)
+            this.update(cx, |this, _| this.message(id, ix))
         })
         .flex_1()
         .min_h_0()
