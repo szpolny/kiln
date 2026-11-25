@@ -7,7 +7,7 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
     ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
-use kiln_agent::{claude, project, AgentEvent};
+use kiln_agent::{claude, process::Process, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, Place};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
@@ -26,6 +26,8 @@ pub struct Workspace {
     /// None disables saving (e.g. the existing file could not be read).
     state_path: Option<std::path::PathBuf>,
     selected: Option<u64>,
+    /// Process of each running turn, by thread id.
+    turns: HashMap<u64, Process>,
     input: Entity<TextInput>,
     focus: FocusHandle,
     /// Palette for the current system appearance, refreshed every render.
@@ -75,6 +77,7 @@ impl Workspace {
             store,
             state_path,
             selected,
+            turns: HashMap::new(),
             input,
             focus: cx.focus_handle(),
             theme: Theme::new(window.appearance(), font),
@@ -160,10 +163,24 @@ impl Workspace {
         }
     }
 
-    /// Escape closes an open menu; text editing is the composer's.
+    /// Escape closes an open menu, or else stops the shown thread's turn. Text
+    /// editing is the composer's.
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.menu.is_some() && ev.keystroke.key == "escape" {
-            self.menu = None;
+        // A held key must not close a menu and then go on to stop the turn.
+        if ev.keystroke.key != "escape" || ev.is_held {
+            return;
+        }
+        if self.menu.take().is_some() {
+            cx.notify();
+        } else if let Some(id) = self.selected {
+            self.stop(id, cx);
+        }
+    }
+
+    /// Stop the thread's turn. It stays running until the process has exited.
+    fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(process) = self.turns.get(&id) {
+            process.stop();
             cx.notify();
         }
     }
@@ -210,7 +227,7 @@ impl Workspace {
         let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
         let mut granted = allowed_tools;
         granted.extend(web_allowed.iter().map(|t| t.to_string()));
-        let rx = claude::run(claude::Turn {
+        let started = claude::run(claude::Turn {
             dir,
             prompt,
             resume: thread.session_id.clone(),
@@ -220,14 +237,26 @@ impl Workspace {
             disallowed_tools: web_disallowed.iter().map(|t| t.to_string()).collect(),
         });
         cx.notify();
+        let (process, rx) = match started {
+            Ok(started) => started,
+            Err(e) => {
+                let error = Some(format!("could not start claude: {e}"));
+                self.apply(id, AgentEvent::Done { error }, &granted);
+                self.save();
+                return;
+            }
+        };
+        self.turns.insert(id, process);
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
-                let done = matches!(ev, AgentEvent::Done { .. });
+                let done = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Stopped);
                 let _ = this.update(cx, |this, cx| {
-                    let finished = matches!(ev, AgentEvent::Done { .. });
+                    if done {
+                        this.turns.remove(&id);
+                    }
                     let retry = this.apply(id, ev, &granted);
-                    if finished {
+                    if done {
                         this.save();
                     }
                     if let Some(rules) = retry {
@@ -293,6 +322,7 @@ impl Workspace {
                         if thread.pending.is_empty() { Status::Idle } else { Status::NeedsInput };
                 }
             }
+            AgentEvent::Stopped => thread.stop_turn(),
         }
         None
     }
@@ -716,24 +746,51 @@ impl Workspace {
             })
     }
 
-    fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The round button at the composer's corner. The caller adds its mark.
+    fn round_button(&self, id: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
-        let running = thread.status == Status::Running;
-        let ready = !running && !self.input.read(cx).text().trim().is_empty();
-        let note = if running {
-            Some("Working…".to_string())
-        } else {
-            thread.reported_model.clone()
-        };
-        let send = div().id("send").flex().flex_shrink_0().items_center().justify_center()
+        div().id(id).flex().flex_shrink_0().items_center().justify_center()
             .size(px(28.)).rounded_full().text_sm().font_weight(FontWeight::BOLD)
-            .when(ready, |d| {
+            .when(enabled, |d| {
                 d.bg(theme.accent).text_color(theme.on_accent).cursor_pointer()
                     .hover(|h| h.opacity(0.85))
             })
-            .when(!ready, |d| d.bg(theme.selected).text_color(theme.muted))
+            .when(!enabled, |d| d.bg(theme.selected).text_color(theme.muted))
+    }
+
+    fn send_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let ready = !self.input.read(cx).text().trim().is_empty();
+        self.round_button("send", ready)
             .child("↑")
-            .on_click(cx.listener(|this, _, _, cx| this.submit(cx)));
+            .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
+    }
+
+    /// Takes the send button's place while a turn runs.
+    fn stop_button(&self, id: u64, enabled: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mark = if enabled { self.theme.on_accent } else { self.theme.muted };
+        self.round_button("stop", enabled)
+            .child(div().size(px(10.)).rounded(px(2.)).bg(mark))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.stop(id, cx);
+                // The click took focus; hand it back for the next message.
+                window.focus(&this.input.focus_handle(cx), cx);
+            }))
+    }
+
+    fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let running = thread.status == Status::Running;
+        let stopping = self.turns.get(&thread.id).is_some_and(Process::stop_requested);
+        let note = match (running, stopping) {
+            (_, true) => Some("Stopping…".to_string()),
+            (true, false) => Some("Working… Esc to stop".to_string()),
+            (false, false) => thread.reported_model.clone(),
+        };
+        let button = if running {
+            self.stop_button(thread.id, !stopping, cx)
+        } else {
+            self.send_button(cx)
+        };
         centered(
             div().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
                 .bg(theme.card).border_1().border_color(theme.border).shadow_md()
@@ -752,7 +809,7 @@ impl Workspace {
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
                             .when_some(note, |d, note| d.child(note)))
-                        .child(send),
+                        .child(button),
                 ),
         )
         .flex_shrink_0()

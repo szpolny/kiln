@@ -1,6 +1,7 @@
 //! Adapters that run coding agents as local child processes.
 
 pub mod claude;
+pub mod process;
 pub mod project;
 
 /// Provider-neutral event stream a thread consumes.
@@ -22,4 +23,6 @@ pub enum AgentEvent {
     },
     /// The turn finished. `error` carries a message when it failed.
     Done { error: Option<String> },
+    /// The turn was stopped on request and its process has exited.
+    Stopped,
 }

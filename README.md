@@ -14,6 +14,7 @@ Kiln runs agents as local processes and gives you one place to start, watch, app
 - A model, a reasoning level, and a web access setting for each thread.
 - Markdown replies, with the tool calls and commands the agent runs.
 - Approving or denying actions the agent was refused.
+- Stopping a running turn with the stop button or Escape.
 
 Kiln does not sandbox the agent: your own Claude Code settings still apply, and anything they allow runs without Kiln asking.
 

@@ -211,6 +211,14 @@ impl Thread {
     pub fn effort(&self) -> Effort {
         self.effort.unwrap_or(self.agent.default_effort())
     }
+
+    /// Settle a turn the user stopped. Nothing it asked for stays waiting.
+    pub fn stop_turn(&mut self) {
+        self.status = Status::Idle;
+        self.pending.clear();
+        self.auto_allow.clear();
+        self.messages.push(Message::notice("Stopped"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +350,26 @@ mod tests {
         assert_eq!(t.model(), "claude-haiku-5-5");
         assert_eq!(t.agent.model_name(t.model()), "Haiku 5.5");
         assert_eq!(t.agent.model_name("claude-mystery-9"), "claude-mystery-9");
+    }
+
+    #[test]
+    fn a_stopped_turn_leaves_the_thread_idle_and_keeps_its_session() {
+        let mut t = Thread::new(1, Agent::Claude);
+        t.status = Status::Running;
+        t.session_id = Some("sess-1".into());
+        t.messages.push(Message::user("go"));
+        t.auto_allow.push("WebSearch".into());
+        t.pending.push(Approval {
+            tool: "Bash".into(),
+            summary: "$ touch a".into(),
+            rule: "Bash(touch a)".into(),
+        });
+        t.stop_turn();
+        assert_eq!(t.status, Status::Idle);
+        assert!(t.pending.is_empty() && t.auto_allow.is_empty());
+        assert_eq!(t.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[1].role, Role::Notice);
     }
 
     #[test]

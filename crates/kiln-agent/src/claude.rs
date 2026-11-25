@@ -1,10 +1,11 @@
 //! Claude Code adapter: one `claude -p` process per turn, resumed by session id.
 
+use crate::process::{self, Process};
 use crate::AgentEvent;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Parse one stream-json line into zero or more events.
 pub fn parse_line(line: &str) -> Vec<AgentEvent> {
@@ -171,65 +172,32 @@ pub struct Turn {
     pub disallowed_tools: Vec<String>,
 }
 
-/// Start a turn. Events arrive on the returned channel; it closes when the
-/// process exits. The sender thread always ends with a `Done`.
-pub fn run(turn: Turn) -> async_channel::Receiver<AgentEvent> {
-    let (tx, rx) = async_channel::unbounded();
-    std::thread::spawn(move || {
-        let mut cmd = Command::new("claude");
-        cmd.current_dir(&turn.dir)
-            .args(["-p", &turn.prompt, "--output-format", "stream-json", "--verbose"])
-            // Privacy: no telemetry or non-essential traffic from the child.
-            .env("DISABLE_TELEMETRY", "1")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null());
-        if let Some(id) = &turn.resume {
-            cmd.args(["--resume", id]);
-        }
-        if let Some(model) = &turn.model {
-            cmd.args(["--model", model]);
-        }
-        if let Some(effort) = &turn.effort {
-            // The variable outranks the flag and would silently undo the choice.
-            cmd.args(["--effort", effort]).env_remove("CLAUDE_CODE_EFFORT_LEVEL");
-        }
-        if !turn.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").args(&turn.allowed_tools);
-        }
-        if !turn.disallowed_tools.is_empty() {
-            cmd.arg("--disallowedTools").args(&turn.disallowed_tools);
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send_blocking(AgentEvent::Done {
-                    error: Some(format!("could not start claude: {e}")),
-                });
-                return;
-            }
-        };
-        let mut finished = false;
-        if let Some(out) = child.stdout.take() {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                for ev in parse_line(&line) {
-                    finished |= matches!(ev, AgentEvent::Done { .. });
-                    if tx.send_blocking(ev).is_err() {
-                        let _ = child.kill();
-                        return;
-                    }
-                }
-            }
-        }
-        let _ = child.wait();
-        if !finished {
-            let _ = tx.send_blocking(AgentEvent::Done {
-                error: Some("claude exited without a result".into()),
-            });
-        }
-    });
-    rx
+/// Start a turn: its process, and the events it produces. The last event is
+/// `Done` or `Stopped`.
+pub fn run(turn: Turn) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)> {
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(&turn.dir)
+        .args(["-p", &turn.prompt, "--output-format", "stream-json", "--verbose"])
+        // Privacy: no telemetry or non-essential traffic from the child.
+        .env("DISABLE_TELEMETRY", "1")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    if let Some(id) = &turn.resume {
+        cmd.args(["--resume", id]);
+    }
+    if let Some(model) = &turn.model {
+        cmd.args(["--model", model]);
+    }
+    if let Some(effort) = &turn.effort {
+        // The variable outranks the flag and would silently undo the choice.
+        cmd.args(["--effort", effort]).env_remove("CLAUDE_CODE_EFFORT_LEVEL");
+    }
+    if !turn.allowed_tools.is_empty() {
+        cmd.arg("--allowedTools").args(&turn.allowed_tools);
+    }
+    if !turn.disallowed_tools.is_empty() {
+        cmd.arg("--disallowedTools").args(&turn.disallowed_tools);
+    }
+    process::spawn(cmd, parse_line)
 }
 
 #[cfg(test)]
@@ -343,7 +311,7 @@ mod live {
         let dir = std::env::temp_dir().join(format!("kiln-approval-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let collect = |t: Turn| -> Vec<AgentEvent> {
-            let rx = run(t);
+            let (_process, rx) = run(t).unwrap();
             std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
         };
         let first = collect(Turn {
@@ -398,7 +366,7 @@ mod live {
             file.display()
         );
         let turn = |allowed_tools| -> Vec<AgentEvent> {
-            let rx = run(Turn {
+            let turn = Turn {
                 dir: dir.clone(),
                 prompt: prompt.clone(),
                 resume: None,
@@ -406,7 +374,8 @@ mod live {
                 effort: None,
                 allowed_tools,
                 disallowed_tools: vec![],
-            });
+            };
+            let (_process, rx) = run(turn).unwrap();
             std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
         };
         let rules: Vec<_> = turn(vec![])
@@ -425,11 +394,52 @@ mod live {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Stop a turn while its shell command runs: the process and the command end,
+    /// and the session still resumes.
+    #[test]
+    #[ignore]
+    fn live_stop_then_resume() {
+        let dir = std::env::temp_dir().join(format!("kiln-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("slow.sh"), "sleep 20\ntouch finished.txt\n").unwrap();
+        let turn = |prompt: &str, resume| Turn {
+            dir: dir.clone(),
+            prompt: prompt.into(),
+            resume,
+            model: None,
+            effort: None,
+            allowed_tools: vec!["Bash(bash slow.sh)".into()],
+            disallowed_tools: vec![],
+        };
+        let (process, rx) =
+            run(turn("run this shell command in the foreground: bash slow.sh", None)).unwrap();
+        let mut session = None;
+        loop {
+            match rx.recv_blocking().expect("ended before running a tool") {
+                AgentEvent::Session(id) => session = Some(id),
+                AgentEvent::Tool { .. } => break,
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        process.stop();
+        let after: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
+        assert_eq!(after.last(), Some(&AgentEvent::Stopped));
+        // Long enough for the command to finish, had it been left running.
+        std::thread::sleep(std::time::Duration::from_secs(22));
+        assert!(!dir.join("finished.txt").exists());
+
+        let (_process, rx) = run(turn("reply with the single word: ok", session)).unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
+        assert_eq!(events.last(), Some(&AgentEvent::Done { error: None }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Needs the `claude` CLI and network: `cargo test -p kiln-agent -- --ignored`.
     #[test]
     #[ignore]
     fn live_turn_streams_session_text_and_done() {
-        let rx = run(Turn {
+        let turn = Turn {
             dir: std::env::temp_dir(),
             prompt: "reply with the single word: ok".into(),
             resume: None,
@@ -437,7 +447,8 @@ mod live {
             effort: None,
             allowed_tools: vec![],
             disallowed_tools: vec![],
-        });
+        };
+        let (_process, rx) = run(turn).unwrap();
         let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Session(_))));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(_))));

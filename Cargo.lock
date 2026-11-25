@@ -2556,6 +2556,7 @@ name = "kiln-agent"
 version = "0.0.1"
 dependencies = [
  "async-channel",
+ "libc",
  "serde_json",
 ]
 
