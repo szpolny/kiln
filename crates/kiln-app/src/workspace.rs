@@ -9,10 +9,10 @@ use crate::transcript::{self, Entry};
 use chrono::{Local, TimeZone};
 use gpui::{
     anchored, canvas, deferred, div, fill, img, list, point, prelude::*, px, relative, rgb, size,
-    svg, Anchor, AnchoredPositionMode, Bounds, Context, DispatchPhase, Entity, FocusHandle, Focusable,
-    FontWeight, HitboxBehavior, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render, RenderImage,
-    ScrollHandle, SharedString, Task, Window,
+    svg, Anchor, AnchoredPositionMode, Animation, AnimationExt, Bounds, Context, DispatchPhase,
+    Entity, FocusHandle, Focusable, FontWeight, HitboxBehavior, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Render, RenderImage, ScrollHandle, SharedString, Task, Window,
 };
 use kiln_agent::{claude, codex, process::Process, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, WEB_TOOLS};
@@ -409,6 +409,13 @@ impl Workspace {
         self.transcript_thread = None; // show what was just sent
         self.save();
         self.start_turn(id, body, vec![], cx);
+    }
+
+    fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.store.thread(id).and_then(Thread::resume_prompt) {
+            self.transcript_thread = None;
+            self.start_turn(id, prompt, vec![], cx);
+        }
     }
 
     /// Run one agent turn and fold its events into the thread.
@@ -1176,6 +1183,7 @@ impl Workspace {
         match self.entries.get(row) {
             Some(&Entry::Message(ix)) => self.message(id, ix),
             Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
+            Some(&Entry::Activity) => self.turn_activity(id).into_any_element(),
             None => div().into_any_element(),
         }
     }
@@ -1286,18 +1294,54 @@ impl Workspace {
             }))
     }
 
+    fn resume_button(&self, id: u64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        self.round_button("resume", true)
+            .w_auto().px_2p5().gap_1().text_xs().font_weight(FontWeight::SEMIBOLD)
+            .child(assets::icon(assets::Icon::Play, 12.))
+            .child("Resume")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.resume(id, cx);
+                window.focus(&this.input.focus_handle(cx), cx);
+            }))
+    }
+
+    fn turn_activity(&self, id: u64) -> impl IntoElement {
+        let theme = self.theme;
+        let stopping = self.turns.get(&id).is_some_and(|turn| turn.process.stop_requested());
+        let waiting = self.has_live_approval(id);
+        let (label, color) = if stopping {
+            ("Stopping…", theme.muted)
+        } else if waiting {
+            ("Waiting for approval", theme.warn)
+        } else {
+            ("Working…", theme.muted)
+        };
+        let dot = div().size(px(7.)).rounded_full().bg(color);
+        let dot = if stopping || waiting {
+            dot.into_any_element()
+        } else {
+            dot.with_animation(
+                ("agent-activity", id),
+                Animation::new(Duration::from_millis(1200)).repeat().with_max_fps(20.),
+                |dot, phase| dot.opacity(1. - 1.2 * phase.min(1. - phase)),
+            ).into_any_element()
+        };
+        centered(div().flex().items_center().gap_2().text_xs().text_color(theme.muted)
+            .child(dot)
+            .child(label))
+            .px_6().py_1p5()
+    }
+
     fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let running = thread.status == Status::Running;
         let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
-        let note = match (running, stopping) {
-            (_, true) => Some("Stopping…".to_string()),
-            (true, false) if self.has_live_approval(thread.id) => Some("Waiting for approval".to_string()),
-            (true, false) => Some("Working… Esc to stop".to_string()),
-            (false, false) => thread.reported_model.clone(),
-        };
+        let stopped = thread.status == Status::Stopped;
+        let has_draft = stopped && !self.input.read(cx).text().trim().is_empty();
         let button = if running {
             self.stop_button(thread.id, !stopping, cx)
+        } else if stopped {
+            self.resume_button(thread.id, cx)
         } else {
             self.send_button(cx)
         };
@@ -1318,7 +1362,8 @@ impl Workspace {
                             .child(self.effort_picker(thread, window, cx)))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
-                            .when_some(note, |d, note| d.child(note)))
+                            .when(running && !stopping, |d| d.child("Esc to stop")))
+                        .when(has_draft, |d| d.child(self.send_button(cx)))
                         .child(button),
                 ),
         )

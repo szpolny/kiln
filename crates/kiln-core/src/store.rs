@@ -9,6 +9,7 @@ pub enum Status {
     Running,
     NeedsInput,
     Idle,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,10 +321,24 @@ impl Thread {
 
     /// End a turn the user stopped. Nothing it asked for stays waiting.
     pub fn stop_turn(&mut self) {
-        self.status = Status::Idle;
+        self.status = Status::Stopped;
         self.pending.clear();
         self.auto_allow.clear();
         self.messages.push(Message::notice("Stopped"));
+    }
+
+    /// Continue the latest request in the provider session, or send it again
+    /// if the turn stopped before there was a session to resume.
+    pub fn resume_prompt(&self) -> Option<String> {
+        if self.status != Status::Stopped {
+            return None;
+        }
+        let request = self.messages.iter().rev().find(|m| m.role == Role::User)?;
+        Some(if self.session_id.is_some() {
+            format!("Continue working on my last request:\n\n{}", request.body)
+        } else {
+            request.body.clone()
+        })
     }
 }
 
@@ -540,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_turn_leaves_the_thread_idle_and_keeps_its_session() {
+    fn a_stopped_turn_can_resume_with_or_without_a_session() {
         let mut t = Thread::new(1, Agent::Claude, 0);
         t.status = Status::Running;
         t.session_id = Some("sess-1".into());
@@ -552,11 +567,19 @@ mod tests {
             rule: "Bash(touch a)".into(),
         });
         t.stop_turn();
-        assert_eq!(t.status, Status::Idle);
+        assert_eq!(t.status, Status::Stopped);
         assert!(t.pending.is_empty() && t.auto_allow.is_empty());
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.messages.len(), 2);
         assert_eq!(t.messages[1].role, Role::Notice);
+        assert_eq!(
+            t.resume_prompt().as_deref(),
+            Some("Continue working on my last request:\n\ngo"),
+        );
+        t.session_id = None;
+        assert_eq!(t.resume_prompt().as_deref(), Some("go"));
+        assert!(t.settle());
+        assert_eq!(t.resume_prompt(), None);
     }
 
     #[test]

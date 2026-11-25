@@ -12,6 +12,8 @@ pub enum Entry {
     /// The row that opens and closes the work starting at message `start`.
     /// `reply` is the last message of the reply it led to.
     Work { start: usize, reply: usize },
+    /// Live turn status after the latest message.
+    Activity,
 }
 
 /// The title of a work row: how long the agent ran, in its two largest units.
@@ -48,10 +50,10 @@ where
 }
 
 /// The rows for `messages`. `running` says a turn is in progress, which keeps
-/// everything since the last user message in view. `open` says whether the work
-/// starting at an index is expanded.
+/// the latest turn's work in view and adds an activity row at the end. `open` says
+/// whether the work starting at an index is expanded.
 pub fn entries(messages: &[Message], running: bool, open: impl Fn(usize) -> bool) -> Vec<Entry> {
-    let mut out = Vec::with_capacity(messages.len());
+    let mut out = Vec::with_capacity(messages.len() + usize::from(running));
     let mut start = 0;
     // What the agent did between one user message and the next.
     for turn in messages.split_inclusive(|m| m.role == Role::User) {
@@ -67,6 +69,9 @@ pub fn entries(messages: &[Message], running: bool, open: impl Fn(usize) -> bool
         }
         out.extend((shown..end).map(Entry::Message));
         start = end;
+    }
+    if running {
+        out.push(Entry::Activity);
     }
     out
 }
@@ -86,7 +91,7 @@ fn reply(turn: &[Message]) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::Entry::Message as M;
+    use super::Entry::{Activity, Message as M};
     use super::*;
     use chrono::Utc;
 
@@ -147,12 +152,23 @@ mod tests {
         messages.extend(turn());
         assert_eq!(
             entries(&messages, true, |_| false),
-            [M(0), work(1, 3), M(3), M(4), M(5), M(6), M(7)]
+            [M(0), work(1, 3), M(3), M(4), M(5), M(6), M(7), Activity]
         );
         assert_eq!(
             entries(&messages, false, |_| false),
             [M(0), work(1, 3), M(3), M(4), work(5, 7), M(7)]
         );
+    }
+
+    #[test]
+    fn activity_follows_the_latest_message_until_the_turn_ends() {
+        let mut messages = vec![Message::user("go")];
+        assert_eq!(entries(&messages, true, |_| false), [M(0), Activity]);
+        messages.push(Message::agent("Looking."));
+        assert_eq!(entries(&messages, true, |_| false), [M(0), M(1), Activity]);
+        messages.push(Message::agent("Done."));
+        assert_eq!(entries(&messages, true, |_| false), [M(0), M(1), M(2), Activity]);
+        assert_eq!(entries(&messages, false, |_| false), [M(0), M(1), M(2)]);
     }
 
     #[test]
