@@ -79,7 +79,7 @@ mod tests {
         let id = store.projects[0].threads[0].id;
         let t = store.thread_mut(id).unwrap();
         t.session_id = Some("sess-1".into());
-        t.model = Some("opus".into());
+        t.model = Some("claude-sonnet-5-5".into());
         t.pending.push(Approval {
             tool: "Bash".into(),
             summary: "touch a".into(),
@@ -91,7 +91,7 @@ mod tests {
         let Loaded::Ok(back) = load(&path).unwrap() else { panic!("expected state") };
         let t = back.thread(id).unwrap();
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(t.model.as_deref(), Some("opus"));
+        assert_eq!(t.model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(t.pending.len(), 1);
         assert_eq!(t.policy.network, crate::policy::Decision::Allow);
     }

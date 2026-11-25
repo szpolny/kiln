@@ -68,13 +68,39 @@ impl Agent {
         }
     }
 
-    /// Model aliases this agent accepts. Aliases follow the provider's latest
-    /// release, so the list needs no remote lookup.
-    pub fn models(self) -> &'static [&'static str] {
+    /// Exact models this agent offers. Pinned rather than looked up, so the
+    /// list never needs the network; a new release means updating it.
+    pub fn models(self) -> &'static [Model] {
         match self {
-            Agent::Claude => &["fable", "opus", "sonnet", "haiku"],
+            Agent::Claude => &[
+                Model { id: "claude-fable-5-2", name: "Fable 5.2", alias: "fable" },
+                Model { id: "claude-opus-5-5", name: "Opus 5.5", alias: "opus" },
+                Model { id: "claude-sonnet-5-5", name: "Sonnet 5.5", alias: "sonnet" },
+                Model { id: "claude-haiku-5-5", name: "Haiku 5.5", alias: "haiku" },
+            ],
         }
     }
+
+    /// Model used until the user picks one.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude-opus-5-5",
+        }
+    }
+
+    /// Display name for a model id, or the id itself when it is not listed.
+    pub fn model_name(self, id: &str) -> &str {
+        self.models().iter().find(|m| m.id == id).map_or(id, |m| m.name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Model {
+    /// Exact id passed to the agent.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Moving alias earlier versions stored; mapped to `id` on load.
+    pub alias: &'static str,
 }
 
 pub const NEW_THREAD_TITLE: &str = "New thread";
@@ -87,7 +113,7 @@ pub struct Thread {
     pub title: String,
     #[serde(default)]
     pub agent: Agent,
-    /// Model requested for the next turn; `None` leaves it to the agent.
+    /// Model requested for the next turn; `None` means the agent's default model.
     #[serde(default)]
     pub model: Option<String>,
     /// Model the agent reported for its most recent turn.
@@ -119,6 +145,11 @@ impl Thread {
             pending: vec![],
             auto_allow: vec![],
         }
+    }
+
+    /// Model the next turn runs with.
+    pub fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or(self.agent.default_model())
     }
 }
 
@@ -152,6 +183,9 @@ impl Store {
             if t.id == 0 {
                 max += 1;
                 t.id = max;
+            }
+            if let Some(m) = t.agent.models().iter().find(|m| t.model.as_deref() == Some(m.alias)) {
+                t.model = Some(m.id.to_string());
             }
         }
         self.next_id = max;
@@ -239,6 +273,26 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_without_a_choice_uses_the_default_model() {
+        let mut t = Thread::new(1, Agent::Claude);
+        assert_eq!(t.model(), "claude-opus-5-5");
+        t.model = Some("claude-haiku-5-5".into());
+        assert_eq!(t.model(), "claude-haiku-5-5");
+        assert_eq!(t.agent.model_name(t.model()), "Haiku 5.5");
+        assert_eq!(t.agent.model_name("claude-mystery-9"), "claude-mystery-9");
+    }
+
+    #[test]
+    fn normalize_pins_stored_model_aliases() {
+        let mut s = Store::sample();
+        s.projects[0].threads[0].model = Some("sonnet".into());
+        s.projects[0].threads[1].model = Some("claude-custom-1".into());
+        s.normalize();
+        assert_eq!(s.projects[0].threads[0].model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(s.projects[0].threads[1].model.as_deref(), Some("claude-custom-1"));
+    }
 
     #[test]
     fn new_threads_get_the_default_policy_and_unique_ids() {

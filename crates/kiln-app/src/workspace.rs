@@ -1,8 +1,9 @@
+use crate::assets;
 use crate::markdown;
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
-    anchored, deferred, div, list, point, prelude::*, px, relative, AnchoredPositionMode, Context,
+    anchored, deferred, div, list, point, prelude::*, px, relative, rgb, svg, AnchoredPositionMode, Context,
     Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
     ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
@@ -39,6 +40,7 @@ pub struct Workspace {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
+    Model,
     Web,
 }
 
@@ -209,7 +211,7 @@ impl Workspace {
             dir,
             prompt,
             resume: thread.session_id.clone(),
-            model: thread.model.clone(),
+            model: Some(thread.model().to_string()),
             allowed_tools: granted.clone(),
             disallowed_tools: web_disallowed.iter().map(|t| t.to_string()).collect(),
         });
@@ -347,38 +349,52 @@ impl Workspace {
         col
     }
 
-    fn set_model(&mut self, id: u64, model: Option<&str>, cx: &mut Context<Self>) {
+    fn set_model(&mut self, id: u64, model: &str, cx: &mut Context<Self>) {
         if let Some(thread) = self.store.thread_mut(id) {
-            thread.model = model.map(str::to_string);
+            thread.model = Some(model.to_string());
             self.save();
             cx.notify();
         }
     }
 
-    /// Segmented control; the choice applies from the next turn.
-    fn model_chooser(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Compact picker in the composer footer; the choice applies from the next turn.
+    fn model_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let open = self.menu == Some(Menu::Model);
+        let button = div().id("model-picker").flex().items_center().gap_1p5().h(px(26.)).px_2()
+            .rounded_md().text_xs().cursor_pointer()
+            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
+            .when(!open, |d| d.text_color(theme.muted).hover(|h| h.bg(theme.hover).text_color(theme.text)))
+            .child(agent_icon(thread.agent, 13.))
+            .child(div().font_weight(FontWeight::MEDIUM)
+                .child(thread.agent.model_name(thread.model()).to_string()))
+            .child(div().text_color(theme.muted).child("▾"))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Model, cx)));
+        let mut picker = div().relative().child(button);
+        if !open {
+            return picker;
+        }
         let id = thread.id;
-        let mut track = div().flex().gap_0p5().p_0p5().rounded_lg().bg(theme.fill);
-        let choices = std::iter::once(None).chain(thread.agent.models().iter().copied().map(Some));
-        for choice in choices {
-            let label = choice.map_or_else(|| "Default".to_string(), capitalized);
-            let active = thread.model.as_deref() == choice;
-            track = track.child(
-                div().id(SharedString::from(format!("model-{label}")))
-                    .px_2p5().py_0p5().rounded_md().text_xs().cursor_pointer()
-                    .when(active, |d| {
-                        d.bg(theme.segment).shadow_sm().text_color(theme.text)
-                            .font_weight(FontWeight::MEDIUM)
-                    })
-                    .when(!active, |d| {
-                        d.text_color(theme.muted).hover(|h| h.text_color(theme.text))
-                    })
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_model(id, choice, cx))),
+        let mut menu = self.menu_panel("model-menu", capitalized(thread.agent.label())).mb_2();
+        for model in thread.agent.models() {
+            let (model_id, active) = (model.id, thread.model() == model.id);
+            let key = SharedString::from(format!("model-{model_id}"));
+            menu = menu.child(
+                self.menu_item(key, Some(thread.agent), model.name, None, active)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.set_model(id, model_id, cx);
+                    })),
             );
         }
-        track
+        // Anchored at the button's top-left corner, so the menu opens above it.
+        picker = picker
+            .child(self.backdrop(window, cx))
+            .child(div().absolute().top_0().left_0().child(
+                deferred(anchored().anchor(Corner::BottomLeft).snap_to_window().child(menu))
+                    .with_priority(2),
+            ));
+        picker
     }
 
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
@@ -413,6 +429,7 @@ impl Workspace {
     fn menu_item(
         &self,
         id: impl Into<SharedString>,
+        icon: Option<Agent>,
         label: impl Into<SharedString>,
         hint: Option<&'static str>,
         active: bool,
@@ -420,6 +437,7 @@ impl Workspace {
         let theme = self.theme;
         div().id(id.into()).flex().items_center().gap_2().h(px(28.)).px_2().rounded_md().text_sm()
             .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
+            .when_some(icon, |d, agent| d.child(agent_icon(agent, 14.)))
             .child(div().flex_1().child(label.into()))
             .when_some(hint, |d, hint| {
                 d.child(div().text_xs().text_color(theme.muted).child(hint))
@@ -468,7 +486,7 @@ impl Workspace {
         ] {
             let key = SharedString::from(format!("web-{label}"));
             menu = menu.child(
-                self.menu_item(key, label, None, current == access)
+                self.menu_item(key, None, label, None, current == access)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
                         this.set_web_access(id, access, cx);
@@ -625,7 +643,7 @@ impl Workspace {
             })
     }
 
-    fn composer(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+    fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let running = thread.status == Status::Running;
         let ready = !running && !self.input.read(cx).text().trim().is_empty();
@@ -655,8 +673,8 @@ impl Workspace {
                         .px_2().py_1p5().text_sm().child(self.input.clone()),
                 )
                 .child(
-                    div().flex().items_center().gap_3()
-                        .child(self.model_chooser(thread, cx))
+                    div().flex().items_center().gap_3().pl_0p5()
+                        .child(self.model_picker(thread, window, cx))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
                             .when_some(note, |d, note| d.child(note)))
@@ -696,9 +714,17 @@ impl Workspace {
             .child(self.toolbar(thread, window, cx))
             .child(messages)
             .child(self.approval_cards(id, cx))
-            .child(self.composer(thread, cx))
+            .child(self.composer(thread, window, cx))
             .into_any_element()
     }
+}
+
+/// The provider's mark, in its brand color.
+fn agent_icon(agent: Agent, size: f32) -> impl IntoElement {
+    let (path, color) = match agent {
+        Agent::Claude => (assets::CLAUDE, rgb(0xd97757)),
+    };
+    svg().path(path).flex_shrink_0().size(px(size)).text_color(color)
 }
 
 fn capitalized(word: &str) -> String {

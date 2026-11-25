@@ -1,3 +1,4 @@
+mod assets;
 mod markdown;
 mod text_edit;
 mod text_input;
@@ -10,7 +11,7 @@ use gpui::{
 };
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         text_input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(

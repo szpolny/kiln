@@ -27,8 +27,6 @@ pub struct Theme {
     pub sidebar: Rgba,
     /// Raised surfaces: composer and approval cards.
     pub card: Rgba,
-    /// The selected choice in a segmented control.
-    pub segment: Rgba,
     /// Quiet fill for tool calls, code and control tracks.
     pub fill: Rgba,
     pub border: Rgba,
@@ -51,7 +49,6 @@ impl Theme {
                 window: rgb(0xffffff),
                 sidebar: rgba(0xf2f2f400 | sidebar_alpha),
                 card: rgb(0xffffff),
-                segment: rgb(0xffffff),
                 fill: rgb(0xf5f5f7),
                 border: rgba(0x00000017),
                 hover: rgba(0x0000000a),
@@ -68,7 +65,6 @@ impl Theme {
                 window: rgb(0x1e1e1f),
                 sidebar: rgba(0x28282a00 | sidebar_alpha),
                 card: rgb(0x2c2c2e),
-                segment: rgb(0x5a5a5f),
                 fill: rgb(0x242426),
                 border: rgba(0xffffff17),
                 hover: rgba(0xffffff0d),
