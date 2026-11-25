@@ -1,9 +1,10 @@
 use crate::markdown;
+use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
     anchored, deferred, div, list, point, prelude::*, px, relative, AnchoredPositionMode, Context,
     Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
-    ListState, MouseButton, PathPromptOptions, Render, SharedString, Window,
+    ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
@@ -22,7 +23,7 @@ pub struct Workspace {
     /// None disables saving (e.g. the existing file could not be read).
     state_path: Option<std::path::PathBuf>,
     selected: Option<u64>,
-    draft: String,
+    input: Entity<TextInput>,
     focus: FocusHandle,
     /// Palette for the current system appearance, refreshed every render.
     theme: Theme,
@@ -59,11 +60,17 @@ impl Workspace {
         };
         let selected = store.first_thread_id();
         let font = ui_font(&cx.text_system().all_font_names());
+        let input = cx.new(|cx| TextInput::new("Ask the agent to do something", window, cx));
+        cx.subscribe(&input, |this, _, ev, cx| match ev {
+            InputEvent::Submit => this.submit(cx),
+            InputEvent::Changed => cx.notify(),
+        })
+        .detach();
         Self {
             store,
             state_path,
             selected,
-            draft: String::new(),
+            input,
             focus: cx.focus_handle(),
             theme: Theme::new(window.appearance(), font),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
@@ -148,34 +155,16 @@ impl Workspace {
         }
     }
 
+    /// Escape closes an open menu; text editing is the composer's.
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        if self.menu.is_some() {
-            if ks.key == "escape" {
-                self.menu = None;
-                cx.notify();
-            }
-            return;
+        if self.menu.is_some() && ev.keystroke.key == "escape" {
+            self.menu = None;
+            cx.notify();
         }
-        if self.selected.is_none() || ks.modifiers.platform || ks.modifiers.control {
-            return;
-        }
-        match ks.key.as_str() {
-            "enter" => self.submit(cx),
-            "backspace" => {
-                self.draft.pop();
-            }
-            _ => {
-                if let Some(ch) = &ks.key_char {
-                    self.draft.push_str(ch);
-                }
-            }
-        }
-        cx.notify();
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let body = self.draft.trim().to_string();
+        let body = self.input.read(cx).text().trim().to_string();
         let Some(id) = self.selected else { return };
         if body.is_empty() {
             return;
@@ -192,7 +181,7 @@ impl Workspace {
             thread.title = body.chars().take(40).collect();
         }
         thread.messages.push(Message::user(body.clone()));
-        self.draft.clear();
+        self.input.update(cx, |input, cx| input.clear(cx));
         self.transcript_thread = None; // show what was just sent
         self.save();
         self.start_turn(id, body, vec![], cx);
@@ -549,7 +538,7 @@ impl Workspace {
                         .when(!active, |d| d.hover(|h| h.bg(theme.hover)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected = Some(id);
-                            window.focus(&this.focus);
+                            window.focus(&this.input.focus_handle(cx));
                             cx.notify();
                         }))
                         .child(self.status_mark(t.status))
@@ -639,12 +628,7 @@ impl Workspace {
     fn composer(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let running = thread.status == Status::Running;
-        let ready = !running && !self.draft.trim().is_empty();
-        let text = if self.draft.is_empty() {
-            div().text_color(theme.muted).child("Ask the agent to do something")
-        } else {
-            div().text_color(theme.text).child(format!("{}▏", self.draft))
-        };
+        let ready = !running && !self.input.read(cx).text().trim().is_empty();
         let note = if running {
             Some("Working…".to_string())
         } else {
@@ -664,10 +648,11 @@ impl Workspace {
             div().flex().flex_col().gap_2().w_full().max_w(px(COLUMN)).p_2().rounded(px(16.))
                 .bg(theme.card).border_1().border_color(theme.border).shadow_md()
                 .child(
-                    div().id("composer").track_focus(&self.focus)
-                        .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
-                        .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
-                        .px_2().py_1p5().text_sm().child(text),
+                    div().id("composer")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.input.focus_handle(cx))
+                        }))
+                        .px_2().py_1p5().text_sm().child(self.input.clone()),
                 )
                 .child(
                     div().flex().items_center().gap_3()
@@ -729,13 +714,25 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focus.is_focused(window) {
-            window.focus(&self.focus);
+        if window.focused(cx).is_none() {
+            window.focus(&self.input.focus_handle(cx));
         }
         self.theme = Theme::new(window.appearance(), self.theme.font);
+        let theme = self.theme;
+        let selection = gpui::Rgba { a: 0.3, ..theme.accent };
+        self.input.update(cx, |input, _| {
+            input.colors = text_input::Colors {
+                text: theme.text.into(),
+                placeholder: theme.muted.into(),
+                caret: theme.accent.into(),
+                selection: selection.into(),
+            }
+        });
         self.sync_transcript();
         // No root background: the macOS sidebar lets the blur through.
         div().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
             .child(self.sidebar(cx))
             .child(match self.selected {
                 Some(id) => self.thread(id, window, cx),

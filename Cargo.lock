@@ -2868,6 +2868,7 @@ dependencies = [
  "kiln-agent",
  "kiln-core",
  "pulldown-cmark",
+ "unicode-segmentation",
 ]
 
 [[package]]
