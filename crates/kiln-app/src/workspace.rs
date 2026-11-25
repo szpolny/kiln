@@ -1,7 +1,7 @@
 use crate::theme;
 use gpui::{
-    div, list, prelude::*, px, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, PathPromptOptions, Render, SharedString, Window,
+    div, list, prelude::*, px, Context, FocusHandle, Focusable, FontWeight, IntoElement,
+    KeyDownEvent, ListAlignment, ListState, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Decision};
@@ -281,19 +281,19 @@ impl Workspace {
     }
 
     fn approval_cards(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut col = div().id("approvals").flex().flex_col().flex_shrink_0().gap_2().px_4()
+        let mut col = div().id("approvals").flex().flex_col().flex_shrink_0().gap_2().px_6().pb_2()
             .max_h(px(240.)).overflow_y_scroll();
         let pending = self.store.thread(id).map(|th| th.pending.clone()).unwrap_or_default();
         for (i, a) in pending.into_iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
-                div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
+                div().id(SharedString::from(id)).px_3().py_1().rounded_sm().text_xs()
                     .cursor_pointer().border_1().border_color(theme::border())
                     .when(primary, |d| d.bg(theme::accent()).text_color(theme::bg()))
                     .when(!primary, |d| d.text_color(theme::text()).hover(|h| h.bg(theme::hover())))
                     .child(label)
             };
             col = col.child(
-                div().flex().flex_shrink_0().items_start().gap_3().px_3().py_2().rounded_lg()
+                div().flex().flex_shrink_0().items_start().gap_3().px_3().py_2().rounded_sm()
                     .bg(theme::surface()).border_1().border_color(theme::warn())
                     .child(
                         div().flex().flex_col().flex_1().min_w_0().gap_0p5()
@@ -322,7 +322,7 @@ impl Workspace {
     /// One button per model; the choice applies from the next turn.
     fn model_chooser(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
         let id = thread.id;
-        let mut row = div().flex().flex_wrap().items_center().gap_1().px_1().pt_2()
+        let mut row = div().flex().flex_wrap().items_center().gap_1().pt_2()
             .child(div().pr_1().text_xs().text_color(theme::muted()).child("Model"));
         let choices = std::iter::once(None).chain(thread.agent.models().iter().copied().map(Some));
         for choice in choices {
@@ -330,7 +330,7 @@ impl Workspace {
             let active = thread.model.as_deref() == choice;
             row = row.child(
                 div().id(SharedString::from(format!("model-{label}")))
-                    .px_2().py_0p5().rounded_md().text_xs().cursor_pointer()
+                    .px_2().py_0p5().rounded_sm().text_xs().cursor_pointer()
                     .border_1()
                     .border_color(if active { theme::accent() } else { theme::border() })
                     .text_color(if active { theme::text() } else { theme::muted() })
@@ -352,18 +352,20 @@ impl Workspace {
             Status::NeedsInput => theme::warn(),
             Status::Idle => theme::muted(),
         };
-        div().size(px(7.)).rounded_full().bg(c)
+        div().flex_shrink_0().size(px(7.)).bg(c)
     }
 
     fn small_button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<gpui::Div> {
-        div().id(id.into()).px_1p5().rounded_md().text_xs().text_color(theme::muted())
+        div().id(id.into()).px_1p5().rounded_sm().text_xs().text_color(theme::muted())
             .cursor_pointer().hover(|h| h.bg(theme::hover()).text_color(theme::text()))
             .child(label)
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let header = div().flex().flex_shrink_0().items_center().px_2().pt_6()
-            .child(div().flex_1().text_sm().text_color(theme::text()).child("Kiln"))
+            .child(div().flex_shrink_0().w(px(4.)).h(px(16.)).mr_2().bg(theme::accent()))
+            .child(div().flex_1().text_base().font_weight(FontWeight::BOLD)
+                .text_color(theme::text()).child("KILN"))
             .child(Self::small_button("add-project", "+ Project")
                 .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
         let mut projects = div().id("projects").flex().flex_col().flex_1().min_h_0().gap_3()
@@ -371,7 +373,9 @@ impl Workspace {
         for (pi, p) in self.store.projects.iter().enumerate() {
             let mut group = div().flex().flex_col().flex_shrink_0().gap_0p5().child(
                 div().flex().items_center().px_2().py_1()
-                    .child(div().flex_1().text_xs().text_color(theme::muted()).child(p.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs()
+                        .font_weight(FontWeight::BOLD).text_color(theme::muted())
+                        .child(p.name.to_uppercase()))
                     .child(Self::small_button(format!("new-thread-{pi}"), "+")
                         .on_click(cx.listener(move |this, _, _, cx| this.new_thread(pi, cx))))
                     .child(Self::small_button(format!("rm-project-{pi}"), "×")
@@ -382,9 +386,10 @@ impl Workspace {
                 let active = self.selected == Some(id);
                 group = group.child(
                     div().id(SharedString::from(format!("t{id}")))
-                        .flex().items_center().gap_2().px_2().py_1p5().rounded_md()
+                        .flex().items_center().gap_2().px_2().py_1p5()
+                        .border_l_2().border_color(theme::sidebar())
                         .text_sm().text_color(theme::text())
-                        .when(active, |d| d.bg(theme::hover()))
+                        .when(active, |d| d.bg(theme::hover()).border_color(theme::accent()))
                         .hover(|d| d.bg(theme::hover()))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -393,7 +398,7 @@ impl Workspace {
                             cx.notify();
                         }))
                         .child(Self::dot(t.status))
-                        .child(div().flex_1().overflow_hidden().child(t.title.clone()))
+                        .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
                         .child(div().text_xs().text_color(theme::muted()).child(t.agent.label()))
                         .child(Self::small_button(format!("del{id}"), "×")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -420,7 +425,7 @@ impl Workspace {
             .child(div().text_sm().text_color(theme::muted()).child(msg))
             .when(!action.is_empty(), |d| {
                 d.child(
-                    div().id("empty-add").px_3().py_1p5().rounded_md().text_sm().cursor_pointer()
+                    div().id("empty-add").px_3().py_1p5().rounded_sm().text_sm().cursor_pointer()
                         .bg(theme::accent()).text_color(theme::bg()).child(action)
                         .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))),
                 )
@@ -435,11 +440,11 @@ impl Workspace {
             return Self::tool_call(name, &m.body).into_any_element();
         }
         let user = m.role == Role::User;
-        div().flex().w_full().px_6().py_2().when(user, |d| d.justify_end())
+        div().w_full().px_6().py_2()
             .child(
-                div().max_w(px(560.)).min_w_0().px_3().py_2().rounded_lg().text_sm()
-                    .text_color(theme::text())
-                    .when(user, |d| d.bg(theme::surface()))
+                div().w_full().min_w_0().pl_3().pr_2().py_1().border_l_2()
+                    .border_color(theme::bg()).text_sm().text_color(theme::text())
+                    .when(user, |d| d.bg(theme::surface()).border_color(theme::accent()))
                     .child(m.body.clone()),
             )
             .into_any_element()
@@ -448,8 +453,8 @@ impl Workspace {
     /// The exact tool name and its input, as the agent sent them.
     fn tool_call(name: &str, input: &str) -> impl IntoElement {
         div().w_full().px_6().py_1().child(
-            div().flex().flex_col().w_full().min_w_0().gap_1().px_3().py_2().rounded_md()
-                .border_1().border_color(theme::border())
+            div().flex().flex_col().w_full().min_w_0().gap_1().pl_3().pr_2().py_1()
+                .border_l_2().border_color(theme::border())
                 .child(div().font_family(MONO).text_xs().text_color(theme::accent())
                     .child(name.to_string()))
                 .when(!input.is_empty(), |d| {
@@ -464,7 +469,7 @@ impl Workspace {
             return self.empty_state(cx).into_any_element();
         };
         let composer_text = if self.draft.is_empty() {
-            div().text_color(theme::muted()).child("Ask anything…")
+            div().text_color(theme::muted()).child("What should the agent do?")
         } else {
             div().text_color(theme::text()).child(format!("{}▏", self.draft))
         };
@@ -486,15 +491,17 @@ impl Workspace {
             .child(messages)
             .child(self.approval_cards(id, cx))
             .child(
-                div().flex_shrink_0().p_4().child(
-                    div().id("composer").track_focus(&self.focus)
-                        .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
-                        .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
-                        .px_4().py_3().rounded_xl().bg(theme::surface())
-                        .border_1().border_color(theme::border())
-                        .text_sm().child(composer_text),
-                )
-                .child(self.model_chooser(thread, cx)),
+                div().flex_shrink_0().px_6().py_3().bg(theme::sidebar())
+                    .border_t_1().border_color(theme::border())
+                    .child(
+                        div().id("composer").track_focus(&self.focus)
+                            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
+                            .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
+                            .flex().gap_3().py_2().text_sm()
+                            .child(div().text_color(theme::accent()).child("›"))
+                            .child(composer_text.flex_1().min_w_0()),
+                    )
+                    .child(self.model_chooser(thread, cx)),
             )
             .into_any_element()
     }

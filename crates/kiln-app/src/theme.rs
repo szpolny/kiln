@@ -1,13 +1,13 @@
-//! Dark, low-chrome palette.
+//! Kiln's palette: dark fired clay with an ember accent.
 use gpui::{rgb, Rgba};
 
-pub fn bg() -> Rgba { rgb(0x0b0b0c) }
-pub fn sidebar() -> Rgba { rgb(0x101012) }
-pub fn surface() -> Rgba { rgb(0x161618) }
-pub fn border() -> Rgba { rgb(0x242427) }
-pub fn hover() -> Rgba { rgb(0x1c1c1f) }
-pub fn text() -> Rgba { rgb(0xe8e8ea) }
-pub fn muted() -> Rgba { rgb(0x8b8b92) }
-pub fn accent() -> Rgba { rgb(0x7c9cff) }
-pub fn ok() -> Rgba { rgb(0x4ade80) }
-pub fn warn() -> Rgba { rgb(0xfbbf24) }
+pub fn bg() -> Rgba { rgb(0x1a1512) }
+pub fn sidebar() -> Rgba { rgb(0x130f0d) }
+pub fn surface() -> Rgba { rgb(0x241d18) }
+pub fn border() -> Rgba { rgb(0x3a2f27) }
+pub fn hover() -> Rgba { rgb(0x2f261f) }
+pub fn text() -> Rgba { rgb(0xf1e7dd) }
+pub fn muted() -> Rgba { rgb(0xa8968a) }
+pub fn accent() -> Rgba { rgb(0xf0813f) }
+pub fn ok() -> Rgba { rgb(0xa3c26b) }
+pub fn warn() -> Rgba { rgb(0xf2c14e) }
