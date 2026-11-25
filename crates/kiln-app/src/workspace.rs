@@ -105,7 +105,7 @@ impl Drop for Workspace {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Menu {
     NewThread,
-    Model,
+    Model { agent: Agent, expanded: bool, choosing_provider: bool },
     Effort,
     Permissions,
     Project,
@@ -359,7 +359,10 @@ impl Workspace {
         if ev.keystroke.key != "escape" || ev.is_held {
             return;
         }
-        if self.menu.take().is_some() {
+        if let Some(Menu::Model { agent, expanded, choosing_provider: true }) = self.menu {
+            self.menu = Some(Menu::Model { agent, expanded, choosing_provider: false });
+            cx.notify();
+        } else if self.menu.take().is_some() {
             cx.notify();
         } else if let Some(id) = self.selected {
             self.stop(id, cx);
@@ -724,40 +727,106 @@ impl Workspace {
 
     /// Compact picker in the composer footer; the choice applies from the next turn.
     fn model_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let button = self.footer_button("model-picker", Menu::Model, cx)
-            .child(agent_icon(thread.agent, 13., self.theme.text))
+        const PREVIEW_LEN: usize = 4;
+        const PROVIDER_CHIP_HEIGHT: f32 = 26.;
+
+        let theme = self.theme;
+        let (agent, expanded, choosing_provider) = match self.menu {
+            Some(Menu::Model { agent, expanded, choosing_provider }) => (agent, expanded, choosing_provider),
+            _ => (thread.agent, false, false),
+        };
+        let state = Menu::Model { agent, expanded, choosing_provider };
+        let button = self.footer_button("model-picker", state, cx)
+            .child(agent_icon(thread.agent, 13., theme.text))
             .child(div().font_weight(FontWeight::MEDIUM)
                 .child(thread.agent.model_name(thread.model()).to_string()));
-        if self.menu != Some(Menu::Model) {
+        if self.menu != Some(state) {
             return self.footer_picker(button, None, window, cx);
         }
+
+        let provider_chip = div().id("choose-model-provider").flex().items_center().gap_1p5()
+            .h(px(PROVIDER_CHIP_HEIGHT)).px_2().rounded_md().bg(theme.fill).border_1().border_color(theme.border)
+            .text_xs().font_weight(FontWeight::SEMIBOLD).cursor_pointer()
+            .when(choosing_provider, |d| d.bg(theme.selected))
+            .hover(|h| h.bg(theme.selected))
+            .child(agent_icon(agent, 13., theme.text))
+            .child(agent.name())
+            .child(assets::icon(assets::Icon::ChevronDown, 12.).text_color(theme.muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.menu = Some(Menu::Model { agent, expanded, choosing_provider: !choosing_provider });
+                cx.notify();
+            }));
+        let header = div().flex().items_center().justify_between().px_1().pb_1()
+            .child(div().pl_1().text_xs().text_color(theme.muted).child("Models"))
+            .child(provider_chip);
+
+        let models = agent.models();
+        let list_height = (window.viewport_size().height - px(164.)).clamp(px(56.), px(196.));
+        let selected = (agent == thread.agent).then(|| thread.model());
+        let preview = &models[..models.len().min(PREVIEW_LEN)];
+        let selected_below_preview = models[preview.len()..].iter().find(|m| Some(m.id) == selected);
+        let shown = if expanded { models } else { preview };
         let id = thread.id;
-        let max_height = (window.viewport_size().height - px(90.)).clamp(px(80.), px(480.));
-        let mut menu = self.menu_panel("model-menu", "Model").w(px(244.))
-            .max_h(max_height).overflow_y_scroll();
-        for agent in Agent::ALL {
-            let same_agent = agent == thread.agent;
-            menu = menu.child(
-                div().flex().items_center().justify_between().gap_2().px_2().pt_2().pb_1()
+        let results = div().id(SharedString::from(format!("model-options-{}-{expanded}", agent.label())))
+            .flex().flex_col().max_h(list_height).overflow_y_scroll()
+            .children(shown.iter().enumerate().map(|(index, model)| {
+                let model = if !expanded && index == PREVIEW_LEN - 1 {
+                    selected_below_preview.unwrap_or(model)
+                } else {
+                    model
+                };
+                let model_id = model.id;
+                let active = Some(model_id) == selected;
+                self.menu_item(model_id, None, model.name, None, active)
                     .flex_shrink_0()
-                    .text_xs().text_color(self.theme.muted)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(agent.name()))
-                    .when(!same_agent && !thread.can_change_agent(), |d| d.child("New thread")),
-            );
-            for model in agent.models() {
-                let (model_id, active) = (model.id, same_agent && thread.model() == model.id);
-                let key = SharedString::from(format!("model-{}-{model_id}", agent.label()));
-                menu = menu.child(
-                    self.menu_item(key, Some(agent), model.name, None, active)
-                        .flex_shrink_0()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.menu = None;
-                            this.set_model(id, agent, model_id, cx);
-                            window.focus(&this.input.focus_handle(cx), cx);
-                        })),
-                );
-            }
-        }
+                    .when(active, |d| d.bg(theme.selected).font_weight(FontWeight::MEDIUM))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.menu = None;
+                        this.set_model(id, agent, model_id, cx);
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    }))
+            }));
+
+        let menu = self.menu_surface("model-menu").relative().w(px(288.)).child(header)
+            .when(agent != thread.agent && !thread.can_change_agent(), |d| {
+                d.child(div().px_2().pb_1().text_xs().text_color(theme.muted)
+                    .child("Selecting a model starts a new thread"))
+            })
+            .child(results)
+            .when(models.len() > PREVIEW_LEN, |d| {
+                let action_color = theme.accent.blend(theme.text.alpha(0.3));
+                let (label, icon) = if expanded {
+                    ("Show fewer models".to_string(), assets::Icon::Minus)
+                } else {
+                    (format!("Show all {} models", models.len()), assets::Icon::Plus)
+                };
+                d.child(div().flex().mt_1().child(div().id("toggle-model-list").flex().items_center().gap_1()
+                        .h(px(28.)).px_2().rounded_md().text_xs().text_color(action_color)
+                        .cursor_pointer().hover(|h| h.bg(theme.hover))
+                        .child(assets::icon(icon, 12.))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.menu = Some(Menu::Model { agent, expanded: !expanded, choosing_provider: false });
+                            cx.notify();
+                        }))))
+            })
+            .when(choosing_provider, |d| {
+                // Paint above the model rows without changing the picker's size.
+                d.child(self.menu_surface("model-providers").absolute()
+                    .top(px(PROVIDER_CHIP_HEIGHT + 8.)).right_2().w(px(152.)).bg(theme.fill)
+                    .children(Agent::ALL.map(|provider| {
+                        self.menu_item(provider.label(), Some(provider), provider.name(), None, provider == agent)
+                            .when(provider == agent, |d| d.bg(theme.selected))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.menu = Some(Menu::Model {
+                                    agent: provider,
+                                    expanded: provider == agent && expanded,
+                                    choosing_provider: false,
+                                });
+                                cx.notify();
+                            }))
+                    })))
+            });
         self.footer_picker(button, Some(menu), window, cx)
     }
 
@@ -844,12 +913,16 @@ impl Workspace {
         .with_priority(1)
     }
 
-    pub(crate) fn menu_panel(&self, id: &'static str, title: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    fn menu_surface(&self, id: &'static str) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
-        div().id(id).flex().flex_col().w(px(220.)).p_1().rounded(px(10.)).bg(theme.card)
+        div().id(id).flex().flex_col().p_1().rounded(px(10.)).bg(theme.card)
             .border_1().border_color(theme.border).shadow_lg().occlude()
+    }
+
+    pub(crate) fn menu_panel(&self, id: &'static str, title: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+        self.menu_surface(id).w(px(220.))
             .child(div().flex_shrink_0().px_2().pt_1().pb_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted).child(title.into()))
+                .text_color(self.theme.muted).child(title.into()))
     }
 
     pub(crate) fn menu_item(
