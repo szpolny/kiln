@@ -6,12 +6,12 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    point, px, size, App, AppContext, Application, Bounds, TitlebarOptions,
+    point, px, size, App, AppContext, Bounds, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 
 fn main() {
-    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+    gpui_platform::application().with_assets(assets::Assets).run(|cx: &mut App| {
         text_input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(

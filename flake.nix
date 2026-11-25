@@ -46,7 +46,10 @@
             // lib.optionalAttrs stdenv.hostPlatform.isLinux {
               nativeBuildInputs = [ pkgs.pkg-config ];
 
-              buildInputs = runtimeLibs ++ [ pkgs.libxcb ];
+              buildInputs = runtimeLibs ++ [
+                pkgs.fontconfig
+                pkgs.libxcb
+              ];
 
               # An rpath instead of LD_LIBRARY_PATH, which would leak into every
               # process Kiln spawns.

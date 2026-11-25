@@ -3,8 +3,8 @@ use crate::markdown;
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
-    anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, AnchoredPositionMode, Context,
-    Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
+    anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, Anchor, AnchoredPositionMode, Context,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
     ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, project, AgentEvent};
@@ -462,7 +462,7 @@ impl Workspace {
         picker
             .child(self.backdrop(window, cx))
             .child(div().absolute().top_0().left_0().child(
-                deferred(anchored().anchor(Corner::BottomLeft).snap_to_window().child(menu.mb_2()))
+                deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window().child(menu.mb_2()))
                     .with_priority(2),
             ))
     }
@@ -571,7 +571,7 @@ impl Workspace {
         picker
             .child(self.backdrop(window, cx))
             .child(div().absolute().bottom_0().right_0().child(
-                deferred(anchored().anchor(Corner::TopRight).snap_to_window().child(menu))
+                deferred(anchored().anchor(Anchor::TopRight).snap_to_window().child(menu))
                     .with_priority(2),
             ))
     }
@@ -626,7 +626,7 @@ impl Workspace {
                         .when(!active, |d| d.hover(|h| h.bg(theme.hover)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected = Some(id);
-                            window.focus(&this.input.focus_handle(cx));
+                            window.focus(&this.input.focus_handle(cx), cx);
                             cx.notify();
                         }))
                         .child(self.status_mark(t.status))
@@ -741,7 +741,7 @@ impl Workspace {
                 .child(
                     div().id("composer")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            window.focus(&this.input.focus_handle(cx))
+                            window.focus(&this.input.focus_handle(cx), cx)
                         }))
                         .px_2().py_1p5().text_sm().child(self.input.clone()),
                 )
@@ -830,7 +830,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
-            window.focus(&self.input.focus_handle(cx));
+            window.focus(&self.input.focus_handle(cx), cx);
         }
         self.theme = Theme::new(window.appearance(), self.theme.font);
         let theme = self.theme;

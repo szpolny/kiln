@@ -56,6 +56,11 @@ const MAX_HEIGHT: f32 = 240.;
 
 /// Platform-standard editing shortcuts for every text field.
 pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys(key_bindings(cfg!(target_os = "macos")));
+}
+
+/// The shortcuts on macOS (`mac`) or elsewhere.
+fn key_bindings(mac: bool) -> Vec<KeyBinding> {
     let c = Some(CONTEXT);
     let mut keys = vec![
         KeyBinding::new("backspace", Backspace, c),
@@ -73,15 +78,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, c),
         KeyBinding::new("shift-home", SelectHome, c),
         KeyBinding::new("shift-end", SelectEnd, c),
-        KeyBinding::new("secondary-a", SelectAll, c),
-        KeyBinding::new("secondary-c", Copy, c),
-        KeyBinding::new("secondary-x", Cut, c),
-        KeyBinding::new("secondary-v", Paste, c),
         KeyBinding::new("enter", Submit, c),
         KeyBinding::new("shift-enter", Newline, c),
     ];
-    if cfg!(target_os = "macos") {
+    if mac {
         keys.extend([
+            KeyBinding::new("cmd-a", SelectAll, c),
+            KeyBinding::new("cmd-c", Copy, c),
+            KeyBinding::new("cmd-x", Cut, c),
+            KeyBinding::new("cmd-v", Paste, c),
             KeyBinding::new("alt-left", WordLeft, c),
             KeyBinding::new("alt-right", WordRight, c),
             KeyBinding::new("alt-shift-left", SelectWordLeft, c),
@@ -102,6 +107,10 @@ pub fn bind_keys(cx: &mut App) {
         ]);
     } else {
         keys.extend([
+            KeyBinding::new("ctrl-a", SelectAll, c),
+            KeyBinding::new("ctrl-c", Copy, c),
+            KeyBinding::new("ctrl-x", Cut, c),
+            KeyBinding::new("ctrl-v", Paste, c),
             KeyBinding::new("ctrl-left", WordLeft, c),
             KeyBinding::new("ctrl-right", WordRight, c),
             KeyBinding::new("ctrl-shift-left", SelectWordLeft, c),
@@ -117,7 +126,7 @@ pub fn bind_keys(cx: &mut App) {
             KeyBinding::new("shift-delete", Cut, c),
         ]);
     }
-    cx.bind_keys(keys);
+    keys
 }
 
 pub enum InputEvent {
@@ -313,7 +322,7 @@ impl TextInput {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         let at = self.index_for(ev.position);
         match ev.click_count {
             1 if ev.modifiers.shift => self.select_to(at, cx),
@@ -657,13 +666,6 @@ struct Prepaint {
     caret: Option<PaintQuad>,
 }
 
-impl IntoElement for TextElement {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for TextElement {
     type RequestLayoutState = Shaping;
     type PrepaintState = Prepaint;
@@ -854,5 +856,17 @@ impl Element for TextElement {
             input.layout = Some(layout);
             input.reveal = false;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GPUI panics on a shortcut it cannot read, which would stop the app at launch.
+    #[test]
+    fn every_shortcut_parses_on_both_platforms() {
+        assert!(!key_bindings(true).is_empty());
+        assert!(!key_bindings(false).is_empty());
     }
 }
