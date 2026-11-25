@@ -2567,7 +2567,7 @@ dependencies = [
  "gpui_platform",
  "kiln-agent",
  "kiln-core",
- "lucide-static-svg",
+ "lucide-icons",
  "pulldown-cmark",
  "unicode-segmentation",
 ]
@@ -2709,10 +2709,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lucide-static-svg"
+name = "lucide-icons"
 version = "1.80.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6741efec9ee4fc82376cf9c69b6bb9e122a47fc7dd91e89b2dec635f5a12ee9"
+checksum = "601078c24e4dd6a68a48aea35b63be14bd70936a14ec1dc75dd1286e8edb5b51"
 
 [[package]]
 name = "lyon_geom"

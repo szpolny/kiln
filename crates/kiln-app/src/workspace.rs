@@ -408,8 +408,7 @@ impl Workspace {
     /// Reasoning level picker beside the model; applies from the next turn.
     fn effort_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let button = self.footer_button("effort-picker", Menu::Effort, cx)
-            .child(svg().path(assets::Icon::Brain.asset_path()).flex_shrink_0().size(px(13.))
-                .text_color(self.theme.muted))
+            .child(assets::icon(assets::Icon::Brain, 13.).text_color(self.theme.muted))
             .child(div().font_weight(FontWeight::MEDIUM).child(thread.effort().name()));
         if self.menu != Some(Menu::Effort) {
             return self.footer_picker(button, None, window, cx);

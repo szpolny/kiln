@@ -12,6 +12,7 @@ use gpui::{
 
 fn main() {
     gpui_platform::application().with_assets(assets::Assets).run(|cx: &mut App| {
+        assets::load_icon_font(cx).expect("failed to load the icon font");
         text_input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(

@@ -1,10 +1,26 @@
 //! Icons compiled into the binary, so nothing is loaded from disk or the network.
 //!
-//! Interface icons come from Lucide: draw one with `svg().path(Icon::X.asset_path())`.
-//! Brand marks are local files.
-use gpui::{AssetSource, Result, SharedString};
-pub use lucide_static_svg::Icon;
+//! Interface icons come from the Lucide font: draw one with [`icon`]. Brand
+//! marks are local files.
+use gpui::{div, prelude::*, px, App, AssetSource, Div, FontWeight, Result, SharedString};
+pub use lucide_icons::Icon;
 use std::borrow::Cow;
+
+/// Family name inside the Lucide font file.
+const ICON_FONT: &str = "lucide";
+
+/// Make [`icon`] drawable. Call once at startup.
+pub fn load_icon_font(cx: &App) -> Result<()> {
+    cx.text_system().add_fonts(vec![Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES)])
+}
+
+/// A Lucide icon filling a `size` pixel square, in the surrounding text color.
+pub fn icon(icon: Icon, size: f32) -> Div {
+    div().flex().flex_shrink_0().items_center().justify_center().size(px(size))
+        .font_family(ICON_FONT).font_weight(FontWeight::NORMAL)
+        .text_size(px(size)).line_height(px(size))
+        .child(char::from(icon).to_string())
+}
 
 pub const CLAUDE: &str = "icons/claude.svg";
 
@@ -35,7 +51,7 @@ impl AssetSource for Assets {
             LOGO_LIGHT => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-mark-light.svg"))),
             LOCKUP_DARK => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-lockup-dark.svg"))),
             LOCKUP_LIGHT => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-lockup-light.svg"))),
-            _ => lucide_static_svg::asset_bytes(path).map(Cow::Borrowed),
+            _ => None,
         })
     }
 
@@ -53,12 +69,6 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lucide_icons_load_by_their_asset_path() {
-        assert!(Assets.load(Icon::Brain.asset_path()).unwrap().is_some());
-        assert!(Assets.load("icons/missing.svg").unwrap().is_none());
-    }
 
     #[test]
     fn brand_files_declare_the_size_they_are_drawn_at() {
