@@ -327,7 +327,7 @@ impl Workspace {
 
     fn approval_cards(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let mut col = div().id("approvals").flex().flex_col().items_center().flex_shrink_0()
+        let mut col = div().id("approvals").flex().flex_col().flex_shrink_0()
             .gap_2().px_6().max_h(px(240.)).overflow_y_scroll();
         let pending = self.store.thread(id).map(|th| th.pending.clone()).unwrap_or_default();
         for (i, a) in pending.into_iter().enumerate() {
@@ -339,8 +339,8 @@ impl Workspace {
                     .hover(|h| h.opacity(0.85))
                     .child(label)
             };
-            col = col.child(
-                div().flex().flex_shrink_0().items_start().gap_2().w_full().max_w(px(COLUMN))
+            col = col.child(centered(
+                div().flex().items_start().gap_2().w_full()
                     .p_3().mb_2().rounded(px(12.)).bg(theme.card)
                     .border_1().border_color(theme.warn).shadow_sm()
                     .child(
@@ -355,7 +355,7 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, _, cx| this.deny(id, i, cx))))
                     .child(button(format!("allow{i}"), "Allow", true)
                         .on_click(cx.listener(move |this, _, _, cx| this.approve(id, i, cx)))),
-            );
+            ).flex_shrink_0());
         }
         col
     }
@@ -635,9 +635,7 @@ impl Workspace {
                 .child(m.body.clone())
                 .into_any_element(),
         };
-        div().flex().flex_col().items_center().w_full().px_6().py_1p5()
-            .child(div().w_full().max_w(px(COLUMN)).min_w_0().child(content))
-            .into_any_element()
+        centered(content).px_6().py_1p5().into_any_element()
     }
 
     /// The exact tool name and its input, as the agent sent them.
@@ -672,9 +670,8 @@ impl Workspace {
             .when(!ready, |d| d.bg(theme.selected).text_color(theme.muted))
             .child("↑")
             .on_click(cx.listener(|this, _, _, cx| this.submit(cx)));
-        // A column, so the card's height follows its wrapped draft.
-        div().flex().flex_col().items_center().flex_shrink_0().px_6().pt_1().pb_4().child(
-            div().flex().flex_col().gap_2().w_full().max_w(px(COLUMN)).p_2().rounded(px(16.))
+        centered(
+            div().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
                 .bg(theme.card).border_1().border_color(theme.border).shadow_md()
                 .child(
                     div().id("composer")
@@ -692,6 +689,10 @@ impl Workspace {
                         .child(send),
                 ),
         )
+        .flex_shrink_0()
+        .px_6()
+        .pt_1()
+        .pb_4()
     }
 
     fn toolbar(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -728,6 +729,16 @@ impl Workspace {
             .child(self.composer(thread, window, cx))
             .into_any_element()
     }
+}
+
+/// Center `child` in the conversation column.
+///
+/// It has to be a row: that settles the capped width before the height is
+/// measured. Centering from a column measures wrapped text at the uncapped
+/// width, so it comes out lines short and the next element overlaps it.
+fn centered(child: impl IntoElement) -> gpui::Div {
+    div().flex().justify_center().w_full()
+        .child(div().flex_1().min_w_0().max_w(px(COLUMN)).child(child))
 }
 
 /// The provider's mark, in its brand color.
