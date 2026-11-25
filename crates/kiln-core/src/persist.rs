@@ -88,6 +88,7 @@ mod tests {
         t.policy.network = crate::policy::Decision::Allow;
         t.updated_at = 42;
         t.settled = true;
+        store.projects[0].icon = Some("/pictures/mark.png".into());
         save(&path, &store).unwrap();
 
         let Loaded::Ok(back) = load(&path).unwrap() else { panic!("expected state") };
@@ -97,6 +98,7 @@ mod tests {
         assert_eq!(t.pending.len(), 1);
         assert_eq!(t.policy.network, crate::policy::Decision::Allow);
         assert_eq!((t.updated_at, t.settled), (42, true));
+        assert_eq!(back.projects[0].icon.as_deref(), Some(Path::new("/pictures/mark.png")));
     }
 
     #[test]

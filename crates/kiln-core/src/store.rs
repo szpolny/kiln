@@ -285,6 +285,9 @@ impl Thread {
 pub struct Project {
     pub name: String,
     pub dir: PathBuf,
+    /// Image the user picked as the icon, in place of the one found in `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<PathBuf>,
     pub threads: Vec<Thread>,
 }
 
@@ -328,7 +331,8 @@ impl Store {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
-        self.projects.push(Project { name, dir: dir.to_path_buf(), threads: vec![] });
+        let dir = dir.to_path_buf();
+        self.projects.push(Project { name, dir, icon: None, threads: vec![] });
         self.projects.len() - 1
     }
 

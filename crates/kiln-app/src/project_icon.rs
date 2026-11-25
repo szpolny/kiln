@@ -1,4 +1,4 @@
-//! A project's icon file turned into the small picture the sidebar draws.
+//! A project's icon file turned into the small picture Kiln draws.
 
 use gpui::RenderImage;
 use image::{imageops, Frame, ImageReader, Limits, RgbaImage};
@@ -14,22 +14,29 @@ const SIDE: u32 = 32;
 /// Largest picture, in pixels per side, that is decoded.
 const MAX_SIDE: u32 = 4096;
 
-/// The icon of the project in `dir`. Reads and decodes files, so call it off the
-/// UI thread.
-pub fn load(dir: &Path) -> Option<Arc<RenderImage>> {
-    project::icon(dir, |bytes| {
-        let mut pixels = match image::guess_format(bytes) {
-            Ok(_) => raster(bytes)?,
-            Err(_) => svg(bytes)?,
-        };
-        // An invisible icon, such as an SVG that is only text, is no icon.
-        if pixels.pixels().all(|p| p[3] == 0) {
-            return None;
-        }
-        // GPUI wants blue first.
-        pixels.pixels_mut().for_each(|p| p.0.swap(0, 2));
-        Some(Arc::new(RenderImage::new(vec![Frame::new(pixels)])))
-    })
+/// The icon of the project in `dir`: the `chosen` file, or else the one found in
+/// the project. Reads and decodes files, so call it off the UI thread.
+pub fn load(dir: &Path, chosen: Option<&Path>) -> Option<Arc<RenderImage>> {
+    chosen.and_then(from_file).or_else(|| project::icon(dir, picture))
+}
+
+/// The picture in `file`, if it can serve as an icon.
+pub fn from_file(file: &Path) -> Option<Arc<RenderImage>> {
+    project::icon_file(file, picture)
+}
+
+fn picture(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let mut pixels = match image::guess_format(bytes) {
+        Ok(_) => raster(bytes)?,
+        Err(_) => svg(bytes)?,
+    };
+    // An invisible icon, such as an SVG that is only text, is no icon.
+    if pixels.pixels().all(|p| p[3] == 0) {
+        return None;
+    }
+    // GPUI wants blue first.
+    pixels.pixels_mut().for_each(|p| p.0.swap(0, 2));
+    Some(Arc::new(RenderImage::new(vec![Frame::new(pixels)])))
 }
 
 /// Whether two icons look the same.
@@ -109,21 +116,21 @@ mod tests {
         // Large pictures shrink, keeping their shape; blue comes first.
         let red = RgbaImage::from_pixel(200, 100, Rgba([255, 0, 0, 255]));
         red.save_with_format(dir.join("favicon.png"), ImageFormat::Png).unwrap();
-        let icon = load(&dir).unwrap();
+        let icon = load(&dir, None).unwrap();
         assert_eq!(size_of(&icon), (32, 16));
         assert_eq!(bytes_of(icon)[..4], [0, 0, 255, 255]);
 
         // Small ones are left alone.
         let dot = RgbaImage::from_pixel(16, 16, Rgba([0, 255, 0, 255]));
         dot.save_with_format(dir.join("favicon.ico"), ImageFormat::Ico).unwrap();
-        assert_eq!(size_of(&load(&dir).unwrap()), (16, 16));
+        assert_eq!(size_of(&load(&dir, None).unwrap()), (16, 16));
 
         let square = r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512">
             <rect width="512" height="512" fill="#0000ff"/></svg>"##;
         fs::write(dir.join("favicon.svg"), square).unwrap();
-        let icon = load(&dir).unwrap();
+        let icon = load(&dir, None).unwrap();
         assert_eq!(size_of(&icon), (32, 32));
-        assert!(same(&icon, &load(&dir).unwrap()));
+        assert!(same(&icon, &load(&dir, None).unwrap()));
         assert_eq!(bytes_of(icon)[..4], [255, 0, 0, 255]);
 
         // An SVG cannot pull in another file, which leaves it empty, so the
@@ -134,12 +141,20 @@ mod tests {
             dir.join("favicon.png").display()
         );
         fs::write(dir.join("favicon.svg"), linking).unwrap();
-        assert_eq!(size_of(&load(&dir).unwrap()), (16, 16));
+        assert_eq!(size_of(&load(&dir, None).unwrap()), (16, 16));
+
+        // A chosen file wins over the project's own, until it cannot be used.
+        let chosen = dir.join("chosen.png");
+        let white = RgbaImage::from_pixel(8, 8, Rgba([255; 4]));
+        white.save_with_format(&chosen, ImageFormat::Png).unwrap();
+        assert_eq!(size_of(&load(&dir, Some(&chosen)).unwrap()), (8, 8));
+        fs::remove_file(&chosen).unwrap();
+        assert_eq!(size_of(&load(&dir, Some(&chosen)).unwrap()), (16, 16));
 
         for junk in ["favicon.svg", "favicon.ico", "favicon.png"] {
             fs::write(dir.join(junk), "not a picture").unwrap();
         }
-        assert!(load(&dir).is_none());
+        assert!(load(&dir, None).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }

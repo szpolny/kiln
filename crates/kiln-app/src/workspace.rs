@@ -76,6 +76,8 @@ pub struct Workspace {
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
     /// The dropdown menu that is open, if any.
     pub(crate) menu: Option<Menu>,
+    /// The open project menu reports that the picked file is no icon.
+    pub(crate) icon_rejected: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,7 @@ pub(crate) enum Menu {
     Model,
     Effort,
     Web,
+    Project,
 }
 
 impl Workspace {
@@ -144,6 +147,7 @@ impl Workspace {
             open_work: HashSet::new(),
             parsed: HashMap::new(),
             menu: None,
+            icon_rejected: false,
         };
         this.sync_rows();
         this.refresh(cx);
@@ -152,7 +156,7 @@ impl Workspace {
 
     /// Reread the branches and redraw, which also brings the ages up to date.
     /// The icons follow once they are read.
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.branches = self
             .store
             .projects
@@ -165,11 +169,12 @@ impl Workspace {
 
     /// Reread the project icons away from the UI thread.
     fn load_icons(&mut self, cx: &mut Context<Self>) {
-        let dirs: Vec<PathBuf> = self.store.projects.iter().map(|p| p.dir.clone()).collect();
+        let projects: Vec<_> =
+            self.store.projects.iter().map(|p| (p.dir.clone(), p.icon.clone())).collect();
         let load = cx.background_executor().spawn(async move {
-            dirs.into_iter()
-                .filter_map(|dir| {
-                    let icon = project_icon::load(&dir)?;
+            projects.into_iter()
+                .filter_map(|(dir, chosen)| {
+                    let icon = project_icon::load(&dir, chosen.as_deref())?;
                     Some((dir, icon))
                 })
                 .collect::<HashMap<_, _>>()
@@ -200,7 +205,7 @@ impl Workspace {
 
     /// Write the state to disk. Every change to the thread list ends here, so
     /// the sidebar is rebuilt too.
-    fn save(&mut self) {
+    pub(crate) fn save(&mut self) {
         self.sync_rows();
         if let Some(path) = &self.state_path {
             if let Err(e) = persist::save(path, &self.store) {
@@ -671,6 +676,7 @@ impl Workspace {
 
     pub(crate) fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = (self.menu != Some(menu)).then_some(menu);
+        self.icon_rejected = false;
         cx.notify();
     }
 
@@ -698,7 +704,7 @@ impl Workspace {
                 .text_color(theme.muted).child(title.into()))
     }
 
-    fn menu_item(
+    pub(crate) fn menu_item(
         &self,
         id: impl Into<SharedString>,
         icon: Option<Agent>,
@@ -956,15 +962,15 @@ impl Workspace {
 
     fn toolbar(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let project = self.store.locate(thread.id).map(|(p, _)| self.store.projects[p].name.clone());
+        let project = self.store.locate(thread.id).map(|(p, _)| &self.store.projects[p]);
         div().flex().flex_shrink_0().items_center().gap_3().px_5().h(px(TOOLBAR))
             .border_b_1().border_color(theme.border)
             .child(
                 div().flex().flex_col().flex_1().min_w_0()
                     .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text).child(thread.title.clone()))
-                    .when_some(project, |d, name| {
-                        d.child(div().truncate().text_xs().text_color(theme.muted).child(name))
+                    .when_some(project, |d, project| {
+                        d.child(self.project_picker(project, window, cx))
                     }),
             )
             .child(self.web_picker(thread, window, cx))

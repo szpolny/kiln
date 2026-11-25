@@ -237,7 +237,7 @@ impl Workspace {
     }
 
     /// The project's own icon, or else its initials.
-    fn project_mark(&self, project: &Project) -> Div {
+    pub(crate) fn project_mark(&self, project: &Project) -> Div {
         let mark = div().flex().flex_shrink_0().items_center().justify_center().size(px(16.));
         match self.icons.get(&project.dir) {
             Some(icon) => mark.child(img(icon.clone()).size_full().rounded(px(4.))),

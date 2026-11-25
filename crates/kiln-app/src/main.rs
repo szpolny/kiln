@@ -1,6 +1,7 @@
 mod assets;
 mod markdown;
 mod project_icon;
+mod project_menu;
 mod sidebar;
 mod text_edit;
 mod text_input;

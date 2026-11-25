@@ -100,14 +100,10 @@ const PAGE_BYTES: u64 = 128 << 10;
 /// The project's own icon: the first file `decode` accepts, from the common
 /// places and then from the pages that name one. Reads only inside the project.
 pub fn icon<T>(dir: &Path, decode: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
-    let load = |path: &str| {
-        // One byte over the limit tells a file that is too large.
-        let bytes = read(dir, path, ICON_BYTES + 1)?;
-        (bytes.len() as u64 <= ICON_BYTES).then(|| decode(&bytes))?
-    };
+    let load = |path: &str| icon_file(&dir.join(inside(dir, Path::new(path))?), &decode);
     ICON_FILES.into_iter().find_map(load).or_else(|| {
         ICON_PAGES.into_iter().find_map(|page| {
-            let page = read(dir, page, PAGE_BYTES)?;
+            let page = read(&dir.join(inside(dir, Path::new(page))?), PAGE_BYTES)?;
             let page = String::from_utf8_lossy(&page);
             // Web projects serve `public/` as the root of the site.
             let mut found = declared_icons(&page)
@@ -117,10 +113,16 @@ pub fn icon<T>(dir: &Path, decode: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
     })
 }
 
-/// The start of the regular file at `path`, at most `limit` bytes of it. `None`
-/// when it is missing or leads outside the project.
-fn read(dir: &Path, path: &str, limit: u64) -> Option<Vec<u8>> {
-    let file = dir.join(inside(dir, Path::new(path))?);
+/// The icon in `file`, wherever it is, when it is small enough and `decode`
+/// accepts it. For a file the user chose; [`icon`] keeps to the project.
+pub fn icon_file<T>(file: &Path, decode: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
+    // One byte over the limit tells a file that is too large.
+    let bytes = read(file, ICON_BYTES + 1)?;
+    (bytes.len() as u64 <= ICON_BYTES).then(|| decode(&bytes))?
+}
+
+/// The start of the regular file `file`, at most `limit` bytes of it.
+fn read(file: &Path, limit: u64) -> Option<Vec<u8>> {
     // Opening a pipe would block, so check the kind first.
     if !file.metadata().ok()?.is_file() {
         return None;
