@@ -868,14 +868,14 @@ impl Workspace {
                 let travel = track_height - thumb_height;
                 let track_top = bounds.top() + px(2.);
                 let thumb_top = track_top + travel * (-scroll.offset().y / max_offset);
-                let track_left = bounds.left() + px(3.);
+                let track_left = bounds.left() + px(4.);
                 let paint_bar = |top, height, color, window: &mut Window| {
-                    let mut bar = fill(Bounds::new(point(track_left, top), size(px(4.), height)), color);
-                    bar.corner_radii = px(2.).into();
+                    let mut bar = fill(Bounds::new(point(track_left, top), size(px(3.), height)), color);
+                    bar.corner_radii = px(1.5).into();
                     window.paint_quad(bar);
                 };
-                paint_bar(track_top, track_height, theme.border, window);
-                paint_bar(thumb_top, thumb_height, theme.muted.alpha(0.8), window);
+                paint_bar(track_top, track_height, theme.border.opacity(0.65), window);
+                paint_bar(thumb_top, thumb_height, theme.muted.alpha(0.56), window);
 
                 let scroll_to = move |y: Pixels, anchor: Pixels, window: &mut Window| {
                     let progress = ((y - track_top - anchor) / travel).clamp(0., 1.);
