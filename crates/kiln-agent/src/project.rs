@@ -1,4 +1,5 @@
-//! Where a path an agent asked for really leads.
+//! What Kiln reads from a project folder: where a path an agent asked for
+//! really leads, and which branch is checked out.
 
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -34,6 +35,28 @@ pub fn inside(dir: &Path, path: &Path) -> Option<PathBuf> {
     at.strip_prefix(&root).ok().map(Path::to_path_buf)
 }
 
+/// The branch checked out where `dir` lives, or a short commit id when HEAD is
+/// detached. Reads Git's files directly. `None` outside a repository.
+pub fn branch(dir: &Path) -> Option<String> {
+    let dot_git = dir.ancestors().map(|at| at.join(".git")).find(|at| at.exists())?;
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        // Worktrees and submodules hold a file that points to the real folder.
+        let link = std::fs::read_to_string(&dot_git).ok()?;
+        dot_git.parent()?.join(link.strip_prefix("gitdir:")?.trim())
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(name) => {
+            let name = name.trim();
+            Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_string())
+        }
+        None => head.get(..7).map(str::to_string),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -64,6 +87,27 @@ mod tests {
         assert_eq!(at(&dir.join("dangling")), None);
         assert_eq!(at(Path::new("~/.ssh/id")), None);
         assert_eq!(inside(&base.join("gone"), Path::new("a")), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reads_the_checked_out_branch() {
+        let base = std::env::temp_dir().join(format!("kiln-branch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (repo, tree) = (base.join("repo"), base.join("tree"));
+        let linked = repo.join(".git/worktrees/tree");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/list\n").unwrap();
+        fs::write(linked.join("HEAD"), "0123456789abcdef\n").unwrap();
+        fs::write(tree.join(".git"), "gitdir: ../repo/.git/worktrees/tree\n").unwrap();
+
+        assert_eq!(branch(&repo).as_deref(), Some("feat/list"));
+        assert_eq!(branch(&repo.join("src")).as_deref(), Some("feat/list"));
+        assert_eq!(branch(&tree).as_deref(), Some("0123456"));
+        fs::write(repo.join(".git/HEAD"), "").unwrap();
+        assert_eq!(branch(&repo), None);
         let _ = fs::remove_dir_all(&base);
     }
 }

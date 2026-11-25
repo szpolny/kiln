@@ -1,5 +1,6 @@
 use crate::assets;
 use crate::markdown;
+use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
@@ -14,24 +15,34 @@ use kiln_core::{
     Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Widest the conversation and composer grow; they stay centered beyond it.
 const COLUMN: f32 = 760.;
 /// Height of the title bar row shared by the sidebar and the thread.
-const TOOLBAR: f32 = 52.;
+pub(crate) const TOOLBAR: f32 = 52.;
+/// How often the sidebar's ages and branches are brought up to date.
+const REFRESH: Duration = Duration::from_secs(30);
 
 pub struct Workspace {
-    store: Store,
+    pub(crate) store: Store,
     /// None disables saving (e.g. the existing file could not be read).
     state_path: Option<std::path::PathBuf>,
-    selected: Option<u64>,
+    pub(crate) selected: Option<u64>,
     /// Process of each running turn, by thread id.
     turns: HashMap<u64, Process>,
-    input: Entity<TextInput>,
+    pub(crate) input: Entity<TextInput>,
     focus: FocusHandle,
     /// Palette for the current system appearance, refreshed every render.
-    theme: Theme,
+    pub(crate) theme: Theme,
+    /// The sidebar's entries, in the order shown.
+    pub(crate) rows: Vec<Row>,
+    /// Virtualized sidebar list over `rows`.
+    pub(crate) thread_list: ListState,
+    /// Checked-out branch of each project folder that is in a repository.
+    pub(crate) branches: HashMap<PathBuf, String>,
     /// Virtualized message list. It follows new output until the user scrolls up.
     transcript: ListState,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
@@ -39,11 +50,12 @@ pub struct Workspace {
     /// Parsed replies of that thread by message index, so frames do not reparse.
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
     /// The dropdown menu that is open, if any.
-    menu: Option<Menu>,
+    pub(crate) menu: Option<Menu>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Menu {
+pub(crate) enum Menu {
+    NewThread,
     Model,
     Effort,
     Web,
@@ -52,6 +64,20 @@ enum Menu {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe_window_appearance(window, |_, _, cx| cx.notify()).detach();
+        // Branches may have been switched while the window was in the background.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh(cx);
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REFRESH).await;
+            if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
         let path = state_path();
         let (store, state_path) = match persist::load(&path) {
             Ok(Loaded::Ok(store)) => (store, Some(path)),
@@ -73,7 +99,7 @@ impl Workspace {
             InputEvent::Changed => cx.notify(),
         })
         .detach();
-        Self {
+        let mut this = Self {
             store,
             state_path,
             selected,
@@ -81,14 +107,34 @@ impl Workspace {
             input,
             focus: cx.focus_handle(),
             theme: Theme::new(window.appearance(), font),
+            rows: Vec::new(),
+            thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            branches: HashMap::new(),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
             transcript_thread: None,
             parsed: HashMap::new(),
             menu: None,
-        }
+        };
+        this.sync_rows();
+        this.refresh(cx);
+        this
     }
 
-    fn save(&self) {
+    /// Reread the branches and redraw, which also brings the ages up to date.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.branches = self
+            .store
+            .projects
+            .iter()
+            .filter_map(|p| Some((p.dir.clone(), project::branch(&p.dir)?)))
+            .collect();
+        cx.notify();
+    }
+
+    /// Write the state to disk. Every change to the thread list ends here, so
+    /// the sidebar is rebuilt too.
+    fn save(&mut self) {
+        self.sync_rows();
         if let Some(path) = &self.state_path {
             if let Err(e) = persist::save(path, &self.store) {
                 eprintln!("kiln: could not save state: {e}");
@@ -112,7 +158,7 @@ impl Workspace {
         }
     }
 
-    fn add_project(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -128,22 +174,37 @@ impl Workspace {
                     this.new_thread(p, cx);
                 } else {
                     this.save();
-                    cx.notify();
                 }
+                this.refresh(cx);
             });
         })
         .detach();
     }
 
-    fn new_thread(&mut self, p: usize, cx: &mut Context<Self>) {
-        if let Some(id) = self.store.add_thread(p, Agent::default()) {
+    pub(crate) fn new_thread(&mut self, p: usize, cx: &mut Context<Self>) {
+        if let Some(id) = self.store.add_thread(p, Agent::default(), now()) {
             self.selected = Some(id);
             self.save();
             cx.notify();
         }
     }
 
-    fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn set_settled(&mut self, id: u64, settled: bool, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(id) else {
+            return;
+        };
+        if settled {
+            if !thread.settle() {
+                return;
+            }
+        } else {
+            thread.settled = false;
+        }
+        self.save();
+        cx.notify();
+    }
+
+    pub(crate) fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
         if self.store.delete_thread(id) {
             if self.selected == Some(id) {
                 self.selected = self.store.first_thread_id();
@@ -153,7 +214,7 @@ impl Workspace {
         }
     }
 
-    fn remove_project(&mut self, p: usize, cx: &mut Context<Self>) {
+    pub(crate) fn remove_project(&mut self, p: usize, cx: &mut Context<Self>) {
         if self.store.remove_project(p) {
             if self.selected.is_some_and(|id| self.store.locate(id).is_none()) {
                 self.selected = self.store.first_thread_id();
@@ -203,6 +264,7 @@ impl Workspace {
             thread.title = body.chars().take(40).collect();
         }
         thread.messages.push(Message::user(body.clone()));
+        thread.touch(now());
         self.input.update(cx, |input, cx| input.clear(cx));
         self.transcript_thread = None; // show what was just sent
         self.save();
@@ -258,6 +320,8 @@ impl Workspace {
                     let retry = this.apply(id, ev, &granted);
                     if done {
                         this.save();
+                        // The turn may have switched branches.
+                        this.refresh(cx);
                     }
                     if let Some(rules) = retry {
                         let go = "Permission granted for the denied action. Continue.".to_string();
@@ -313,16 +377,21 @@ impl Workspace {
             }
             AgentEvent::Done { error } => {
                 if let Some(e) = error {
+                    thread.touch(now());
                     thread.status = Status::NeedsInput;
                     thread.messages.push(Message::notice(format!("Error: {e}")));
                 } else if !thread.auto_allow.is_empty() {
                     return Some(std::mem::take(&mut thread.auto_allow));
                 } else {
+                    thread.touch(now());
                     thread.status =
                         if thread.pending.is_empty() { Status::Idle } else { Status::NeedsInput };
                 }
             }
-            AgentEvent::Stopped => thread.stop_turn(),
+            AgentEvent::Stopped => {
+                thread.touch(now());
+                thread.stop_turn();
+            }
         }
         None
     }
@@ -337,6 +406,7 @@ impl Workspace {
         let a = thread.pending.remove(idx);
         let note = format!("✓ Allowed: {}\n{}", a.tool, a.summary);
         thread.messages.push(Message::notice(note));
+        thread.touch(now());
         let go = "Permission granted for the denied action. Continue.".to_string();
         self.save();
         self.start_turn(id, go, vec![a.rule], cx);
@@ -352,6 +422,7 @@ impl Workspace {
         let a = thread.pending.remove(idx);
         let note = format!("✗ Denied: {}\n{}", a.tool, a.summary);
         thread.messages.push(Message::notice(note));
+        thread.touch(now());
         if thread.pending.is_empty() {
             thread.status = Status::Idle;
         }
@@ -496,14 +567,14 @@ impl Workspace {
             ))
     }
 
-    fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = (self.menu != Some(menu)).then_some(menu);
         cx.notify();
     }
 
     /// A see-through layer under an open menu. It catches clicks outside the
     /// menu, including on its button, so one click only closes the menu.
-    fn backdrop(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn backdrop(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let layer = div().id("menu-backdrop").w(viewport.width).h(viewport.height).occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
@@ -517,7 +588,7 @@ impl Workspace {
         .with_priority(1)
     }
 
-    fn menu_panel(&self, id: &'static str, title: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn menu_panel(&self, id: &'static str, title: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         div().id(id).flex().flex_col().w(px(220.)).p_1().rounded(px(10.)).bg(theme.card)
             .border_1().border_color(theme.border).shadow_lg().occlude()
@@ -605,94 +676,12 @@ impl Workspace {
             ))
     }
 
-    fn status_mark(&self, status: Status) -> impl IntoElement {
-        let color = match status {
-            Status::Running => Some(self.theme.accent),
-            Status::NeedsInput => Some(self.theme.warn),
-            Status::Idle => None,
-        };
-        div().flex_shrink_0().size(px(7.)).rounded_full().when_some(color, |d, c| d.bg(c))
-    }
-
-    /// A borderless toolbar-style button.
-    fn quiet_button(
-        &self,
-        id: impl Into<SharedString>,
-        label: &'static str,
-    ) -> gpui::Stateful<gpui::Div> {
-        let theme = self.theme;
-        div().id(id.into()).flex().items_center().justify_center().min_w(px(20.)).h(px(20.))
-            .px_1().rounded_md().text_sm().text_color(theme.muted).cursor_pointer()
-            .hover(|h| h.bg(theme.hover).text_color(theme.text))
-            .child(label)
-    }
-
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        // macOS draws its window buttons over the top of the sidebar.
-        let top = if cfg!(target_os = "macos") { TOOLBAR } else { 12. };
-        let mut projects = div().id("projects").flex().flex_col().flex_1().min_h_0().gap_4()
-            .px_2p5().overflow_y_scroll();
-        for (pi, p) in self.store.projects.iter().enumerate() {
-            let mut group = div().flex().flex_col().flex_shrink_0().gap_0p5().child(
-                div().flex().items_center().gap_1().pl_2().pr_1()
-                    .child(div().flex_1().min_w_0().truncate().text_xs()
-                        .font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
-                        .child(p.name.clone()))
-                    .child(self.quiet_button(format!("new-thread-{pi}"), "+")
-                        .on_click(cx.listener(move |this, _, _, cx| this.new_thread(pi, cx))))
-                    .child(self.quiet_button(format!("rm-project-{pi}"), "×")
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_project(pi, cx)))),
-            );
-            for t in &p.threads {
-                let id = t.id;
-                let active = self.selected == Some(id);
-                group = group.child(
-                    div().id(SharedString::from(format!("t{id}")))
-                        .flex().items_center().gap_2().h(px(30.)).pl_2().pr_1().rounded_md()
-                        .text_sm().text_color(theme.text).cursor_pointer()
-                        .when(active, |d| d.bg(theme.selected).font_weight(FontWeight::MEDIUM))
-                        .when(!active, |d| d.hover(|h| h.bg(theme.hover)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.selected = Some(id);
-                            window.focus(&this.input.focus_handle(cx), cx);
-                            cx.notify();
-                        }))
-                        .child(self.status_mark(t.status))
-                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().line_clamp(1)
-                            .child(t.title.clone()))
-                        .child(div().text_xs().text_color(theme.muted).child(t.agent.label()))
-                        .child(self.quiet_button(format!("del{id}"), "×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.delete_thread(id, cx);
-                            }))),
-                );
-            }
-            projects = projects.child(group);
-        }
-        let add = div().id("add-project").flex().flex_shrink_0().items_center().gap_2()
-            .mx_2p5().mb_2p5().px_2().h(px(30.)).rounded_md().text_sm().text_color(theme.muted)
-            .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
-            .child("+").child("Add Project")
-            .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)));
-        // Lines up with the project names below.
-        let (width, height) = assets::LOCKUP_SIZE;
-        let brand = div().flex().flex_shrink_0().px(px(18.)).pb_2()
-            .child(img(theme.lockup).flex_shrink_0().w(px(width)).h(px(height)));
-        div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
-            .bg(theme.sidebar).border_r_1().border_color(theme.border)
-            .child(brand)
-            .child(projects)
-            .child(add)
-    }
-
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let (msg, action) = if self.store.projects.is_empty() {
             ("Add a project folder to start working with an agent.", "Add Project")
         } else {
-            ("Select a thread, or create one with + next to a project.", "")
+            ("Select a thread, or start one with the new thread button.", "")
         };
         div().flex().flex_col().flex_1().h_full().items_center().justify_center().gap_3()
             .bg(theme.window)
@@ -865,7 +854,7 @@ fn centered(child: impl IntoElement) -> gpui::Div {
 }
 
 /// The provider's mark, in its brand color.
-fn agent_icon(agent: Agent, size: f32) -> impl IntoElement {
+pub(crate) fn agent_icon(agent: Agent, size: f32) -> impl IntoElement {
     let (path, color) = match agent {
         Agent::Claude => (assets::CLAUDE, rgb(0xd97757)),
     };
@@ -904,7 +893,7 @@ impl Render for Workspace {
         div().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
-            .child(self.sidebar(cx))
+            .child(self.sidebar(window, cx))
             .child(match self.selected {
                 Some(id) => self.thread(id, window, cx),
                 None => self.empty_state(cx).into_any_element(),

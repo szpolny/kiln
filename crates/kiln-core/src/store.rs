@@ -182,10 +182,16 @@ pub struct Thread {
     pub pending: Vec<Approval>,
     /// Rules the policy already allows; sent with the automatic retry.
     pub auto_allow: Vec<String>,
+    /// Last activity in Unix seconds; 0 when unknown.
+    #[serde(default)]
+    pub updated_at: u64,
+    /// The user set the thread aside as done with.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 impl Thread {
-    fn new(id: u64, agent: Agent) -> Self {
+    fn new(id: u64, agent: Agent, now: u64) -> Self {
         Self {
             id,
             title: NEW_THREAD_TITLE.into(),
@@ -199,6 +205,8 @@ impl Thread {
             session_id: None,
             pending: vec![],
             auto_allow: vec![],
+            updated_at: now,
+            settled: false,
         }
     }
 
@@ -212,7 +220,29 @@ impl Thread {
         self.effort.unwrap_or(self.agent.default_effort())
     }
 
-    /// Settle a turn the user stopped. Nothing it asked for stays waiting.
+    /// Record activity at `now`, which makes a settled thread active again.
+    pub fn touch(&mut self, now: u64) {
+        self.updated_at = now;
+        self.settled = false;
+    }
+
+    /// Whether nothing is running or waiting for the user's approval.
+    pub fn can_settle(&self) -> bool {
+        self.status != Status::Running && self.pending.is_empty()
+    }
+
+    /// Set the thread aside, which also dismisses a failed turn. Refused while
+    /// the thread still needs attention.
+    pub fn settle(&mut self) -> bool {
+        if !self.can_settle() {
+            return false;
+        }
+        self.status = Status::Idle;
+        self.settled = true;
+        true
+    }
+
+    /// End a turn the user stopped. Nothing it asked for stays waiting.
     pub fn stop_turn(&mut self) {
         self.status = Status::Idle;
         self.pending.clear();
@@ -272,11 +302,11 @@ impl Store {
         self.projects.len() - 1
     }
 
-    /// Add a thread to project `p`; returns its id.
-    pub fn add_thread(&mut self, p: usize, agent: Agent) -> Option<u64> {
+    /// Add a thread to project `p`, created at `now`; returns its id.
+    pub fn add_thread(&mut self, p: usize, agent: Agent, now: u64) -> Option<u64> {
         self.next_id += 1;
         let id = self.next_id;
-        self.projects.get_mut(p)?.threads.push(Thread::new(id, agent));
+        self.projects.get_mut(p)?.threads.push(Thread::new(id, agent, now));
         Some(id)
     }
 
@@ -323,8 +353,22 @@ impl Store {
         Some(self.projects[p].dir.clone())
     }
 
+    /// The active or the settled threads of every project, latest activity
+    /// first and newer threads first among equals.
+    pub fn thread_ids(&self, settled: bool) -> Vec<u64> {
+        let mut threads: Vec<&Thread> = self
+            .projects
+            .iter()
+            .flat_map(|p| &p.threads)
+            .filter(|t| t.settled == settled)
+            .collect();
+        threads.sort_unstable_by_key(|t| std::cmp::Reverse((t.updated_at, t.id)));
+        threads.into_iter().map(|t| t.id).collect()
+    }
+
+    /// The thread at the top of the list: active ones come before settled ones.
     pub fn first_thread_id(&self) -> Option<u64> {
-        self.projects.iter().flat_map(|p| &p.threads).next().map(|t| t.id)
+        self.thread_ids(false).first().or(self.thread_ids(true).first()).copied()
     }
 
     /// Test fixture: one project with two threads.
@@ -332,8 +376,8 @@ impl Store {
     pub fn sample() -> Self {
         let mut s = Self::default();
         let p = s.add_project(Path::new("/tmp/kiln-sample"));
-        s.add_thread(p, Agent::Claude);
-        s.add_thread(p, Agent::Claude);
+        s.add_thread(p, Agent::Claude, 0);
+        s.add_thread(p, Agent::Claude, 0);
         s
     }
 }
@@ -344,7 +388,7 @@ mod tests {
 
     #[test]
     fn a_thread_without_a_choice_uses_the_default_model() {
-        let mut t = Thread::new(1, Agent::Claude);
+        let mut t = Thread::new(1, Agent::Claude, 0);
         assert_eq!(t.model(), "claude-opus-5-5");
         t.model = Some("claude-haiku-5-5".into());
         assert_eq!(t.model(), "claude-haiku-5-5");
@@ -354,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_stopped_turn_leaves_the_thread_idle_and_keeps_its_session() {
-        let mut t = Thread::new(1, Agent::Claude);
+        let mut t = Thread::new(1, Agent::Claude, 0);
         t.status = Status::Running;
         t.session_id = Some("sess-1".into());
         t.messages.push(Message::user("go"));
@@ -382,7 +426,7 @@ mod tests {
 
     #[test]
     fn threads_saved_without_an_effort_still_load() {
-        let mut value = serde_json::to_value(Thread::new(1, Agent::Claude)).unwrap();
+        let mut value = serde_json::to_value(Thread::new(1, Agent::Claude, 0)).unwrap();
         value.as_object_mut().unwrap().remove("effort");
         let thread: Thread = serde_json::from_value(value).unwrap();
         assert_eq!(thread.effort(), Effort::Medium);
@@ -422,7 +466,7 @@ mod tests {
         let (first, second) = (s.projects[0].threads[0].id, s.projects[0].threads[1].id);
         assert!(s.delete_thread(first));
         assert_eq!(s.locate(second), Some((0, 0)));
-        let third = s.add_thread(0, Agent::Claude).unwrap();
+        let third = s.add_thread(0, Agent::Claude, 0).unwrap();
         assert!(third != first && third != second);
     }
 
@@ -436,6 +480,68 @@ mod tests {
     }
 
     #[test]
+    fn threads_of_all_projects_are_listed_by_latest_activity() {
+        let mut s = Store::default();
+        let a = s.add_project(Path::new("/x/a"));
+        let b = s.add_project(Path::new("/x/b"));
+        let first = s.add_thread(a, Agent::Claude, 10).unwrap();
+        let second = s.add_thread(b, Agent::Claude, 20).unwrap();
+        let third = s.add_thread(a, Agent::Claude, 20).unwrap();
+        assert_eq!(s.thread_ids(false), [third, second, first]);
+
+        s.thread_mut(first).unwrap().touch(30);
+        assert_eq!(s.thread_ids(false), [first, third, second]);
+
+        assert!(s.thread_mut(first).unwrap().settle());
+        assert_eq!(s.thread_ids(false), [third, second]);
+        assert_eq!(s.thread_ids(true), [first]);
+        assert_eq!(s.first_thread_id(), Some(third));
+
+        for id in [second, third] {
+            assert!(s.thread_mut(id).unwrap().settle());
+        }
+        assert_eq!(s.first_thread_id(), Some(first));
+    }
+
+    #[test]
+    fn new_activity_brings_a_settled_thread_back() {
+        let mut t = Thread::new(1, Agent::Claude, 10);
+        assert!(t.settle());
+        t.touch(20);
+        assert!(!t.settled);
+        assert_eq!(t.updated_at, 20);
+    }
+
+    #[test]
+    fn only_threads_that_need_nothing_can_be_settled() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        t.status = Status::Running;
+        assert!(!t.settle());
+        t.status = Status::NeedsInput;
+        t.pending.push(Approval {
+            tool: "Bash".into(),
+            summary: "$ touch a".into(),
+            rule: "Bash(touch a)".into(),
+        });
+        assert!(!t.settle() && !t.settled);
+
+        // A failed turn leaves nothing to approve, so settling dismisses it.
+        t.pending.clear();
+        assert!(t.settle());
+        assert_eq!(t.status, Status::Idle);
+    }
+
+    #[test]
+    fn threads_saved_without_activity_or_settled_state_still_load() {
+        let mut value = serde_json::to_value(Thread::new(1, Agent::Claude, 10)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("updated_at");
+        fields.remove("settled");
+        let thread: Thread = serde_json::from_value(value).unwrap();
+        assert_eq!((thread.updated_at, thread.settled), (0, false));
+    }
+
+    #[test]
     fn normalize_assigns_ids_to_legacy_threads() {
         let mut s = Store::sample();
         for t in &mut s.projects[0].threads {
@@ -445,7 +551,7 @@ mod tests {
         let a = s.projects[0].threads[0].id;
         let b = s.projects[0].threads[1].id;
         assert!(a != 0 && b != 0 && a != b);
-        let c = s.add_thread(0, Agent::Claude).unwrap();
+        let c = s.add_thread(0, Agent::Claude, 0).unwrap();
         assert!(c != a && c != b);
     }
 }

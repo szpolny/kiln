@@ -1,5 +1,6 @@
 mod assets;
 mod markdown;
+mod sidebar;
 mod text_edit;
 mod text_input;
 mod theme;

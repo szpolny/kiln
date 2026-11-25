@@ -10,6 +10,7 @@ Kiln runs agents as local processes and gives you one place to start, watch, app
 ## What works today
 
 - Projects added from local folders, each with its own threads.
+- One thread list across projects, with each thread's branch. Settle the threads you are done with to move them out of the way; sending a message brings one back.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the agent. Support for others, such as Codex, is planned.
 - A model, a reasoning level, and a web access setting for each thread.
 - Markdown replies, with the tool calls and commands the agent runs.
