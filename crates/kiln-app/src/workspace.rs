@@ -1,6 +1,6 @@
-use crate::theme;
+use crate::theme::{ui_font, Theme, MONO};
 use gpui::{
-    div, list, prelude::*, px, Context, FocusHandle, Focusable, FontWeight, IntoElement,
+    div, list, prelude::*, px, relative, Context, FocusHandle, Focusable, FontWeight, IntoElement,
     KeyDownEvent, ListAlignment, ListState, PathPromptOptions, Render, SharedString, Window,
 };
 use kiln_agent::{claude, AgentEvent};
@@ -8,7 +8,10 @@ use kiln_core::policy::{capability_for_tool, Decision};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{Agent, Approval, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE};
 
-const MONO: &str = if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" };
+/// Widest the conversation and composer grow; they stay centered beyond it.
+const COLUMN: f32 = 760.;
+/// Height of the title bar row shared by the sidebar and the thread.
+const TOOLBAR: f32 = 52.;
 
 pub struct Workspace {
     store: Store,
@@ -17,6 +20,8 @@ pub struct Workspace {
     selected: Option<u64>,
     draft: String,
     focus: FocusHandle,
+    /// Palette for the current system appearance, refreshed every render.
+    theme: Theme,
     /// Virtualized message list. It follows new output until the user scrolls up.
     transcript: ListState,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
@@ -24,7 +29,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify()).detach();
         let path = state_path();
         let (store, state_path) = match persist::load(&path) {
             Ok(Loaded::Ok(store)) => (store, Some(path)),
@@ -39,12 +45,14 @@ impl Workspace {
             }
         };
         let selected = store.first_thread_id();
+        let font = ui_font(&cx.text_system().all_font_names());
         Self {
             store,
             state_path,
             selected,
             draft: String::new(),
             focus: cx.focus_handle(),
+            theme: Theme::new(window.appearance(), font),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
             transcript_thread: None,
         }
@@ -227,7 +235,7 @@ impl Workspace {
             AgentEvent::Denied { tool, summary, rule } => {
                 match thread.policy.decide(capability_for_tool(&tool)) {
                     Decision::Allow => thread.auto_allow.push(rule),
-                    Decision::Deny => thread.messages.push(Message::agent(format!(
+                    Decision::Deny => thread.messages.push(Message::notice(format!(
                         "Blocked by policy: {tool}\n{summary}"
                     ))),
                     Decision::Ask => thread.pending.push(Approval { tool, summary, rule }),
@@ -236,7 +244,7 @@ impl Workspace {
             AgentEvent::Done { error } => {
                 if let Some(e) = error {
                     thread.status = Status::NeedsInput;
-                    thread.messages.push(Message::agent(format!("Error: {e}")));
+                    thread.messages.push(Message::notice(format!("Error: {e}")));
                 } else if !thread.auto_allow.is_empty() {
                     return Some(std::mem::take(&mut thread.auto_allow));
                 } else {
@@ -257,7 +265,7 @@ impl Workspace {
         }
         let a = thread.pending.remove(idx);
         let note = format!("✓ Allowed: {}\n{}", a.tool, a.summary);
-        thread.messages.push(Message::user(note));
+        thread.messages.push(Message::notice(note));
         let go = "Permission granted for the denied action. Continue.".to_string();
         self.save();
         self.start_turn(id, go, vec![a.rule], cx);
@@ -272,7 +280,7 @@ impl Workspace {
         }
         let a = thread.pending.remove(idx);
         let note = format!("✗ Denied: {}\n{}", a.tool, a.summary);
-        thread.messages.push(Message::user(note));
+        thread.messages.push(Message::notice(note));
         if thread.pending.is_empty() {
             thread.status = Status::Idle;
         }
@@ -281,31 +289,35 @@ impl Workspace {
     }
 
     fn approval_cards(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut col = div().id("approvals").flex().flex_col().flex_shrink_0().gap_2().px_6().pb_2()
-            .max_h(px(240.)).overflow_y_scroll();
+        let theme = self.theme;
+        let mut col = div().id("approvals").flex().flex_col().items_center().flex_shrink_0()
+            .gap_2().px_6().max_h(px(240.)).overflow_y_scroll();
         let pending = self.store.thread(id).map(|th| th.pending.clone()).unwrap_or_default();
         for (i, a) in pending.into_iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
-                div().id(SharedString::from(id)).px_3().py_1().rounded_sm().text_xs()
-                    .cursor_pointer().border_1().border_color(theme::border())
-                    .when(primary, |d| d.bg(theme::accent()).text_color(theme::bg()))
-                    .when(!primary, |d| d.text_color(theme::text()).hover(|h| h.bg(theme::hover())))
+                div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
+                    .font_weight(FontWeight::MEDIUM).cursor_pointer()
+                    .when(primary, |d| d.bg(theme.accent).text_color(theme.on_accent))
+                    .when(!primary, |d| d.bg(theme.selected).text_color(theme.text))
+                    .hover(|h| h.opacity(0.85))
                     .child(label)
             };
             col = col.child(
-                div().flex().flex_shrink_0().items_start().gap_3().px_3().py_2().rounded_sm()
-                    .bg(theme::surface()).border_1().border_color(theme::warn())
+                div().flex().flex_shrink_0().items_start().gap_2().w_full().max_w(px(COLUMN))
+                    .p_3().mb_2().rounded(px(12.)).bg(theme.card)
+                    .border_1().border_color(theme.warn).shadow_sm()
                     .child(
-                        div().flex().flex_col().flex_1().min_w_0().gap_0p5()
-                            .child(div().text_xs().text_color(theme::warn())
+                        div().flex().flex_col().flex_1().min_w_0().gap_1()
+                            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.warn)
                                 .child(format!("{} needs approval", a.tool)))
-                            .child(div().font_family(MONO).text_xs().text_color(theme::text())
+                            .child(div().font_family(MONO).text_xs().text_color(theme.text)
                                 .child(a.summary)),
                     )
-                    .child(button(format!("allow{i}"), "Allow", true)
-                        .on_click(cx.listener(move |this, _, _, cx| this.approve(id, i, cx))))
                     .child(button(format!("deny{i}"), "Deny", false)
-                        .on_click(cx.listener(move |this, _, _, cx| this.deny(id, i, cx)))),
+                        .on_click(cx.listener(move |this, _, _, cx| this.deny(id, i, cx))))
+                    .child(button(format!("allow{i}"), "Allow", true)
+                        .on_click(cx.listener(move |this, _, _, cx| this.approve(id, i, cx)))),
             );
         }
         col
@@ -319,66 +331,69 @@ impl Workspace {
         }
     }
 
-    /// One button per model; the choice applies from the next turn.
+    /// Segmented control; the choice applies from the next turn.
     fn model_chooser(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
         let id = thread.id;
-        let mut row = div().flex().flex_wrap().items_center().gap_1().pt_2()
-            .child(div().pr_1().text_xs().text_color(theme::muted()).child("Model"));
+        let mut track = div().flex().gap_0p5().p_0p5().rounded_lg().bg(theme.fill);
         let choices = std::iter::once(None).chain(thread.agent.models().iter().copied().map(Some));
         for choice in choices {
-            let label = choice.unwrap_or("default");
+            let label = choice.map_or_else(|| "Default".to_string(), capitalized);
             let active = thread.model.as_deref() == choice;
-            row = row.child(
+            track = track.child(
                 div().id(SharedString::from(format!("model-{label}")))
-                    .px_2().py_0p5().rounded_sm().text_xs().cursor_pointer()
-                    .border_1()
-                    .border_color(if active { theme::accent() } else { theme::border() })
-                    .text_color(if active { theme::text() } else { theme::muted() })
-                    .hover(|h| h.bg(theme::hover()))
+                    .px_2p5().py_0p5().rounded_md().text_xs().cursor_pointer()
+                    .when(active, |d| {
+                        d.bg(theme.segment).shadow_sm().text_color(theme.text)
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                    .when(!active, |d| {
+                        d.text_color(theme.muted).hover(|h| h.text_color(theme.text))
+                    })
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_model(id, choice, cx))),
             );
         }
-        row.when_some(thread.reported_model.clone(), |row, model| {
-            row.child(div().flex_1()).child(
-                div().text_xs().text_color(theme::muted()).child(format!("last turn ran {model}")),
-            )
-        })
+        track
     }
 
-    fn dot(status: Status) -> impl IntoElement {
-        let c = match status {
-            Status::Running => theme::accent(),
-            Status::NeedsInput => theme::warn(),
-            Status::Idle => theme::muted(),
+    fn status_mark(&self, status: Status) -> impl IntoElement {
+        let color = match status {
+            Status::Running => Some(self.theme.accent),
+            Status::NeedsInput => Some(self.theme.warn),
+            Status::Idle => None,
         };
-        div().flex_shrink_0().size(px(7.)).bg(c)
+        div().flex_shrink_0().size(px(7.)).rounded_full().when_some(color, |d, c| d.bg(c))
     }
 
-    fn small_button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<gpui::Div> {
-        div().id(id.into()).px_1p5().rounded_sm().text_xs().text_color(theme::muted())
-            .cursor_pointer().hover(|h| h.bg(theme::hover()).text_color(theme::text()))
+    /// A borderless toolbar-style button.
+    fn quiet_button(
+        &self,
+        id: impl Into<SharedString>,
+        label: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        div().id(id.into()).flex().items_center().justify_center().min_w(px(20.)).h(px(20.))
+            .px_1().rounded_md().text_sm().text_color(theme.muted).cursor_pointer()
+            .hover(|h| h.bg(theme.hover).text_color(theme.text))
             .child(label)
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div().flex().flex_shrink_0().items_center().px_2().pt_6()
-            .child(div().flex_shrink_0().w(px(4.)).h(px(16.)).mr_2().bg(theme::accent()))
-            .child(div().flex_1().text_base().font_weight(FontWeight::BOLD)
-                .text_color(theme::text()).child("KILN"))
-            .child(Self::small_button("add-project", "+ Project")
-                .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))));
-        let mut projects = div().id("projects").flex().flex_col().flex_1().min_h_0().gap_3()
-            .overflow_y_scroll();
+        let theme = self.theme;
+        // macOS draws its window buttons over the top of the sidebar.
+        let top = if cfg!(target_os = "macos") { TOOLBAR } else { 12. };
+        let mut projects = div().id("projects").flex().flex_col().flex_1().min_h_0().gap_4()
+            .px_2p5().overflow_y_scroll();
         for (pi, p) in self.store.projects.iter().enumerate() {
             let mut group = div().flex().flex_col().flex_shrink_0().gap_0p5().child(
-                div().flex().items_center().px_2().py_1()
+                div().flex().items_center().gap_1().pl_2().pr_1()
                     .child(div().flex_1().min_w_0().truncate().text_xs()
-                        .font_weight(FontWeight::BOLD).text_color(theme::muted())
-                        .child(p.name.to_uppercase()))
-                    .child(Self::small_button(format!("new-thread-{pi}"), "+")
+                        .font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
+                        .child(p.name.clone()))
+                    .child(self.quiet_button(format!("new-thread-{pi}"), "+")
                         .on_click(cx.listener(move |this, _, _, cx| this.new_thread(pi, cx))))
-                    .child(Self::small_button(format!("rm-project-{pi}"), "×")
+                    .child(self.quiet_button(format!("rm-project-{pi}"), "×")
                         .on_click(cx.listener(move |this, _, _, cx| this.remove_project(pi, cx)))),
             );
             for t in &p.threads {
@@ -386,21 +401,20 @@ impl Workspace {
                 let active = self.selected == Some(id);
                 group = group.child(
                     div().id(SharedString::from(format!("t{id}")))
-                        .flex().items_center().gap_2().px_2().py_1p5()
-                        .border_l_2().border_color(theme::sidebar())
-                        .text_sm().text_color(theme::text())
-                        .when(active, |d| d.bg(theme::hover()).border_color(theme::accent()))
-                        .hover(|d| d.bg(theme::hover()))
-                        .cursor_pointer()
+                        .flex().items_center().gap_2().h(px(30.)).pl_2().pr_1().rounded_md()
+                        .text_sm().text_color(theme.text).cursor_pointer()
+                        .when(active, |d| d.bg(theme.selected).font_weight(FontWeight::MEDIUM))
+                        .when(!active, |d| d.hover(|h| h.bg(theme.hover)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.selected = Some(id);
                             window.focus(&this.focus);
                             cx.notify();
                         }))
-                        .child(Self::dot(t.status))
-                        .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
-                        .child(div().text_xs().text_color(theme::muted()).child(t.agent.label()))
-                        .child(Self::small_button(format!("del{id}"), "×")
+                        .child(self.status_mark(t.status))
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().line_clamp(1)
+                            .child(t.title.clone()))
+                        .child(div().text_xs().text_color(theme.muted).child(t.agent.label()))
+                        .child(self.quiet_button(format!("del{id}"), "×")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.delete_thread(id, cx);
@@ -409,71 +423,148 @@ impl Workspace {
             }
             projects = projects.child(group);
         }
-        div().flex().flex_col().flex_shrink_0().gap_3().p_3().w(px(260.)).h_full()
-            .bg(theme::sidebar()).border_r_1().border_color(theme::border())
-            .child(header)
+        let add = div().id("add-project").flex().flex_shrink_0().items_center().gap_2()
+            .mx_2p5().mb_2p5().px_2().h(px(30.)).rounded_md().text_sm().text_color(theme.muted)
+            .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
+            .child("+").child("Add Project")
+            .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)));
+        div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
+            .bg(theme.sidebar).border_r_1().border_color(theme.border)
             .child(projects)
+            .child(add)
     }
 
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
         let (msg, action) = if self.store.projects.is_empty() {
-            ("Add a project folder to start working with an agent.", "Add project")
+            ("Add a project folder to start working with an agent.", "Add Project")
         } else {
             ("Select a thread, or create one with + next to a project.", "")
         };
         div().flex().flex_col().flex_1().h_full().items_center().justify_center().gap_3()
-            .child(div().text_sm().text_color(theme::muted()).child(msg))
+            .bg(theme.window)
+            .child(div().text_sm().text_color(theme.muted).child(msg))
             .when(!action.is_empty(), |d| {
                 d.child(
-                    div().id("empty-add").px_3().py_1p5().rounded_sm().text_sm().cursor_pointer()
-                        .bg(theme::accent()).text_color(theme::bg()).child(action)
+                    div().id("empty-add").px_4().py_1p5().rounded_lg().text_sm()
+                        .font_weight(FontWeight::MEDIUM).cursor_pointer()
+                        .bg(theme.accent).text_color(theme.on_accent).child(action)
                         .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))),
                 )
             })
     }
 
     fn message(&self, id: u64, ix: usize) -> gpui::AnyElement {
+        let theme = self.theme;
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
             return div().into_any_element();
         };
-        if let Some(name) = &m.tool {
-            return Self::tool_call(name, &m.body).into_any_element();
-        }
-        let user = m.role == Role::User;
-        div().w_full().px_6().py_2()
-            .child(
-                div().w_full().min_w_0().pl_3().pr_2().py_1().border_l_2()
-                    .border_color(theme::bg()).text_sm().text_color(theme::text())
-                    .when(user, |d| d.bg(theme::surface()).border_color(theme::accent()))
-                    .child(m.body.clone()),
-            )
+        let body = div().min_w_0().text_sm().line_height(relative(1.55));
+        let content = match (&m.tool, m.role) {
+            (Some(name), _) => self.tool_call(name, &m.body).into_any_element(),
+            (None, Role::User) => div().flex().justify_end()
+                .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
+                    .bg(theme.accent).text_color(theme.on_accent)
+                    .child(m.body.clone()))
+                .into_any_element(),
+            (None, Role::Agent) => body.child(m.body.clone()).into_any_element(),
+            (None, Role::Notice) => body.text_xs().text_color(theme.muted)
+                .child(m.body.clone())
+                .into_any_element(),
+        };
+        div().flex().flex_col().items_center().w_full().px_6().py_1p5()
+            .child(div().w_full().max_w(px(COLUMN)).min_w_0().child(content))
             .into_any_element()
     }
 
     /// The exact tool name and its input, as the agent sent them.
-    fn tool_call(name: &str, input: &str) -> impl IntoElement {
-        div().w_full().px_6().py_1().child(
-            div().flex().flex_col().w_full().min_w_0().gap_1().pl_3().pr_2().py_1()
-                .border_l_2().border_color(theme::border())
-                .child(div().font_family(MONO).text_xs().text_color(theme::accent())
-                    .child(name.to_string()))
-                .when(!input.is_empty(), |d| {
-                    d.child(div().font_family(MONO).text_xs().text_color(theme::text())
-                        .child(input.to_string()))
-                }),
+    fn tool_call(&self, name: &str, input: &str) -> impl IntoElement {
+        let theme = self.theme;
+        div().flex().flex_col().w_full().min_w_0().rounded(px(10.)).bg(theme.fill)
+            .border_1().border_color(theme.border)
+            .child(div().px_3().py_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted).child(name.to_string()))
+            .when(!input.is_empty(), |d| {
+                d.child(div().px_3().py_2().border_t_1().border_color(theme.border)
+                    .font_family(MONO).text_xs().line_height(relative(1.6))
+                    .text_color(theme.text).child(input.to_string()))
+            })
+    }
+
+    fn composer(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let running = thread.status == Status::Running;
+        let ready = !running && !self.draft.trim().is_empty();
+        let text = if self.draft.is_empty() {
+            div().text_color(theme.muted).child("Ask the agent to do something")
+        } else {
+            div().text_color(theme.text).child(format!("{}▏", self.draft))
+        };
+        let note = if running {
+            Some("Working…".to_string())
+        } else {
+            thread.reported_model.clone()
+        };
+        let send = div().id("send").flex().flex_shrink_0().items_center().justify_center()
+            .size(px(28.)).rounded_full().text_sm().font_weight(FontWeight::BOLD)
+            .when(ready, |d| {
+                d.bg(theme.accent).text_color(theme.on_accent).cursor_pointer()
+                    .hover(|h| h.opacity(0.85))
+            })
+            .when(!ready, |d| d.bg(theme.selected).text_color(theme.muted))
+            .child("↑")
+            .on_click(cx.listener(|this, _, _, cx| this.submit(cx)));
+        // A column, so the card's height follows its wrapped draft.
+        div().flex().flex_col().items_center().flex_shrink_0().px_6().pt_1().pb_4().child(
+            div().flex().flex_col().gap_2().w_full().max_w(px(COLUMN)).p_2().rounded(px(16.))
+                .bg(theme.card).border_1().border_color(theme.border).shadow_md()
+                .child(
+                    div().id("composer").track_focus(&self.focus)
+                        .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
+                        .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
+                        .px_2().py_1p5().text_sm().child(text),
+                )
+                .child(
+                    div().flex().items_center().gap_3()
+                        .child(self.model_chooser(thread, cx))
+                        .child(div().flex_1().min_w_0().truncate().text_xs()
+                            .text_color(theme.muted).text_right()
+                            .when_some(note, |d, note| d.child(note)))
+                        .child(send),
+                ),
         )
+    }
+
+    fn toolbar(&self, id: u64, thread: &Thread) -> impl IntoElement {
+        let theme = self.theme;
+        let project = self.store.locate(id).map(|(p, _)| self.store.projects[p].name.clone());
+        let (badge, color) = if thread.policy.is_local_only() {
+            ("Local only", theme.ok)
+        } else {
+            ("Network allowed", theme.warn)
+        };
+        div().flex().flex_shrink_0().items_center().gap_3().px_5().h(px(TOOLBAR))
+            .border_b_1().border_color(theme.border)
+            .child(
+                div().flex().flex_col().flex_1().min_w_0()
+                    .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text).child(thread.title.clone()))
+                    .when_some(project, |d, name| {
+                        d.child(div().truncate().text_xs().text_color(theme.muted).child(name))
+                    }),
+            )
+            .child(
+                div().flex().items_center().gap_1p5().px_2p5().py_1().rounded_full()
+                    .bg(theme.fill).text_xs().text_color(theme.muted)
+                    .child(div().size(px(6.)).rounded_full().bg(color))
+                    .child(badge),
+            )
     }
 
     fn thread(&self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(thread) = self.store.thread(id) else {
             return self.empty_state(cx).into_any_element();
         };
-        let composer_text = if self.draft.is_empty() {
-            div().text_color(theme::muted()).child("What should the agent do?")
-        } else {
-            div().text_color(theme::text()).child(format!("{}▏", self.draft))
-        };
-        let badge = if thread.policy.is_local_only() { "● local only" } else { "○ network allowed" };
         let this = cx.entity();
         let messages = list(self.transcript.clone(), move |ix, _, cx| {
             this.read(cx).message(id, ix)
@@ -481,30 +572,18 @@ impl Workspace {
         .flex_1()
         .min_h_0()
         .py_3();
-        div().flex().flex_col().flex_1().min_w_0().h_full()
-            .child(
-                div().flex().flex_shrink_0().items_center().gap_2().px_4().h(px(44.))
-                    .border_b_1().border_color(theme::border())
-                    .text_sm().text_color(theme::text()).child(thread.title.clone())
-                    .child(div().text_xs().text_color(theme::ok()).child(badge)),
-            )
+        div().flex().flex_col().flex_1().min_w_0().h_full().bg(self.theme.window)
+            .child(self.toolbar(id, thread))
             .child(messages)
             .child(self.approval_cards(id, cx))
-            .child(
-                div().flex_shrink_0().px_6().py_3().bg(theme::sidebar())
-                    .border_t_1().border_color(theme::border())
-                    .child(
-                        div().id("composer").track_focus(&self.focus)
-                            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
-                            .on_click(cx.listener(|this, _, window, _| window.focus(&this.focus)))
-                            .flex().gap_3().py_2().text_sm()
-                            .child(div().text_color(theme::accent()).child("›"))
-                            .child(composer_text.flex_1().min_w_0()),
-                    )
-                    .child(self.model_chooser(thread, cx)),
-            )
+            .child(self.composer(thread, cx))
             .into_any_element()
     }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 impl Focusable for Workspace {
@@ -518,8 +597,10 @@ impl Render for Workspace {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
+        self.theme = Theme::new(window.appearance(), self.theme.font);
         self.sync_transcript();
-        div().flex().size_full().bg(theme::bg()).text_color(theme::text())
+        // No root background: the macOS sidebar lets the blur through.
+        div().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .child(self.sidebar(cx))
             .child(match self.selected {
                 Some(id) => self.thread(id, cx),

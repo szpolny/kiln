@@ -13,6 +13,8 @@ pub enum Status {
 pub enum Role {
     User,
     Agent,
+    /// Written by Kiln itself: errors and approval outcomes.
+    Notice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,10 @@ impl Message {
 
     pub fn agent(body: impl Into<String>) -> Self {
         Self { role: Role::Agent, body: body.into(), tool: None }
+    }
+
+    pub fn notice(body: impl Into<String>) -> Self {
+        Self { role: Role::Notice, body: body.into(), tool: None }
     }
 
     pub fn tool_call(name: impl Into<String>, input: impl Into<String>) -> Self {

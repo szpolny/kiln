@@ -2,7 +2,8 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions,
+    point, px, size, App, AppContext, Application, Bounds, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 
 fn main() {
@@ -11,9 +12,20 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // On macOS the content runs under a transparent title bar.
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Kiln".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(19.), px(19.))),
+                }),
+                window_background: if cfg!(target_os = "macos") {
+                    WindowBackgroundAppearance::Blurred
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                },
                 ..Default::default()
             },
-            |_, cx| cx.new(workspace::Workspace::new),
+            |window, cx| cx.new(|cx| workspace::Workspace::new(window, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);
