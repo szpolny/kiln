@@ -7,8 +7,8 @@ use gpui::{
     Corner, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
     ListState, MouseButton, Entity, PathPromptOptions, Render, SharedString, Window,
 };
-use kiln_agent::{claude, AgentEvent};
-use kiln_core::policy::{capability_for_tool, Decision};
+use kiln_agent::{claude, project, AgentEvent};
+use kiln_core::policy::{capability_for_tool, Capability, Decision, Place};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{Agent, Approval, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE};
 use std::collections::HashMap;
@@ -243,6 +243,7 @@ impl Workspace {
     /// Returns rules to retry with when the policy pre-approved denied actions.
     /// `granted` holds the allow rules the turn was started with.
     fn apply(&mut self, id: u64, ev: AgentEvent, granted: &[String]) -> Option<Vec<String>> {
+        let dir = self.store.project_dir_of(id)?;
         let thread = self.store.thread_mut(id)?;
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
@@ -253,17 +254,27 @@ impl Workspace {
             }
             // Already granted, so something outside Kiln refused it and a
             // retry would only be refused again.
-            AgentEvent::Denied { tool, summary, rule } if granted.contains(&rule) => {
+            AgentEvent::Denied { tool, summary, rule, .. } if granted.contains(&rule) => {
                 thread.messages.push(Message::notice(format!(
                     "Blocked by the agent's own settings: {tool}\n{summary}"
                 )))
             }
-            AgentEvent::Denied { tool, summary, rule } => {
-                match thread.policy.decide(capability_for_tool(&tool)) {
+            AgentEvent::Denied { tool, summary, rule, path } => {
+                let place = path.map_or(Place::Outside, |path| {
+                    let resolved = project::inside(&dir, &path);
+                    Place::of(resolved.as_deref(), path.strip_prefix(&dir).unwrap_or(&path))
+                });
+                let capability = capability_for_tool(&tool, place);
+                match thread.policy.decide(capability) {
                     Decision::Allow => thread.auto_allow.push(rule),
-                    Decision::Deny => thread.messages.push(Message::notice(format!(
-                        "Blocked by policy: {tool}\n{summary}"
-                    ))),
+                    Decision::Deny => {
+                        let why = match capability {
+                            Capability::OutsideFiles => "Blocked outside the project",
+                            _ => "Blocked by policy",
+                        };
+                        let note = format!("{why}: {tool}\n{summary}");
+                        thread.messages.push(Message::notice(note));
+                    }
                     Decision::Ask => thread.pending.push(Approval { tool, summary, rule }),
                 }
             }

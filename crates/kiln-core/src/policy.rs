@@ -1,6 +1,7 @@
 //! Privacy policy. Default is deny: an agent gets nothing it was not granted.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
@@ -65,14 +66,52 @@ impl Policy {
 /// Provider tools that reach the web.
 pub const WEB_TOOLS: [&str; 2] = ["WebFetch", "WebSearch"];
 
-/// Which capability a provider tool needs. Unknown tools are treated as
-/// `Exec`, the strictest default that still lets a human decide.
-pub fn capability_for_tool(tool: &str) -> Capability {
-    match tool {
-        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Glob" | "Grep" => {
+/// Project files that decide what runs: version control hooks and agent setup.
+const CONTROL_FILES: [&str; 3] = [".git", ".claude", ".mcp.json"];
+
+/// Where a file tool's target lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Inside,
+    /// Inside the project, in a file that decides what runs.
+    Control,
+    /// Outside the project, or unknown.
+    Outside,
+}
+
+impl Place {
+    /// `resolved` is the target relative to the project once links are
+    /// followed, `None` if it leaves the project. `named` is the path as asked
+    /// for, so a linked control folder still counts.
+    pub fn of(resolved: Option<&Path>, named: &Path) -> Self {
+        let Some(resolved) = resolved else { return Place::Outside };
+        let control = [resolved, named].iter().any(|path| {
+            path.components().any(|part| {
+                // Some file systems ignore case.
+                CONTROL_FILES.iter().any(|name| part.as_os_str().eq_ignore_ascii_case(name))
+            })
+        });
+        if control {
+            Place::Control
+        } else {
+            Place::Inside
+        }
+    }
+}
+
+/// Which capability a provider tool needs. `place` only matters for file
+/// tools. Unknown tools are treated as `Exec`, the strictest default that
+/// still lets a human decide.
+pub fn capability_for_tool(tool: &str, place: Place) -> Capability {
+    match (tool, place) {
+        ("Read" | "Glob" | "Grep" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit", Place::Outside) => {
+            Capability::OutsideFiles
+        }
+        ("Read" | "Glob" | "Grep", _) => Capability::ProjectFiles,
+        ("Write" | "Edit" | "MultiEdit" | "NotebookEdit", Place::Inside) => {
             Capability::ProjectFiles
         }
-        tool if WEB_TOOLS.contains(&tool) => Capability::Network,
+        (tool, _) if WEB_TOOLS.contains(&tool) => Capability::Network,
         _ => Capability::Exec,
     }
 }
@@ -83,10 +122,34 @@ mod tests {
 
     #[test]
     fn tools_map_to_capabilities() {
-        assert_eq!(capability_for_tool("Bash"), Capability::Exec);
-        assert_eq!(capability_for_tool("Edit"), Capability::ProjectFiles);
-        assert_eq!(capability_for_tool("WebFetch"), Capability::Network);
-        assert_eq!(capability_for_tool("SomethingNew"), Capability::Exec);
+        let inside = |tool| capability_for_tool(tool, Place::Inside);
+        assert_eq!(inside("Bash"), Capability::Exec);
+        assert_eq!(inside("Edit"), Capability::ProjectFiles);
+        assert_eq!(inside("WebFetch"), Capability::Network);
+        assert_eq!(inside("SomethingNew"), Capability::Exec);
+    }
+
+    #[test]
+    fn file_tools_depend_on_where_they_reach() {
+        for tool in ["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "NotebookEdit"] {
+            assert_eq!(capability_for_tool(tool, Place::Outside), Capability::OutsideFiles);
+        }
+        assert_eq!(capability_for_tool("Read", Place::Control), Capability::ProjectFiles);
+        assert_eq!(capability_for_tool("Write", Place::Control), Capability::Exec);
+        assert_eq!(capability_for_tool("Bash", Place::Outside), Capability::Exec);
+    }
+
+    #[test]
+    fn control_files_are_recognised_by_either_path() {
+        let place = |resolved: &str, named: &str| {
+            Place::of(Some(Path::new(resolved)), Path::new(named))
+        };
+        assert_eq!(place("src/a.rs", "src/a.rs"), Place::Inside);
+        assert_eq!(place(".gitignore", ".gitignore"), Place::Inside);
+        assert_eq!(place(".git/hooks/pre-commit", "x"), Place::Control);
+        assert_eq!(place("config/settings.json", ".claude/settings.json"), Place::Control);
+        assert_eq!(place("sub/.MCP.json", "sub/.MCP.json"), Place::Control);
+        assert_eq!(Place::of(None, Path::new("a")), Place::Outside);
     }
 
     #[test]

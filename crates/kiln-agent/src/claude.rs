@@ -3,7 +3,7 @@
 use crate::AgentEvent;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Parse one stream-json line into zero or more events.
@@ -49,6 +49,7 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                         tool: tool.to_string(),
                         summary: describe_input(input),
                         rule: allow_rule(tool, input),
+                        path: target(tool, input),
                     });
                 }
             }
@@ -97,12 +98,63 @@ fn describe_input(input: &Value) -> String {
     lines.join("\n")
 }
 
-/// The narrowest allow rule for a denied call.
-fn allow_rule(tool: &str, input: &Value) -> String {
-    match input["command"].as_str().or_else(|| input["file_path"].as_str()) {
-        Some(target) => format!("{tool}({target})"),
-        None => tool.to_string(),
+/// The file or folder a file tool call reaches; `None` for other tools and
+/// when it cannot be told.
+fn target(tool: &str, input: &Value) -> Option<PathBuf> {
+    let arg = |name: &str| input[name].as_str().map(PathBuf::from);
+    match tool {
+        "Read" | "Write" | "Edit" | "MultiEdit" => arg("file_path"),
+        "NotebookEdit" => arg("notebook_path"),
+        "Grep" => Some(arg("path").unwrap_or_else(|| ".".into())),
+        // A glob pattern can leave the search folder by itself.
+        "Glob" => {
+            let pattern = input["pattern"].as_str()?;
+            if ["..", "{/", ",/"].iter().any(|p| pattern.contains(p)) {
+                return None;
+            }
+            let fixed: PathBuf = Path::new(pattern)
+                .components()
+                .take_while(|c| !c.as_os_str().to_string_lossy().contains(['*', '?', '[', '{']))
+                .collect();
+            Some(arg("path").unwrap_or_else(|| ".".into()).join(fixed))
+        }
+        _ => None,
     }
+}
+
+/// The narrowest allow rule for a denied call.
+///
+/// Claude Code matches file rules as patterns, only under the names `Read` and
+/// `Edit`, and reads a single leading slash as relative to its settings.
+fn allow_rule(tool: &str, input: &Value) -> String {
+    if let Some(command) = input["command"].as_str() {
+        return format!("{tool}({command})");
+    }
+    let (name, below) = match tool {
+        "Read" => ("Read", ""),
+        "Glob" | "Grep" => ("Read", "/**"),
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => ("Edit", ""),
+        _ => return tool.to_string(),
+    };
+    // Never fall back to a bare tool name: that would allow every file.
+    let Some(path) = target(tool, input) else {
+        return format!("{name}(./)");
+    };
+    let mut pattern = String::new();
+    for c in path.to_string_lossy().chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    let root = if path.is_absolute() {
+        "/"
+    } else if path.starts_with(".") {
+        ""
+    } else {
+        "./"
+    };
+    format!("{name}({root}{pattern}{below})")
 }
 
 pub struct Turn {
@@ -216,7 +268,8 @@ mod tests {
             AgentEvent::Denied {
                 tool: "Bash".into(),
                 summary: "$ touch a.txt".into(),
-                rule: "Bash(touch a.txt)".into()
+                rule: "Bash(touch a.txt)".into(),
+                path: None,
             }
         );
         assert_eq!(
@@ -224,10 +277,35 @@ mod tests {
             AgentEvent::Denied {
                 tool: "Edit".into(),
                 summary: "file_path: /p/x.rs".into(),
-                rule: "Edit(/p/x.rs)".into()
+                rule: "Edit(//p/x.rs)".into(),
+                path: Some("/p/x.rs".into()),
             }
         );
         assert_eq!(evs[2], AgentEvent::Done { error: None });
+    }
+
+    #[test]
+    fn file_rules_name_one_target_the_way_claude_matches_them() {
+        let rule = |tool, input| allow_rule(tool, &input);
+        let json = |v: &str| serde_json::from_str::<Value>(v).unwrap();
+        let file = json(r#"{"file_path":"/p/a b/[id]*.ts"}"#);
+        assert_eq!(rule("Write", file.clone()), r"Edit(//p/a b/\[id\]\*.ts)");
+        assert_eq!(rule("Read", file), r"Read(//p/a b/\[id\]\*.ts)");
+        let notebook = json(r#"{"notebook_path":"/p/n.ipynb"}"#);
+        assert_eq!(rule("NotebookEdit", notebook), "Edit(//p/n.ipynb)");
+        assert_eq!(rule("Grep", json(r#"{"path":"/p/src"}"#)), "Read(//p/src/**)");
+        assert_eq!(rule("Grep", json("{}")), "Read(./**)");
+        assert_eq!(rule("Edit", json("{}")), "Edit(./)");
+    }
+
+    #[test]
+    fn glob_targets_include_where_the_pattern_leads() {
+        let glob = |v: serde_json::Value| target("Glob", &v);
+        let at = |pattern: &str| glob(serde_json::json!({ "pattern": pattern, "path": "/p" }));
+        assert_eq!(at("src/**/*.rs"), Some("/p/src".into()));
+        assert_eq!(at("/etc/*.conf"), Some("/etc".into()));
+        assert_eq!(at("../*"), None);
+        assert_eq!(at("{/etc,src}/*"), None);
     }
 
     #[test]
@@ -298,6 +376,45 @@ mod live {
     }
 
     use super::*;
+
+    /// Approving the rules Kiln writes lets the same file edits through.
+    #[test]
+    #[ignore]
+    fn live_file_rules_are_accepted() {
+        let dir = std::env::temp_dir().join(format!("kiln-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let file = dir.join("[id] (draft).txt");
+        let prompt = format!(
+            "Use the Write tool to create {} containing the word hi. Do not use Bash.",
+            file.display()
+        );
+        let turn = |allowed_tools| -> Vec<AgentEvent> {
+            let rx = run(Turn {
+                dir: dir.clone(),
+                prompt: prompt.clone(),
+                resume: None,
+                model: None,
+                allowed_tools,
+                disallowed_tools: vec![],
+            });
+            std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
+        };
+        let rules: Vec<_> = turn(vec![])
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::Denied { rule, .. } => Some(rule),
+                _ => None,
+            })
+            .collect();
+        if !rules.is_empty() {
+            assert!(!file.exists());
+            let events = turn(rules);
+            assert!(!events.iter().any(|e| matches!(e, AgentEvent::Denied { .. })));
+        }
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Needs the `claude` CLI and network: `cargo test -p kiln-agent -- --ignored`.
     #[test]
