@@ -8,10 +8,11 @@ use crate::theme::{ui_font, Theme, MONO};
 use crate::transcript::{self, Entry};
 use chrono::{Local, TimeZone};
 use gpui::{
-    anchored, deferred, div, img, list, point, prelude::*, px, relative, rgb, svg, Anchor, AnchoredPositionMode, Context,
-    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
-    ListState, MouseButton, Entity, PathPromptOptions, Render, RenderImage, SharedString, Task,
-    Window,
+    anchored, canvas, deferred, div, fill, img, list, point, prelude::*, px, relative, rgb, size,
+    svg, Anchor, AnchoredPositionMode, Bounds, Context, DispatchPhase, Entity, FocusHandle, Focusable,
+    FontWeight, HitboxBehavior, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render, RenderImage,
+    ScrollHandle, SharedString, Task, Window,
 };
 use kiln_agent::{claude, codex, process::Process, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, WEB_TOOLS};
@@ -19,6 +20,7 @@ use kiln_core::persist::{self, Loaded};
 use kiln_core::{
     Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -33,6 +35,8 @@ const TRANSCRIPT_PADDING: f32 = 12.;
 pub(crate) const TOOLBAR: f32 = 52.;
 /// How often the sidebar's ages, branches, and icons are brought up to date.
 const REFRESH: Duration = Duration::from_secs(30);
+const MENU_ROW_HEIGHT: f32 = 28.;
+const SCROLLBAR_GUTTER: f32 = 10.;
 
 /// A turn in progress.
 struct RunningTurn {
@@ -90,6 +94,8 @@ pub struct Workspace {
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
     /// The dropdown menu that is open, if any.
     pub(crate) menu: Option<Menu>,
+    model_scroll: ScrollHandle,
+    model_scroll_grab: Rc<Cell<Option<Pixels>>>,
     /// The open project menu reports that the picked file is no icon.
     pub(crate) icon_rejected: bool,
 }
@@ -171,6 +177,8 @@ impl Workspace {
             open_work: HashSet::new(),
             parsed: HashMap::new(),
             menu: None,
+            model_scroll: ScrollHandle::new(),
+            model_scroll_grab: Rc::default(),
             icon_rejected: false,
         };
         this.sync_rows();
@@ -766,9 +774,12 @@ impl Workspace {
         let preview = &models[..models.len().min(PREVIEW_LEN)];
         let selected_below_preview = models[preview.len()..].iter().find(|m| Some(m.id) == selected);
         let shown = if expanded { models } else { preview };
+        let overflows = px(MENU_ROW_HEIGHT * shown.len() as f32) > list_height;
         let id = thread.id;
         let results = div().id(SharedString::from(format!("model-options-{}-{expanded}", agent.label())))
             .flex().flex_col().max_h(list_height).overflow_y_scroll()
+            .track_scroll(&self.model_scroll)
+            .when(overflows, |d| d.pr(px(SCROLLBAR_GUTTER)))
             .children(shown.iter().enumerate().map(|(index, model)| {
                 let model = if !expanded && index == PREVIEW_LEN - 1 {
                     selected_below_preview.unwrap_or(model)
@@ -792,7 +803,8 @@ impl Workspace {
                 d.child(div().px_2().pb_1().text_xs().text_color(theme.muted)
                     .child("Selecting a model starts a new thread"))
             })
-            .child(results)
+            .child(div().relative().child(results)
+                .when(overflows, |d| d.child(self.model_scrollbar())))
             .when(models.len() > PREVIEW_LEN, |d| {
                 let action_color = theme.accent.blend(theme.text.alpha(0.3));
                 let (label, icon) = if expanded {
@@ -806,6 +818,7 @@ impl Workspace {
                         .child(assets::icon(icon, 12.))
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reset_model_scroll();
                             this.menu = Some(Menu::Model { agent, expanded: !expanded, choosing_provider: false });
                             cx.notify();
                         }))))
@@ -818,6 +831,9 @@ impl Workspace {
                         self.menu_item(provider.label(), Some(provider), provider.name(), None, provider == agent)
                             .when(provider == agent, |d| d.bg(theme.selected))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if provider != agent {
+                                    this.reset_model_scroll();
+                                }
                                 this.menu = Some(Menu::Model {
                                     agent: provider,
                                     expanded: provider == agent && expanded,
@@ -828,6 +844,79 @@ impl Workspace {
                     })))
             });
         self.footer_picker(button, Some(menu), window, cx)
+    }
+
+    fn reset_model_scroll(&self) {
+        self.model_scroll.set_offset(point(px(0.), px(0.)));
+        self.model_scroll_grab.set(None);
+    }
+
+    fn model_scrollbar(&self) -> impl IntoElement {
+        let scroll = self.model_scroll.clone();
+        let grab = self.model_scroll_grab.clone();
+        let theme = self.theme;
+        canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, _| {
+                let max_offset = scroll.max_offset().y;
+                if max_offset <= px(0.) {
+                    return;
+                }
+                let track_height = bounds.size.height - px(4.);
+                let thumb_height = (track_height * (bounds.size.height / (bounds.size.height + max_offset)))
+                    .clamp(px(16.), track_height);
+                let travel = track_height - thumb_height;
+                let track_top = bounds.top() + px(2.);
+                let thumb_top = track_top + travel * (-scroll.offset().y / max_offset);
+                let track_left = bounds.left() + px(3.);
+                let paint_bar = |top, height, color, window: &mut Window| {
+                    let mut bar = fill(Bounds::new(point(track_left, top), size(px(4.), height)), color);
+                    bar.corner_radii = px(2.).into();
+                    window.paint_quad(bar);
+                };
+                paint_bar(track_top, track_height, theme.border, window);
+                paint_bar(thumb_top, thumb_height, theme.muted.alpha(0.8), window);
+
+                let scroll_to = move |y: Pixels, anchor: Pixels, window: &mut Window| {
+                    let progress = ((y - track_top - anchor) / travel).clamp(0., 1.);
+                    scroll.set_offset(point(px(0.), -max_offset * progress));
+                    window.refresh();
+                };
+                let drag_scroll = scroll_to.clone();
+                let start_grab = grab.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || event.button != MouseButton::Left
+                        || !hitbox.is_hovered(window)
+                    {
+                        return;
+                    }
+                    let within_thumb = event.position.y - thumb_top;
+                    let anchor = if (px(0.)..=thumb_height).contains(&within_thumb) {
+                        within_thumb
+                    } else {
+                        thumb_height / 2.
+                    };
+                    start_grab.set(Some(anchor));
+                    scroll_to(event.position.y, anchor, window);
+                    cx.stop_propagation();
+                });
+                let moving_grab = grab.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && event.dragging() {
+                        if let Some(anchor) = moving_grab.get() {
+                            drag_scroll(event.position.y, anchor, window);
+                            cx.stop_propagation();
+                        }
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, _| {
+                    if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                        grab.set(None);
+                    }
+                });
+            },
+        )
+        .absolute().top_0().right_0().bottom_0().w(px(SCROLLBAR_GUTTER))
     }
 
     /// Reasoning level picker beside the model; applies from the next turn.
@@ -892,6 +981,9 @@ impl Workspace {
     }
 
     pub(crate) fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        if matches!(menu, Menu::Model { .. }) {
+            self.reset_model_scroll();
+        }
         self.menu = (self.menu != Some(menu)).then_some(menu);
         self.icon_rejected = false;
         cx.notify();
@@ -934,7 +1026,7 @@ impl Workspace {
         active: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
-        div().id(id.into()).flex().items_center().gap_2().h(px(28.)).px_2().rounded_md().text_sm()
+        div().id(id.into()).flex().items_center().gap_2().h(px(MENU_ROW_HEIGHT)).px_2().rounded_md().text_sm()
             .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
             .when_some(icon, |d, agent| d.child(agent_icon(agent, 14., theme.text)))
             .child(div().flex_1().child(label.into()))
