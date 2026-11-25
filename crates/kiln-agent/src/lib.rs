@@ -15,7 +15,12 @@ pub enum AgentEvent {
     PermissionMode(kiln_core::policy::PermissionMode),
     Text(String),
     /// A tool call: the provider's tool name and what it was called with.
-    Tool { name: String, input: String },
+    Tool {
+        name: String,
+        input: String,
+        /// Length of the shell source after the displayed `$ ` prompt.
+        command_bytes: Option<usize>,
+    },
     /// A live request that the provider is waiting for Kiln to answer.
     ApprovalRequested(codex::ApprovalRequest),
     /// The provider cleared a live request, for example on interruption.

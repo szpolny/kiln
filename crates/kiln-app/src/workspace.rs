@@ -2,6 +2,7 @@ use crate::assets;
 use crate::markdown;
 use crate::project_icon;
 use crate::settings::{OpenSettings, SettingsModal};
+use crate::shell;
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
@@ -96,6 +97,8 @@ pub struct Workspace {
     open_tools: HashSet<(u64, usize)>,
     /// Parsed replies of that thread by message index, so frames do not reparse.
     parsed: HashMap<usize, Rc<[markdown::Block]>>,
+    /// Syntax spans for expanded shell commands in the selected thread.
+    shell_highlights: HashMap<usize, Option<Vec<shell::Span>>>,
     /// The dropdown menu that is open, if any.
     pub(crate) menu: Option<Menu>,
     model_scroll: ScrollHandle,
@@ -182,6 +185,7 @@ impl Workspace {
             open_tool_groups: HashSet::new(),
             open_tools: HashSet::new(),
             parsed: HashMap::new(),
+            shell_highlights: HashMap::new(),
             menu: None,
             model_scroll: ScrollHandle::new(),
             model_scroll_grab: Rc::default(),
@@ -272,6 +276,7 @@ impl Workspace {
         if switched {
             self.transcript.reset(entries.len());
             self.parsed.clear();
+            self.shell_highlights.clear();
             self.transcript_thread = self.selected;
         } else {
             let same = |(a, b): &(&Entry, &Entry)| match (a, b) {
@@ -548,8 +553,10 @@ impl Workspace {
                 }
             }
             AgentEvent::Text(text) => thread.messages.push(Message::agent(text).at(now())),
-            AgentEvent::Tool { name, input } => {
-                thread.messages.push(Message::tool_call(name, input))
+            AgentEvent::Tool { name, input, command_bytes } => {
+                let mut message = Message::tool_call(name, input);
+                message.command_bytes = command_bytes;
+                thread.messages.push(message);
             }
             AgentEvent::Notice(text) => thread.messages.push(Message::notice(text)),
             AgentEvent::ApprovalRequested(request) => {
@@ -1281,7 +1288,14 @@ impl Workspace {
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
         let content = match (&m.tool, m.role) {
-            (Some(name), _) => self.tool_call(id, ix, name, &m.body, cx).into_any_element(),
+            (Some(name), _) => {
+                if shell::is_shell(name) && self.open_tools.contains(&(id, ix)) {
+                    self.shell_highlights.entry(ix).or_insert_with(|| {
+                        shell::highlights(name, &m.body, m.command_bytes)
+                    });
+                }
+                self.tool_call(id, ix, name, &m.body, cx).into_any_element()
+            }
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
                     .bg(theme.accent).text_color(theme.on_accent)
@@ -1311,7 +1325,7 @@ impl Workspace {
         let preview = input.lines().next().unwrap_or_default().trim();
         let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
         let header = div().flex().items_center().gap_2().min_w_0().px_3().py_1p5().text_xs()
-            .child(assets::icon(assets::Icon::Wrench, 13.))
+            .child(assets::icon(tool_icon(name), 13.))
             .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text).child(name.to_string()))
             .child(div().flex_1().min_w_0().truncate().font_family(MONO)
@@ -1348,9 +1362,14 @@ impl Workspace {
             .text_color(theme.muted)
             .child(header)
             .when(open, |d| {
-                d.child(div().px_3().py_2().border_t_1().border_color(theme.border)
+                let details = div().px_3().py_2().border_t_1().border_color(theme.border)
                     .font_family(MONO).text_xs().line_height(relative(1.6))
-                    .text_color(theme.text).child(input.to_string()))
+                    .text_color(theme.text);
+                let details = match self.shell_highlights.get(&ix).and_then(Option::as_deref) {
+                    Some(spans) => details.child(shell::render(input, spans, theme)),
+                    None => details.child(input.to_string()),
+                };
+                d.child(details)
             })
     }
 
@@ -1497,6 +1516,19 @@ impl Workspace {
             .child(self.approval_cards(id, cx))
             .child(self.composer(thread, window, cx))
             .into_any_element()
+    }
+}
+
+fn tool_icon(name: &str) -> assets::Icon {
+    use assets::Icon;
+
+    match name {
+        name if shell::is_shell(name) => Icon::Terminal,
+        "File change" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Icon::FilePen,
+        "Read" => Icon::FileText,
+        "Glob" | "Grep" => Icon::FileSearch,
+        "Web search" | "WebSearch" | "WebFetch" => Icon::Globe,
+        _ => Icon::Wrench,
     }
 }
 

@@ -339,7 +339,12 @@ fn notification(method: &str, params: &Value) -> Option<AgentEvent> {
             return Some(AgentEvent::Text(item["text"].as_str()?.to_string()));
         }
         ("item/started", Some("commandExecution")) => {
-            ("Shell", format!("$ {}", item["command"].as_str()?))
+            let command = item["command"].as_str()?;
+            return Some(AgentEvent::Tool {
+                name: "Shell".into(),
+                input: format!("$ {command}"),
+                command_bytes: Some(command.len()),
+            });
         }
         ("item/started", Some("fileChange")) => {
             ("File change", file_paths(&item["changes"]).join("\n"))
@@ -360,6 +365,7 @@ fn notification(method: &str, params: &Value) -> Option<AgentEvent> {
     Some(AgentEvent::Tool {
         name: name.to_string(),
         input,
+        command_bytes: None,
     })
 }
 
@@ -548,6 +554,7 @@ mod tests {
             Some(AgentEvent::Tool {
                 name: "Shell".into(),
                 input: "$ pwd".into(),
+                command_bytes: Some(3),
             })
         );
         assert_eq!(notification("item/completed", &shell), None);

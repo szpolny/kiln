@@ -16,6 +16,8 @@ image = { version = "0.25", default-features = false, features = ["gif", "ico", 
 lucide-icons = "=1.80.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 resvg = { version = "0.49", default-features = false }
+tree-sitter-bash = "0.25"
+tree-sitter-highlight = "0.26"
 unicode-segmentation = "1"
 kiln-core = { path = "../kiln-core" }
 kiln-agent = { path = "../kiln-agent" }

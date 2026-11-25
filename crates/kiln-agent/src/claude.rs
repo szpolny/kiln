@@ -42,9 +42,11 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                     }
                     Some("tool_use") => {
                         if let Some(n) = block["name"].as_str() {
+                            let input = &block["input"];
                             out.push(AgentEvent::Tool {
                                 name: n.to_string(),
-                                input: describe_input(&block["input"]),
+                                input: describe_input(input),
+                                command_bytes: input.get("command").and_then(Value::as_str).map(str::len),
                             });
                         }
                     }
@@ -264,7 +266,8 @@ mod tests {
                 AgentEvent::Text("hi".into()),
                 AgentEvent::Tool {
                     name: "Bash".into(),
-                    input: "$ ls -la\ndescription: List files".into()
+                    input: "$ ls -la\ndescription: List files".into(),
+                    command_bytes: Some(6),
                 }
             ]
         );

@@ -27,6 +27,9 @@ pub struct Message {
     /// Set when this is a tool call: the tool's name, with `body` its input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Length of the shell source after the displayed `$ ` prompt, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_bytes: Option<usize>,
     /// When it arrived, in Unix seconds; 0 when unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub at: u64,
@@ -42,7 +45,7 @@ fn is_zero(n: &u64) -> bool {
 
 impl Message {
     fn new(role: Role, body: impl Into<String>) -> Self {
-        Self { role, body: body.into(), tool: None, at: 0, worked_ms: 0 }
+        Self { role, body: body.into(), tool: None, command_bytes: None, at: 0, worked_ms: 0 }
     }
 
     pub fn user(body: impl Into<String>) -> Self {

@@ -3,6 +3,7 @@ mod markdown;
 mod project_icon;
 mod project_menu;
 mod settings;
+mod shell;
 mod sidebar;
 mod text_edit;
 mod text_input;
