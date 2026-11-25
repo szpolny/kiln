@@ -77,7 +77,7 @@ impl Policy {
 pub const WEB_TOOLS: [&str; 2] = ["WebFetch", "WebSearch"];
 
 /// Project files that decide what runs: version control hooks and agent setup.
-const CONTROL_FILES: [&str; 3] = [".git", ".claude", ".mcp.json"];
+const CONTROL_FILES: [&str; 5] = [".git", ".claude", ".codex", ".agents", ".mcp.json"];
 
 /// Where a file tool's target lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,7 @@ mod tests {
         assert_eq!(place(".gitignore", ".gitignore"), Place::Inside);
         assert_eq!(place(".git/hooks/pre-commit", "x"), Place::Control);
         assert_eq!(place("config/settings.json", ".claude/settings.json"), Place::Control);
+        assert_eq!(place(".codex/config.toml", "settings"), Place::Control);
         assert_eq!(place("sub/.MCP.json", "sub/.MCP.json"), Place::Control);
         assert_eq!(Place::of(None, Path::new("a")), Place::Outside);
     }

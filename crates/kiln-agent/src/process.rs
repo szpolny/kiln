@@ -2,7 +2,7 @@
 
 use crate::AgentEvent;
 use std::io::{self, BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -24,19 +24,24 @@ struct State {
 }
 
 impl Process {
+    fn new(child: Child, grace: Duration) -> Self {
+        let state = State { child, stop_requested: false };
+        Self { state: Arc::new(Mutex::new(state)), grace }
+    }
+
     /// Ask the process to exit, and kill it if it is still running after a grace
     /// period. Does nothing once it has exited.
     pub fn stop(&self) {
+        self.stop_with(|| Err(io::Error::other("no protocol interrupt")));
+    }
+
+    pub(crate) fn stop_with(&self, interrupt: impl FnOnce() -> io::Result<()>) {
         let mut state = self.lock();
         // Only a child that has not been reaped is sure to still own its id.
         if state.stop_requested || !matches!(state.child.try_wait(), Ok(None)) {
             return;
         }
         state.stop_requested = true;
-        // Terminating lets the agent stop the commands it started; killing it
-        // outright would leave them running.
-        // SAFETY: `kill` takes no pointers, and the id is this child's (above).
-        unsafe { libc::kill(state.child.id() as libc::pid_t, libc::SIGTERM) };
         drop(state);
         let process = self.clone();
         thread::spawn(move || {
@@ -44,6 +49,13 @@ impl Process {
             // Does nothing if the child has been reaped by now.
             let _ = process.lock().child.kill();
         });
+        if interrupt().is_err() {
+            let mut state = self.lock();
+            if matches!(state.child.try_wait(), Ok(None)) {
+                // SAFETY: the child still owns its PID, and kill takes no pointers.
+                unsafe { libc::kill(state.child.id() as libc::pid_t, libc::SIGTERM) };
+            }
+        }
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -61,6 +73,35 @@ impl Process {
         // The state stays valid even if a holder panicked.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Spawn a bidirectional provider. The driver closes its input and returns
+/// when the turn is over. Publish the terminal event after the child exits.
+pub(crate) fn spawn_protocol<F>(
+    mut cmd: Command,
+    driver: F,
+) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)>
+where
+    F: FnOnce(ChildStdin, ChildStdout, &async_channel::Sender<AgentEvent>) -> io::Result<()>
+        + Send + 'static,
+{
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let input = child.stdin.take().expect("piped stdin");
+    let output = child.stdout.take().expect("piped stdout");
+    let process = Process::new(child, STOP_GRACE);
+    let reader = process.clone();
+    let (tx, rx) = async_channel::unbounded();
+    thread::spawn(move || {
+        let result = driver(input, output, &tx);
+        reader.wait();
+        let event = if reader.stop_requested() {
+            AgentEvent::Stopped
+        } else {
+            AgentEvent::Done { error: result.err().map(|e| e.to_string()) }
+        };
+        let _ = tx.send_blocking(event);
+    });
+    Ok((process, rx))
 }
 
 /// Spawn `cmd` and turn each line it prints into events with `parse`.
@@ -82,8 +123,7 @@ fn spawn_with_grace(
     let name = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let out = child.stdout.take();
-    let state = State { child, stop_requested: false };
-    let process = Process { state: Arc::new(Mutex::new(state)), grace };
+    let process = Process::new(child, grace);
     let (tx, rx) = async_channel::unbounded();
     let reader = process.clone();
     thread::spawn(move || {

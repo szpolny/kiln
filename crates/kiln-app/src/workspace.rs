@@ -13,7 +13,7 @@ use gpui::{
     ListState, MouseButton, Entity, PathPromptOptions, Render, RenderImage, SharedString, Task,
     Window,
 };
-use kiln_agent::{claude, process::Process, project, AgentEvent};
+use kiln_agent::{claude, codex, process::Process, project, AgentEvent};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, WEB_TOOLS};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
@@ -38,6 +38,18 @@ const REFRESH: Duration = Duration::from_secs(30);
 struct RunningTurn {
     process: Process,
     started: Instant,
+    codex: Option<codex::Client>,
+    approvals: Vec<codex::ApprovalRequest>,
+}
+
+impl RunningTurn {
+    fn stop(&self) {
+        if let Some(client) = &self.codex {
+            client.stop(&self.process);
+        } else {
+            self.process.stop();
+        }
+    }
 }
 
 pub struct Workspace {
@@ -80,6 +92,14 @@ pub struct Workspace {
     pub(crate) menu: Option<Menu>,
     /// The open project menu reports that the picked file is no icon.
     pub(crate) icon_rejected: bool,
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        for turn in self.turns.values() {
+            turn.stop();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -279,7 +299,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let p = this.store.add_project(&dir);
                 if this.store.projects[p].threads.is_empty() {
-                    this.new_thread(p, cx);
+                    this.new_thread(p, Agent::default(), cx);
                 } else {
                     this.save();
                 }
@@ -289,8 +309,8 @@ impl Workspace {
         .detach();
     }
 
-    pub(crate) fn new_thread(&mut self, p: usize, cx: &mut Context<Self>) {
-        if let Some(id) = self.store.add_thread(p, Agent::default(), now()) {
+    pub(crate) fn new_thread(&mut self, p: usize, agent: Agent, cx: &mut Context<Self>) {
+        if let Some(id) = self.store.add_thread(p, agent, now()) {
             self.selected = Some(id);
             self.save();
             cx.notify();
@@ -349,7 +369,7 @@ impl Workspace {
     /// Stop the thread's turn. It stays running until the process has exited.
     fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(turn) = self.turns.get(&id) {
-            turn.process.stop();
+            turn.stop();
             cx.notify();
         }
     }
@@ -400,34 +420,40 @@ impl Workspace {
         thread.status = Status::Running;
         let mut granted = allowed_tools;
         let permission_mode = thread.permission_mode;
-        let disallowed_tools = if permission_mode == PermissionMode::Manual {
+        let agent = thread.agent;
+        let disallowed_tools = if agent == Agent::Claude && permission_mode == PermissionMode::Manual {
             let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
             granted.extend(web_allowed.iter().map(|t| t.to_string()));
             web_disallowed.iter().map(|t| t.to_string()).collect()
         } else {
             vec![]
         };
-        let started = claude::run(claude::Turn {
-            dir,
-            prompt,
-            resume: thread.session_id.clone(),
-            model: Some(thread.model().to_string()),
-            effort: Some(thread.effort().id().to_string()),
-            permission_mode,
-            allowed_tools: granted.clone(),
-            disallowed_tools,
-        });
+        let resume = thread.session_id.clone();
+        let model = thread.model();
+        let effort = thread.effort().id().to_string();
+        let started = match agent {
+            Agent::Claude => claude::run(claude::Turn {
+                dir, prompt, resume, model: Some(model.to_string()), effort: Some(effort),
+                permission_mode, allowed_tools: granted.clone(), disallowed_tools,
+            }).map(|(process, rx)| (process, None, rx)),
+            Agent::Codex => codex::run(codex::Turn {
+                dir, prompt, resume, model: Some(model.to_string()),
+                effort, permission_mode, policy: thread.policy.clone(),
+            }).map(|(process, client, rx)| (process, Some(client), rx)),
+        };
         cx.notify();
-        let (process, rx) = match started {
+        let (process, codex, rx) = match started {
             Ok(started) => started,
             Err(e) => {
-                let error = Some(format!("could not start claude: {e}"));
+                let error = Some(format!("Could not start {}: {e}", agent.name()));
                 self.apply(id, AgentEvent::Done { error }, permission_mode, &granted);
                 self.save();
                 return;
             }
         };
-        self.turns.insert(id, RunningTurn { process, started: Instant::now() });
+        self.turns.insert(id, RunningTurn {
+            process, codex, started: Instant::now(), approvals: Vec::new(),
+        });
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
@@ -476,8 +502,8 @@ impl Workspace {
             AgentEvent::PermissionMode(mode) => {
                 if mode != permission_mode {
                     thread.messages.push(Message::notice(format!(
-                        "Claude Code is using {} permissions instead of {}.",
-                        permission_label(mode), permission_label(permission_mode)
+                        "{} is using {} permissions instead of {}.",
+                        thread.agent.name(), permission_label(mode), permission_label(permission_mode)
                     )));
                 }
             }
@@ -485,9 +511,20 @@ impl Workspace {
             AgentEvent::Tool { name, input } => {
                 thread.messages.push(Message::tool_call(name, input))
             }
+            AgentEvent::Notice(text) => thread.messages.push(Message::notice(text)),
+            AgentEvent::ApprovalRequested(request) => {
+                if let Some(turn) = self.turns.get_mut(&id).filter(|turn| !turn.process.stop_requested()) {
+                    turn.approvals.push(request);
+                }
+            }
+            AgentEvent::ApprovalResolved(request) => {
+                if let Some(turn) = self.turns.get_mut(&id) {
+                    turn.approvals.retain(|approval| approval.id != request);
+                }
+            }
             AgentEvent::Denied { tool, summary, .. } if permission_mode != PermissionMode::Manual => {
                 thread.messages.push(Message::notice(format!(
-                    "Blocked by Claude Code: {tool}\n{summary}"
+                    "Blocked by {}: {tool}\n{summary}", thread.agent.name()
                 )));
             }
             // Already granted, so something outside Kiln refused it and a
@@ -577,15 +614,57 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn has_live_approval(&self, id: u64) -> bool {
+        self.turns.get(&id).is_some_and(|turn| {
+            !turn.approvals.is_empty() && !turn.process.stop_requested()
+        })
+    }
+
+    fn decide_codex(
+        &mut self,
+        id: u64,
+        started: Instant,
+        request_id: &codex::ApprovalId,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(turn) = self.turns.get_mut(&id) else { return };
+        if turn.started != started || turn.process.stop_requested() {
+            return;
+        }
+        let Some(client) = &turn.codex else { return };
+        let Some(index) = turn.approvals.iter().position(|request| &request.id == request_id) else { return };
+        let request = turn.approvals.remove(index);
+        let note = match client.respond(&request, allow) {
+            Ok(()) => {
+                let decision = if allow { "✓ Allowed" } else { "✗ Denied" };
+                format!("{decision}: {}\n{}", request.tool, request.summary)
+            }
+            Err(error) => format!("Could not answer Codex approval: {error}"),
+        };
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.touch(now());
+            thread.messages.push(Message::notice(note));
+        }
+        self.save();
+        cx.notify();
+    }
+
     fn approval_cards(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut col = div().id("approvals").flex().flex_col().flex_shrink_0()
             .gap_2().px_6().max_h(px(240.)).overflow_y_scroll();
-        let pending = self.store.thread(id)
+        let mut pending: Vec<_> = self.store.thread(id)
             .filter(|thread| thread.status != Status::Running)
-            .map(|thread| thread.pending.clone())
-            .unwrap_or_default();
-        for (i, a) in pending.into_iter().enumerate() {
+            .into_iter().flat_map(|thread| thread.pending.iter())
+            .map(|approval| (approval.tool.clone(), approval.summary.clone(), None))
+            .collect();
+        if let Some(turn) = self.turns.get(&id).filter(|_| self.has_live_approval(id)) {
+            pending.extend(turn.approvals.iter().map(|request| {
+                (request.tool.clone(), request.summary.clone(), Some((turn.started, request.id.clone())))
+            }));
+        }
+        for (i, (tool, summary, request)) in pending.into_iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
                 div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
                     .font_weight(FontWeight::MEDIUM).cursor_pointer()
@@ -594,6 +673,7 @@ impl Workspace {
                     .hover(|h| h.opacity(0.85))
                     .child(label)
             };
+            let deny_request = request.clone();
             col = col.child(centered(
                 div().flex().items_start().gap_2().w_full()
                     .p_3().mb_2().rounded(px(12.)).bg(theme.card)
@@ -602,24 +682,37 @@ impl Workspace {
                         div().flex().flex_col().flex_1().min_w_0().gap_1()
                             .child(div().text_xs().font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.warn)
-                                .child(format!("{} needs approval", a.tool)))
+                                .child(format!("{tool} needs approval")))
                             .child(div().font_family(MONO).text_xs().text_color(theme.text)
-                                .child(a.summary)),
+                                .child(summary)),
                     )
                     .child(button(format!("deny{i}"), "Deny", false)
-                        .on_click(cx.listener(move |this, _, _, cx| this.deny(id, i, cx))))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some((started, request)) = &deny_request {
+                                this.decide_codex(id, *started, request, false, cx);
+                            } else {
+                                this.deny(id, i, cx);
+                            }
+                        })))
                     .child(button(format!("allow{i}"), "Allow", true)
-                        .on_click(cx.listener(move |this, _, _, cx| this.approve(id, i, cx)))),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some((started, request)) = &request {
+                                this.decide_codex(id, *started, request, true, cx);
+                            } else {
+                                this.approve(id, i, cx);
+                            }
+                        }))),
             ).flex_shrink_0());
         }
         col
     }
 
-    fn set_model(&mut self, id: u64, model: &str, cx: &mut Context<Self>) {
-        if self.store.select_model(id, model) {
+    fn set_model(&mut self, id: u64, agent: Agent, model: &str, cx: &mut Context<Self>) {
+        if let Some(target) = self.store.choose_model(id, agent, model, now()) {
+            self.selected = Some(target);
             self.save();
-            cx.notify();
         }
+        cx.notify();
     }
 
     fn set_effort(&mut self, id: u64, effort: Effort, cx: &mut Context<Self>) {
@@ -632,24 +725,38 @@ impl Workspace {
     /// Compact picker in the composer footer; the choice applies from the next turn.
     fn model_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let button = self.footer_button("model-picker", Menu::Model, cx)
-            .child(agent_icon(thread.agent, 13.))
+            .child(agent_icon(thread.agent, 13., self.theme.text))
             .child(div().font_weight(FontWeight::MEDIUM)
                 .child(thread.agent.model_name(thread.model()).to_string()));
         if self.menu != Some(Menu::Model) {
             return self.footer_picker(button, None, window, cx);
         }
         let id = thread.id;
-        let mut menu = self.menu_panel("model-menu", capitalized(thread.agent.label()));
-        for model in thread.agent.models() {
-            let (model_id, active) = (model.id, thread.model() == model.id);
-            let key = SharedString::from(format!("model-{model_id}"));
+        let max_height = (window.viewport_size().height - px(90.)).clamp(px(80.), px(480.));
+        let mut menu = self.menu_panel("model-menu", "Model").w(px(244.))
+            .max_h(max_height).overflow_y_scroll();
+        for agent in Agent::ALL {
+            let same_agent = agent == thread.agent;
             menu = menu.child(
-                self.menu_item(key, Some(thread.agent), model.name, None, active)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menu = None;
-                        this.set_model(id, model_id, cx);
-                    })),
+                div().flex().items_center().justify_between().gap_2().px_2().pt_2().pb_1()
+                    .flex_shrink_0()
+                    .text_xs().text_color(self.theme.muted)
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(agent.name()))
+                    .when(!same_agent && !thread.can_change_agent(), |d| d.child("New thread")),
             );
+            for model in agent.models() {
+                let (model_id, active) = (model.id, same_agent && thread.model() == model.id);
+                let key = SharedString::from(format!("model-{}-{model_id}", agent.label()));
+                menu = menu.child(
+                    self.menu_item(key, Some(agent), model.name, None, active)
+                        .flex_shrink_0()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.menu = None;
+                            this.set_model(id, agent, model_id, cx);
+                            window.focus(&this.input.focus_handle(cx), cx);
+                        })),
+                );
+            }
         }
         self.footer_picker(button, Some(menu), window, cx)
     }
@@ -664,7 +771,7 @@ impl Workspace {
         }
         let id = thread.id;
         let mut menu = self.menu_panel("effort-menu", "Reasoning");
-        for &effort in thread.agent.efforts() {
+        for &effort in thread.agent.efforts(thread.model()) {
             let key = SharedString::from(format!("effort-{}", effort.id()));
             menu = menu.child(
                 self.menu_item(key, None, effort.name(), None, thread.effort() == effort)
@@ -741,7 +848,7 @@ impl Workspace {
         let theme = self.theme;
         div().id(id).flex().flex_col().w(px(220.)).p_1().rounded(px(10.)).bg(theme.card)
             .border_1().border_color(theme.border).shadow_lg().occlude()
-            .child(div().px_2().pt_1().pb_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
+            .child(div().flex_shrink_0().px_2().pt_1().pb_1p5().text_xs().font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.muted).child(title.into()))
     }
 
@@ -756,7 +863,7 @@ impl Workspace {
         let theme = self.theme;
         div().id(id.into()).flex().items_center().gap_2().h(px(28.)).px_2().rounded_md().text_sm()
             .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
-            .when_some(icon, |d, agent| d.child(agent_icon(agent, 14.)))
+            .when_some(icon, |d, agent| d.child(agent_icon(agent, 14., theme.text)))
             .child(div().flex_1().child(label.into()))
             .when_some(hint, |d, hint| {
                 d.child(div().text_xs().text_color(theme.muted).child(hint))
@@ -840,18 +947,24 @@ impl Workspace {
             );
         }
         if mode == PermissionMode::Manual {
+            let codex = thread.agent == Agent::Codex;
             menu = menu.child(
                 div().mt_1().border_t_1().border_color(theme.border)
                     .px_2().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted).child("Web search and fetch"),
+                    .text_color(theme.muted).child(if codex { "Web search" } else { "Web search and fetch" }),
             );
             for (key, access, label) in [
                 ("web-ask", Decision::Ask, "Ask first"),
                 ("web-allow", Decision::Allow, "Allow"),
                 ("web-block", Decision::Deny, "Block"),
             ] {
+                if codex && access == Decision::Ask {
+                    continue;
+                }
+                let selected = thread.policy.network == access
+                    || (codex && access == Decision::Deny && thread.policy.network == Decision::Ask);
                 menu = menu.child(
-                    self.menu_item(key, None, label, None, thread.policy.network == access)
+                    self.menu_item(key, None, label, None, selected)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.menu = None;
                             this.set_web_access(id, access);
@@ -1014,6 +1127,7 @@ impl Workspace {
         let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
         let note = match (running, stopping) {
             (_, true) => Some("Stopping…".to_string()),
+            (true, false) if self.has_live_approval(thread.id) => Some("Waiting for approval".to_string()),
             (true, false) => Some("Working… Esc to stop".to_string()),
             (false, false) => thread.reported_model.clone(),
         };
@@ -1103,17 +1217,13 @@ fn centered(child: impl IntoElement) -> gpui::Div {
         .child(div().flex_1().min_w_0().max_w(px(COLUMN)).child(child))
 }
 
-/// The provider's mark, in its brand color.
-pub(crate) fn agent_icon(agent: Agent, size: f32) -> impl IntoElement {
+/// The provider's mark at the size of the surrounding text.
+pub(crate) fn agent_icon(agent: Agent, size: f32, foreground: gpui::Rgba) -> impl IntoElement {
     let (path, color) = match agent {
         Agent::Claude => (assets::CLAUDE, rgb(0xd97757)),
+        Agent::Codex => (assets::OPENAI, foreground),
     };
     svg().path(path).flex_shrink_0().size(px(size)).text_color(color)
-}
-
-fn capitalized(word: &str) -> String {
-    let mut chars = word.chars();
-    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 impl Focusable for Workspace {

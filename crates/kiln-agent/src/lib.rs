@@ -1,6 +1,7 @@
 //! Adapters that run coding agents as local child processes.
 
 pub mod claude;
+pub mod codex;
 pub mod process;
 pub mod project;
 
@@ -15,6 +16,11 @@ pub enum AgentEvent {
     Text(String),
     /// A tool call: the provider's tool name and what it was called with.
     Tool { name: String, input: String },
+    /// A live request that the provider is waiting for Kiln to answer.
+    ApprovalRequested(codex::ApprovalRequest),
+    /// The provider cleared a live request, for example on interruption.
+    ApprovalResolved(codex::ApprovalId),
+    Notice(String),
     /// The provider refused an action pending human approval.
     Denied {
         tool: String,

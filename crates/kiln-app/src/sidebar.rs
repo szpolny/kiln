@@ -6,7 +6,7 @@ use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
     Focusable, FontWeight, IntoElement, SharedString, Stateful, Window,
 };
-use kiln_core::{Project, Status, Thread};
+use kiln_core::{Agent, Project, Status, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
@@ -95,14 +95,9 @@ impl Workspace {
         for (p, project) in self.store.projects.iter().enumerate() {
             let busy = project.threads.iter().any(|t| t.status == Status::Running);
             menu = menu.child(
-                div().id(("new-thread-in", p)).group(ROW).flex().flex_shrink_0().items_center()
+                div().id(("project-for-new-thread", p)).group(ROW).flex().flex_shrink_0().items_center()
                     .gap_2().h(px(28.)).pl_2().pr_1().rounded_md().text_sm()
-                    .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.menu = None;
-                        this.new_thread(p, cx);
-                        window.focus(&this.input.focus_handle(cx), cx);
-                    }))
+                    .text_color(theme.text)
                     .child(self.project_mark(project))
                     .child(div().flex_1().min_w_0().truncate().child(project.name.clone()))
                     .when(!busy, |d| {
@@ -117,6 +112,18 @@ impl Workspace {
                         )
                     }),
             );
+            for agent in Agent::ALL {
+                let key = SharedString::from(format!("new-thread-{p}-{}", agent.label()));
+                menu = menu.child(
+                    self.menu_item(key, Some(agent), agent.name(), None, false)
+                        .ml_4().flex_shrink_0()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.menu = None;
+                            this.new_thread(p, agent, cx);
+                            window.focus(&this.input.focus_handle(cx), cx);
+                        })),
+                );
+            }
         }
         // Anchored at the button's bottom-right corner, so the menu opens below it.
         picker
@@ -165,6 +172,7 @@ impl Workspace {
                 .child(self.row_end(thread, age, theme.muted, cx))
         } else {
             let (state, color) = match thread.status {
+                Status::Running if self.has_live_approval(id) => (Some("Approval"), theme.warn),
                 Status::Running => (Some("Working"), theme.accent),
                 _ if !thread.pending.is_empty() => (Some("Approval"), theme.warn),
                 Status::NeedsInput => (Some("Failed"), theme.warn),
@@ -190,7 +198,7 @@ impl Workspace {
                                 d.child(assets::icon(Icon::GitBranch, 11.))
                                     .child(div().min_w_0().truncate().child(branch))
                             }))
-                        .child(agent_icon(thread.agent, 13.)),
+                        .child(agent_icon(thread.agent, 13., theme.text)),
                 )
         };
         div().px_2p5().pb_0p5().child(row).into_any_element()

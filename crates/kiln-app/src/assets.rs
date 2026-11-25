@@ -23,6 +23,7 @@ pub fn icon(icon: Icon, size: f32) -> Div {
 }
 
 pub const CLAUDE: &str = "icons/claude.svg";
+pub const OPENAI: &str = "icons/openai.svg";
 
 // GPUI rasterizes an SVG image at twice the size the file declares and shrinks it
 // with plain bilinear filtering, so each brand file declares the size it is drawn
@@ -47,6 +48,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
             CLAUDE => Some(Cow::Borrowed(include_bytes!("../assets/icons/claude.svg"))),
+            OPENAI => Some(Cow::Borrowed(include_bytes!("../assets/icons/openai.svg"))),
             LOGO_DARK => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-mark-dark.svg"))),
             LOGO_LIGHT => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-mark-light.svg"))),
             LOCKUP_DARK => Some(Cow::Borrowed(include_bytes!("../assets/brand/kiln-lockup-dark.svg"))),
@@ -58,6 +60,7 @@ impl AssetSource for Assets {
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(vec![
             CLAUDE.into(),
+            OPENAI.into(),
             LOGO_DARK.into(),
             LOGO_LIGHT.into(),
             LOCKUP_DARK.into(),

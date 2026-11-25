@@ -81,23 +81,48 @@ pub struct Approval {
 pub enum Agent {
     #[default]
     Claude,
+    Codex,
 }
 
+const CODEX_DEFAULT_MODEL: &str = "gpt-6.2-sol";
+
+// Visible models reported by Codex CLI 0.171.0's model/list.
+const CODEX_MODELS: &[Model] = &[
+    Model { id: CODEX_DEFAULT_MODEL, name: "GPT-6.2-Sol", alias: "default" },
+    Model::named("gpt-6.2-astra", "GPT-6.2-Astra"),
+    Model::named("gpt-6.1-terra", "GPT-6.1 Terra"),
+    Model::named("gpt-6.1-sol", "GPT-6.1-Sol"),
+    Model::named("gpt-6-astra", "GPT-6-Astra"),
+    Model::named("gpt-6-sol", "GPT-6-Sol"),
+    Model::named("gpt-6-luna", "GPT-6-Luna"),
+    Model::named("gpt-5.6-sol", "GPT-5.6-Sol"),
+    Model::named("gpt-5.6-terra", "GPT-5.6-Terra"),
+    Model::named("gpt-5.6-luna", "GPT-5.6-Luna"),
+    Model::named("gpt-5.5", "GPT-5.5"),
+];
+
 impl Agent {
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
     pub fn label(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Codex => "Codex",
         }
     }
 
     pub fn permission_modes(self) -> &'static [PermissionMode] {
-        match self {
-            Agent::Claude => &[PermissionMode::Manual, PermissionMode::Auto, PermissionMode::FullAccess],
-        }
+        &[PermissionMode::Manual, PermissionMode::Auto, PermissionMode::FullAccess]
     }
 
-    /// Exact models this agent offers. Pinned rather than looked up, so the
-    /// list never needs the network; a new release means updating it.
+    /// Model choices shown in the composer. The list is available offline.
     pub fn models(self) -> &'static [Model] {
         match self {
             Agent::Claude => &[
@@ -106,6 +131,7 @@ impl Agent {
                 Model { id: "claude-sonnet-5-5", name: "Sonnet 5.5", alias: "sonnet" },
                 Model { id: "claude-haiku-5-5", name: "Haiku 5.5", alias: "haiku" },
             ],
+            Agent::Codex => CODEX_MODELS,
         }
     }
 
@@ -113,23 +139,21 @@ impl Agent {
     pub fn default_model(self) -> &'static str {
         match self {
             Agent::Claude => "claude-opus-5-5",
+            Agent::Codex => CODEX_DEFAULT_MODEL,
         }
     }
 
-    /// Reasoning levels this agent accepts, lowest first.
-    pub fn efforts(self) -> &'static [Effort] {
-        match self {
-            Agent::Claude => {
-                &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max]
-            }
+    /// Reasoning levels offered for this model, lowest first.
+    pub fn efforts(self, model: &str) -> &'static [Effort] {
+        match (self, model) {
+            (Agent::Codex, "gpt-5.5") => &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh],
+            _ => &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max],
         }
     }
 
     /// Reasoning level used until the user picks one.
     pub fn default_effort(self) -> Effort {
-        match self {
-            Agent::Claude => Effort::Medium,
-        }
+        Effort::Medium
     }
 
     /// Display name for a model id, or the id itself when it is not listed.
@@ -140,11 +164,17 @@ impl Agent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Model {
-    /// Exact id passed to the agent.
+    /// Exact id passed to the provider.
     pub id: &'static str,
     pub name: &'static str,
     /// Moving alias earlier versions stored; mapped to `id` on load.
     pub alias: &'static str,
+}
+
+impl Model {
+    const fn named(id: &'static str, name: &'static str) -> Self {
+        Self { id, name, alias: id }
+    }
 }
 
 /// How much the model reasons before it answers.
@@ -248,7 +278,13 @@ impl Thread {
 
     /// Reasoning level the next turn runs with.
     pub fn effort(&self) -> Effort {
-        self.effort.unwrap_or(self.agent.default_effort())
+        self.effort.filter(|effort| self.agent.efforts(self.model()).contains(effort))
+            .unwrap_or(self.agent.default_effort())
+    }
+
+    pub fn can_change_agent(&self) -> bool {
+        self.status == Status::Idle && self.messages.is_empty()
+            && self.session_id.is_none() && self.pending.is_empty()
     }
 
     /// Record activity at `now`, which makes a settled thread active again.
@@ -336,6 +372,9 @@ impl Store {
                 t.model = Some(m.id.to_string());
             }
         }
+        if self.last_model.as_deref() == Some("default") {
+            self.last_model = Some(CODEX_DEFAULT_MODEL.to_string());
+        }
         self.next_id = max;
     }
 
@@ -366,7 +405,7 @@ impl Store {
             .as_ref()
             .filter(|id| agent.models().iter().any(|model| model.id == id.as_str()))
             .cloned();
-        thread.effort = self.last_effort.filter(|effort| agent.efforts().contains(effort));
+        thread.effort = self.last_effort;
         if agent.permission_modes().contains(&self.settings.permission_mode) {
             thread.permission_mode = self.settings.permission_mode;
         }
@@ -421,9 +460,32 @@ impl Store {
         true
     }
 
+    /// Select a provider and model from the composer. A thread with history
+    /// keeps its provider and session, so a cross-provider choice starts a thread.
+    pub fn choose_model(&mut self, id: u64, agent: Agent, model: &str, now: u64) -> Option<u64> {
+        if !agent.models().iter().any(|choice| choice.id == model) {
+            return None;
+        }
+        let (p, t) = self.locate(id)?;
+        let source = &mut self.projects[p].threads[t];
+        let target = if source.agent == agent {
+            id
+        } else if source.can_change_agent() {
+            source.agent = agent;
+            source.reported_model = None;
+            id
+        } else {
+            self.add_thread(p, agent, now)?
+        };
+        self.select_model(target, model).then_some(target)
+    }
+
     /// Apply an explicit composer choice to this thread and remember it for new ones.
     pub fn select_effort(&mut self, id: u64, effort: Effort) -> bool {
         let Some(thread) = self.thread_mut(id) else { return false };
+        if !thread.agent.efforts(thread.model()).contains(&effort) {
+            return false;
+        }
         thread.effort = Some(effort);
         self.last_effort = Some(effort);
         true
@@ -518,7 +580,7 @@ mod tests {
 
     #[test]
     fn effort_is_stored_as_the_value_the_agent_takes() {
-        for &effort in Agent::Claude.efforts() {
+        for &effort in Agent::Claude.efforts(Agent::Claude.default_model()) {
             let stored = serde_json::to_value(effort).unwrap();
             assert_eq!(stored, effort.id());
         }
@@ -540,6 +602,30 @@ mod tests {
         s.normalize();
         assert_eq!(s.projects[0].threads[0].model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(s.projects[0].threads[1].model.as_deref(), Some("claude-custom-1"));
+    }
+
+    #[test]
+    fn old_codex_default_resolves_to_a_named_model() {
+        let mut store = Store::sample();
+        let id = store.add_thread(0, Agent::Codex, 0).unwrap();
+        assert_eq!(store.thread(id).unwrap().model(), "gpt-6.2-sol");
+        assert!(store.select_model(id, "default"));
+        store.normalize();
+        assert_eq!(store.thread(id).unwrap().model(), "gpt-6.2-sol");
+        assert_eq!(store.last_model.as_deref(), Some("gpt-6.2-sol"));
+        assert!(Agent::Codex.models().iter().all(|model| model.id != "default"));
+    }
+
+    #[test]
+    fn codex_uses_supported_effort_after_changing_models() {
+        let mut store = Store::sample();
+        let id = store.add_thread(0, Agent::Codex, 0).unwrap();
+        assert!(store.select_effort(id, Effort::Max));
+        assert_eq!(store.choose_model(id, Agent::Codex, "gpt-5.5", 1), Some(id));
+        assert_eq!(store.thread(id).unwrap().effort(), Effort::Medium);
+        assert!(!store.select_effort(id, Effort::Max));
+        assert_eq!(store.choose_model(id, Agent::Codex, "gpt-6-luna", 2), Some(id));
+        assert_eq!(store.thread(id).unwrap().effort(), Effort::Max);
     }
 
     #[test]
@@ -582,6 +668,39 @@ mod tests {
         s.last_model = Some("claude-retired-1".into());
         let id = s.add_thread(0, Agent::Claude, 0).unwrap();
         assert_eq!(s.thread(id).unwrap().model(), Agent::Claude.default_model());
+    }
+
+    #[test]
+    fn choosing_a_codex_model_changes_the_provider_of_an_empty_thread() {
+        let mut store = Store::sample();
+        let id = store.projects[0].threads[0].id;
+        assert_eq!(store.choose_model(id, Agent::Codex, "gpt-6.2-sol", 1), Some(id));
+        let thread = store.thread(id).unwrap();
+        assert_eq!(thread.agent, Agent::Codex);
+        assert_eq!(thread.model(), "gpt-6.2-sol");
+        assert_eq!(store.projects[0].threads.len(), 2);
+        assert!(store.choose_model(id, Agent::Claude, "gpt-6.2-sol", 2).is_none());
+        assert_eq!(store.thread(id).unwrap().agent, Agent::Codex);
+    }
+
+    #[test]
+    fn choosing_a_different_provider_preserves_an_existing_conversation() {
+        let mut store = Store::sample();
+        let id = store.projects[0].threads[0].id;
+        let thread = store.thread_mut(id).unwrap();
+        thread.messages.push(Message::user("Existing prompt"));
+        thread.session_id = Some("existing-session".into());
+        let target = store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 1).unwrap();
+        assert_ne!(target, id);
+        assert_eq!(store.locate(target).unwrap().0, 0);
+        let original = store.thread(id).unwrap();
+        assert_eq!(original.agent, Agent::Claude);
+        assert_eq!(original.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(original.messages[0].body, "Existing prompt");
+        let new_thread = store.thread(target).unwrap();
+        assert_eq!(new_thread.agent, Agent::Codex);
+        assert_eq!(new_thread.model(), "gpt-6.2-astra");
+        assert!(new_thread.messages.is_empty() && new_thread.session_id.is_none());
     }
 
     #[test]
