@@ -1,6 +1,7 @@
 use crate::assets;
 use crate::markdown;
 use crate::project_icon;
+use crate::settings::{OpenSettings, SettingsModal};
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
@@ -48,8 +49,9 @@ pub struct Workspace {
     turns: HashMap<u64, RunningTurn>,
     pub(crate) input: Entity<TextInput>,
     focus: FocusHandle,
-    /// Palette for the current system appearance, refreshed every render.
+    /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
+    pub(crate) settings_modal: Option<SettingsModal>,
     /// The sidebar's entries, in the order shown.
     pub(crate) rows: Vec<Row>,
     /// Virtualized sidebar list over `rows`.
@@ -121,6 +123,7 @@ impl Workspace {
         };
         let selected = store.first_thread_id();
         let font = ui_font(&cx.text_system().all_font_names());
+        let theme = Theme::new(window.appearance(), store.settings.appearance, font);
         let input = cx.new(|cx| TextInput::new("Ask the agent to do something", window, cx));
         cx.subscribe(&input, |this, _, ev, cx| match ev {
             InputEvent::Submit => this.submit(cx),
@@ -134,7 +137,8 @@ impl Workspace {
             turns: HashMap::new(),
             input,
             focus: cx.focus_handle(),
-            theme: Theme::new(window.appearance(), font),
+            theme,
+            settings_modal: None,
             rows: Vec::new(),
             thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
             branches: HashMap::new(),
@@ -573,16 +577,14 @@ impl Workspace {
     }
 
     fn set_model(&mut self, id: u64, model: &str, cx: &mut Context<Self>) {
-        if let Some(thread) = self.store.thread_mut(id) {
-            thread.model = Some(model.to_string());
+        if self.store.select_model(id, model) {
             self.save();
             cx.notify();
         }
     }
 
     fn set_effort(&mut self, id: u64, effort: Effort, cx: &mut Context<Self>) {
-        if let Some(thread) = self.store.thread_mut(id) {
-            thread.effort = Some(effort);
+        if self.store.select_effort(id, effort) {
             self.save();
             cx.notify();
         }
@@ -1030,7 +1032,7 @@ impl Render for Workspace {
         if window.focused(cx).is_none() {
             window.focus(&self.input.focus_handle(cx), cx);
         }
-        self.theme = Theme::new(window.appearance(), self.theme.font);
+        self.theme = Theme::new(window.appearance(), self.store.settings.appearance, self.theme.font);
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
         self.input.update(cx, |input, _| {
@@ -1043,14 +1045,18 @@ impl Render for Workspace {
         });
         self.sync_transcript();
         // No root background: the macOS sidebar lets the blur through.
-        div().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
+        div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
+            }))
             .child(self.sidebar(window, cx))
             .child(match self.selected {
                 Some(id) => self.thread(id, window, cx),
                 None => self.empty_state(cx).into_any_element(),
             })
+            .children(self.render_settings(cx))
     }
 }
 

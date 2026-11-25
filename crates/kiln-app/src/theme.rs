@@ -1,5 +1,6 @@
-//! Light and dark palettes in a macOS style, following the system appearance.
+//! Light and dark palettes in a macOS style.
 use gpui::{rgb, rgba, Rgba, WindowAppearance};
+use kiln_core::Appearance;
 
 pub const MONO: &str = if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" };
 
@@ -44,8 +45,13 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn new(appearance: WindowAppearance, font: &'static str) -> Self {
+    pub fn new(system: WindowAppearance, preference: Appearance, font: &'static str) -> Self {
         let sidebar_alpha = if cfg!(target_os = "macos") { 0xd8 } else { 0xff };
+        let appearance = match preference {
+            Appearance::System => system,
+            Appearance::Light => WindowAppearance::Light,
+            Appearance::Dark => WindowAppearance::Dark,
+        };
         match appearance {
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self {
                 font,

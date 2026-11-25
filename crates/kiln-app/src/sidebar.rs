@@ -62,16 +62,20 @@ impl Workspace {
         })
         .flex_1()
         .min_h_0();
-        let add = div().id("add-project").flex().flex_shrink_0().items_center().gap_2()
-            .mx_2p5().mb_2p5().px_2().h(px(30.)).rounded_md().text_sm().text_color(theme.muted)
-            .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
+        let footer_button = |id| div().id(id).flex().flex_shrink_0().items_center().gap_2()
+            .px_2().h(px(30.)).rounded_md().text_sm().text_color(theme.muted)
+            .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text));
+        let add = footer_button("add-project")
             .child(assets::icon(Icon::Plus, 14.)).child("Add Project")
             .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)));
+        let settings = footer_button("open-settings")
+            .child(assets::icon(Icon::Settings, 14.)).child("Settings")
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
         div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
             .bg(theme.sidebar).border_r_1().border_color(theme.border)
             .child(brand)
             .child(threads)
-            .child(add)
+            .child(div().flex().flex_col().gap_0p5().mx_2p5().mb_2p5().child(add).child(settings))
     }
 
     /// The button that starts a thread. Its menu lists the projects, where one

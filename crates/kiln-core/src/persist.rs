@@ -64,7 +64,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Approval;
+    use crate::{policy::Decision, Agent, Appearance, Approval, Effort, Settings};
 
     fn temp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kiln-test-{}-{name}", std::process::id()));
@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_sessions_approvals_and_policy() {
+    fn round_trips_sessions_approvals_policy_and_settings() {
         let path = temp("roundtrip");
         let mut store = Store::sample();
         let id = store.projects[0].threads[0].id;
@@ -89,9 +89,16 @@ mod tests {
         t.updated_at = 42;
         t.settled = true;
         store.projects[0].icon = Some("/pictures/mark.png".into());
+        store.settings = Settings {
+            appearance: Appearance::Dark,
+            web: Decision::Deny,
+        };
+        let second = store.projects[0].threads[1].id;
+        assert!(store.select_model(second, "claude-haiku-5-5"));
+        assert!(store.select_effort(second, Effort::High));
         save(&path, &store).unwrap();
 
-        let Loaded::Ok(back) = load(&path).unwrap() else { panic!("expected state") };
+        let Loaded::Ok(mut back) = load(&path).unwrap() else { panic!("expected state") };
         let t = back.thread(id).unwrap();
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.model.as_deref(), Some("claude-sonnet-5-5"));
@@ -99,6 +106,10 @@ mod tests {
         assert_eq!(t.policy.network, crate::policy::Decision::Allow);
         assert_eq!((t.updated_at, t.settled), (42, true));
         assert_eq!(back.projects[0].icon.as_deref(), Some(Path::new("/pictures/mark.png")));
+        assert_eq!(back.settings, store.settings);
+        let new_id = back.add_thread(0, Agent::Claude, 0).unwrap();
+        let new_thread = back.thread(new_id).unwrap();
+        assert_eq!((new_thread.model(), new_thread.effort()), ("claude-haiku-5-5", Effort::High));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::policy::Policy;
+use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -296,6 +297,13 @@ pub struct Store {
     pub projects: Vec<Project>,
     #[serde(default)]
     next_id: u64,
+    #[serde(default)]
+    pub settings: Settings,
+    /// The last choices made in the composer, independent of thread history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_effort: Option<Effort>,
 }
 
 impl Store {
@@ -336,11 +344,22 @@ impl Store {
         self.projects.len() - 1
     }
 
-    /// Add a thread to project `p`, created at `now`; returns its id.
+    /// Add a thread to project `p`, created at `now`; returns its id. It starts
+    /// with the last model and reasoning choices the agent supports, and the
+    /// configured web access.
     pub fn add_thread(&mut self, p: usize, agent: Agent, now: u64) -> Option<u64> {
+        let project = self.projects.get_mut(p)?;
         self.next_id += 1;
         let id = self.next_id;
-        self.projects.get_mut(p)?.threads.push(Thread::new(id, agent, now));
+        let mut thread = Thread::new(id, agent, now);
+        thread.model = self
+            .last_model
+            .as_ref()
+            .filter(|id| agent.models().iter().any(|model| model.id == id.as_str()))
+            .cloned();
+        thread.effort = self.last_effort.filter(|effort| agent.efforts().contains(effort));
+        thread.policy.network = self.settings.web;
+        project.threads.push(thread);
         Some(id)
     }
 
@@ -380,6 +399,22 @@ impl Store {
     pub fn thread_mut(&mut self, id: u64) -> Option<&mut Thread> {
         let (p, t) = self.locate(id)?;
         Some(&mut self.projects[p].threads[t])
+    }
+
+    /// Apply an explicit composer choice to this thread and remember it for new ones.
+    pub fn select_model(&mut self, id: u64, model: &str) -> bool {
+        let Some(thread) = self.thread_mut(id) else { return false };
+        thread.model = Some(model.to_owned());
+        self.last_model = Some(model.to_owned());
+        true
+    }
+
+    /// Apply an explicit composer choice to this thread and remember it for new ones.
+    pub fn select_effort(&mut self, id: u64, effort: Effort) -> bool {
+        let Some(thread) = self.thread_mut(id) else { return false };
+        thread.effort = Some(effort);
+        self.last_effort = Some(effort);
+        true
     }
 
     pub fn project_dir_of(&self, id: u64) -> Option<PathBuf> {
@@ -503,6 +538,49 @@ mod tests {
         assert_ne!(ids[0], ids[1]);
         let asks = |t: &Thread| t.policy.network == crate::policy::Decision::Ask;
         assert!(s.projects[0].threads.iter().all(asks));
+    }
+
+    #[test]
+    fn new_threads_start_with_the_last_composer_choices() {
+        let mut s = Store::sample();
+        let first = s.projects[0].threads[0].id;
+        let second = s.projects[0].threads[1].id;
+        assert!(s.select_model(first, "claude-sonnet-5-5"));
+        assert!(s.select_model(second, "claude-haiku-5-5"));
+        assert!(s.select_effort(first, Effort::High));
+        s.settings.web = crate::policy::Decision::Deny;
+        let id = s.add_thread(0, Agent::Claude, 0).unwrap();
+        let t = s.thread(id).unwrap();
+        assert_eq!((t.model(), t.effort()), ("claude-haiku-5-5", Effort::High));
+        assert_eq!(t.policy.network, crate::policy::Decision::Deny);
+        assert_eq!(s.thread(first).unwrap().model(), "claude-sonnet-5-5");
+        assert_eq!(s.thread(second).unwrap().effort(), Agent::Claude.default_effort());
+
+        assert!(s.select_model(second, Agent::Claude.default_model()));
+        assert!(s.select_effort(second, Agent::Claude.default_effort()));
+        let id = s.add_thread(0, Agent::Claude, 0).unwrap();
+        let t = s.thread(id).unwrap();
+        assert_eq!(t.model(), Agent::Claude.default_model());
+        assert_eq!(t.effort(), Agent::Claude.default_effort());
+    }
+
+    #[test]
+    fn new_threads_fall_back_when_the_last_model_is_unavailable() {
+        let mut s = Store::sample();
+        s.last_model = Some("claude-retired-1".into());
+        let id = s.add_thread(0, Agent::Claude, 0).unwrap();
+        assert_eq!(s.thread(id).unwrap().model(), Agent::Claude.default_model());
+    }
+
+    #[test]
+    fn stores_saved_without_settings_still_load() {
+        let mut value = serde_json::to_value(Store::sample()).unwrap();
+        value.as_object_mut().unwrap().remove("settings");
+        let mut store: Store = serde_json::from_value(value).unwrap();
+        assert_eq!(store.settings, Settings::default());
+        let id = store.add_thread(0, Agent::Claude, 0).unwrap();
+        let thread = store.thread(id).unwrap();
+        assert_eq!((thread.model.as_deref(), thread.effort), (None, None));
     }
 
     #[test]

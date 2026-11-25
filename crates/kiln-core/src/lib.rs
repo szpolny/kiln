@@ -3,8 +3,10 @@
 
 pub mod persist;
 pub mod policy;
+pub mod settings;
 pub mod store;
 
+pub use settings::{Appearance, Settings};
 pub use store::{
     Agent, Approval, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
