@@ -28,7 +28,10 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                     }
                     Some("tool_use") => {
                         if let Some(n) = block["name"].as_str() {
-                            out.push(AgentEvent::Tool(n.to_string()));
+                            out.push(AgentEvent::Tool {
+                                name: n.to_string(),
+                                input: describe_input(&block["input"]),
+                            });
                         }
                     }
                     _ => {}
@@ -38,8 +41,12 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         Some("result") => {
             for d in v["permission_denials"].as_array().into_iter().flatten() {
                 if let Some(tool) = d["tool_name"].as_str() {
-                    let (summary, rule) = describe_denial(tool, &d["tool_input"]);
-                    out.push(AgentEvent::Denied { tool: tool.to_string(), summary, rule });
+                    let input = &d["tool_input"];
+                    out.push(AgentEvent::Denied {
+                        tool: tool.to_string(),
+                        summary: describe_input(input),
+                        rule: allow_rule(tool, input),
+                    });
                 }
             }
             let error = (v["is_error"] == true)
@@ -51,17 +58,48 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     out
 }
 
-/// Human-readable summary plus the narrowest allow rule for a denied call.
-fn describe_denial(tool: &str, input: &Value) -> (String, String) {
-    if let Some(cmd) = input["command"].as_str() {
-        return (cmd.to_string(), format!("{tool}({cmd})"));
+/// Longest argument value shown, in characters. Commands are never cut.
+const MAX_ARG_CHARS: usize = 2000;
+
+/// A tool call's arguments as text: the shell command first and in full, then
+/// one `name: value` line per remaining argument.
+fn describe_input(input: &Value) -> String {
+    let Some(args) = input.as_object() else {
+        return String::new();
+    };
+    let command = args.get("command").and_then(Value::as_str);
+    let mut lines: Vec<String> = command.map(|c| format!("$ {c}")).into_iter().collect();
+    // The argument that says what is being touched goes first.
+    let main = ["file_path", "path", "pattern", "url", "query"];
+    let rank = |key: &str| main.iter().position(|m| *m == key).unwrap_or(main.len());
+    let mut rest: Vec<_> = args
+        .iter()
+        .filter(|(key, _)| command.is_none() || *key != "command")
+        .collect();
+    rest.sort_by_key(|(key, _)| rank(key));
+    for (key, value) in rest {
+        let value = match value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let cut = value.char_indices().nth(MAX_ARG_CHARS);
+        lines.push(match cut {
+            Some((at, _)) => {
+                let more = value[at..].chars().count();
+                format!("{key}: {}… ({more} more characters)", &value[..at])
+            }
+            None => format!("{key}: {value}"),
+        });
     }
-    if let Some(path) = input["file_path"].as_str() {
-        return (format!("{tool} {path}"), format!("{tool}({path})"));
+    lines.join("\n")
+}
+
+/// The narrowest allow rule for a denied call.
+fn allow_rule(tool: &str, input: &Value) -> String {
+    match input["command"].as_str().or_else(|| input["file_path"].as_str()) {
+        Some(target) => format!("{tool}({target})"),
+        None => tool.to_string(),
     }
-    let mut detail = input.to_string();
-    detail.truncate(120);
-    (format!("{tool} {detail}"), tool.to_string())
 }
 
 pub struct Turn {
@@ -134,8 +172,14 @@ mod tests {
             vec![AgentEvent::Session("abc".into())]
         );
         assert_eq!(
-            parse_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash"}]}}"#),
-            vec![AgentEvent::Text("hi".into()), AgentEvent::Tool("Bash".into())]
+            parse_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls -la","description":"List files"}}]}}"#),
+            vec![
+                AgentEvent::Text("hi".into()),
+                AgentEvent::Tool {
+                    name: "Bash".into(),
+                    input: "$ ls -la\ndescription: List files".into()
+                }
+            ]
         );
         assert_eq!(
             parse_line(r#"{"type":"result","is_error":false,"result":"hi"}"#),
@@ -158,7 +202,7 @@ mod tests {
             evs[0],
             AgentEvent::Denied {
                 tool: "Bash".into(),
-                summary: "touch a.txt".into(),
+                summary: "$ touch a.txt".into(),
                 rule: "Bash(touch a.txt)".into()
             }
         );
@@ -166,11 +210,23 @@ mod tests {
             evs[1],
             AgentEvent::Denied {
                 tool: "Edit".into(),
-                summary: "Edit /p/x.rs".into(),
+                summary: "file_path: /p/x.rs".into(),
                 rule: "Edit(/p/x.rs)".into()
             }
         );
         assert_eq!(evs[2], AgentEvent::Done { error: None });
+    }
+
+    #[test]
+    fn tool_input_keeps_commands_whole_and_caps_other_values() {
+        let long = "é".repeat(MAX_ARG_CHARS + 5);
+        let command = serde_json::json!({ "command": long });
+        assert_eq!(describe_input(&command), format!("$ {long}"));
+
+        let write = serde_json::json!({ "content": long, "file_path": "/p/a" });
+        let shown = describe_input(&write);
+        assert!(shown.starts_with("file_path: /p/a\ncontent: é"));
+        assert!(shown.ends_with("… (5 more characters)"));
     }
 
     #[test]

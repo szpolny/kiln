@@ -19,6 +19,23 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub body: String,
+    /// Set when this is a tool call: the tool's name, with `body` its input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+impl Message {
+    pub fn user(body: impl Into<String>) -> Self {
+        Self { role: Role::User, body: body.into(), tool: None }
+    }
+
+    pub fn agent(body: impl Into<String>) -> Self {
+        Self { role: Role::Agent, body: body.into(), tool: None }
+    }
+
+    pub fn tool_call(name: impl Into<String>, input: impl Into<String>) -> Self {
+        Self { tool: Some(name.into()), ..Self::agent(input) }
+    }
 }
 
 /// An action the agent was denied and a human must decide on.

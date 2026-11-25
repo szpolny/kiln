@@ -8,6 +8,8 @@ use kiln_core::policy::{capability_for_tool, Decision};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{Agent, Approval, Message, Role, Status, Store, NEW_THREAD_TITLE};
 
+const MONO: &str = if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" };
+
 pub struct Workspace {
     store: Store,
     /// None disables saving (e.g. the existing file could not be read).
@@ -158,7 +160,7 @@ impl Workspace {
         if thread.title == NEW_THREAD_TITLE {
             thread.title = body.chars().take(40).collect();
         }
-        thread.messages.push(Message { role: Role::User, body: body.clone() });
+        thread.messages.push(Message::user(body.clone()));
         self.draft.clear();
         self.transcript_thread = None; // show what was just sent
         self.save();
@@ -214,24 +216,25 @@ impl Workspace {
     /// Returns rules to retry with when the policy pre-approved denied actions.
     fn apply(&mut self, id: u64, ev: AgentEvent) -> Option<Vec<String>> {
         let thread = self.store.thread_mut(id)?;
-        let agent_msg = |body: String| Message { role: Role::Agent, body };
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
-            AgentEvent::Text(text) => thread.messages.push(agent_msg(text)),
-            AgentEvent::Tool(name) => thread.messages.push(agent_msg(format!("⚙ {name}"))),
+            AgentEvent::Text(text) => thread.messages.push(Message::agent(text)),
+            AgentEvent::Tool { name, input } => {
+                thread.messages.push(Message::tool_call(name, input))
+            }
             AgentEvent::Denied { tool, summary, rule } => {
                 match thread.policy.decide(capability_for_tool(&tool)) {
                     Decision::Allow => thread.auto_allow.push(rule),
-                    Decision::Deny => thread
-                        .messages
-                        .push(agent_msg(format!("Blocked by policy: {summary}"))),
+                    Decision::Deny => thread.messages.push(Message::agent(format!(
+                        "Blocked by policy: {tool}\n{summary}"
+                    ))),
                     Decision::Ask => thread.pending.push(Approval { tool, summary, rule }),
                 }
             }
             AgentEvent::Done { error } => {
                 if let Some(e) = error {
                     thread.status = Status::NeedsInput;
-                    thread.messages.push(agent_msg(format!("Error: {e}")));
+                    thread.messages.push(Message::agent(format!("Error: {e}")));
                 } else if !thread.auto_allow.is_empty() {
                     return Some(std::mem::take(&mut thread.auto_allow));
                 } else {
@@ -251,7 +254,8 @@ impl Workspace {
             return;
         }
         let a = thread.pending.remove(idx);
-        thread.messages.push(Message { role: Role::User, body: format!("✓ Allowed: {}", a.summary) });
+        let note = format!("✓ Allowed: {}\n{}", a.tool, a.summary);
+        thread.messages.push(Message::user(note));
         let go = "Permission granted for the denied action. Continue.".to_string();
         self.save();
         self.start_turn(id, go, vec![a.rule], cx);
@@ -265,7 +269,8 @@ impl Workspace {
             return;
         }
         let a = thread.pending.remove(idx);
-        thread.messages.push(Message { role: Role::User, body: format!("✗ Denied: {}", a.summary) });
+        let note = format!("✗ Denied: {}\n{}", a.tool, a.summary);
+        thread.messages.push(Message::user(note));
         if thread.pending.is_empty() {
             thread.status = Status::Idle;
         }
@@ -286,13 +291,14 @@ impl Workspace {
                     .child(label)
             };
             col = col.child(
-                div().flex().flex_shrink_0().items_center().gap_3().px_3().py_2().rounded_lg()
+                div().flex().flex_shrink_0().items_start().gap_3().px_3().py_2().rounded_lg()
                     .bg(theme::surface()).border_1().border_color(theme::warn())
                     .child(
                         div().flex().flex_col().flex_1().min_w_0().gap_0p5()
                             .child(div().text_xs().text_color(theme::warn())
                                 .child(format!("{} needs approval", a.tool)))
-                            .child(div().text_sm().text_color(theme::text()).child(a.summary)),
+                            .child(div().font_family(MONO).text_xs().text_color(theme::text())
+                                .child(a.summary)),
                     )
                     .child(button(format!("allow{i}"), "Allow", true)
                         .on_click(cx.listener(move |this, _, _, cx| this.approve(id, i, cx))))
@@ -388,6 +394,9 @@ impl Workspace {
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
             return div().into_any_element();
         };
+        if let Some(name) = &m.tool {
+            return Self::tool_call(name, &m.body).into_any_element();
+        }
         let user = m.role == Role::User;
         div().flex().w_full().px_6().py_2().when(user, |d| d.justify_end())
             .child(
@@ -397,6 +406,20 @@ impl Workspace {
                     .child(m.body.clone()),
             )
             .into_any_element()
+    }
+
+    /// The exact tool name and its input, as the agent sent them.
+    fn tool_call(name: &str, input: &str) -> impl IntoElement {
+        div().w_full().px_6().py_1().child(
+            div().flex().flex_col().w_full().min_w_0().gap_1().px_3().py_2().rounded_md()
+                .border_1().border_color(theme::border())
+                .child(div().font_family(MONO).text_xs().text_color(theme::accent())
+                    .child(name.to_string()))
+                .when(!input.is_empty(), |d| {
+                    d.child(div().font_family(MONO).text_xs().text_color(theme::text())
+                        .child(input.to_string()))
+                }),
+        )
     }
 
     fn thread(&self, id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
