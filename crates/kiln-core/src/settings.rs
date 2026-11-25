@@ -1,6 +1,6 @@
 //! App-wide preferences, saved with the rest of the local state.
 
-use crate::policy::{Decision, Policy};
+use crate::policy::{Decision, PermissionMode, Policy};
 use serde::{Deserialize, Serialize};
 
 /// Which palette the window uses.
@@ -18,6 +18,8 @@ pub enum Appearance {
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    /// Permission mode new threads start with when supported by their provider.
+    pub permission_mode: PermissionMode,
     /// Web access new threads start with.
     pub web: Decision,
 }
@@ -26,6 +28,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             appearance: Appearance::default(),
+            permission_mode: PermissionMode::default(),
             web: Policy::default().network,
         }
     }
@@ -36,9 +39,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_follow_the_system_and_ask_before_using_the_web() {
+    fn defaults_follow_the_system_and_use_manual_permissions() {
         let s = Settings::default();
         assert_eq!(s.appearance, Appearance::System);
+        assert_eq!(s.permission_mode, PermissionMode::Manual);
         assert_eq!(s.web, Decision::Ask);
     }
 

@@ -1,4 +1,4 @@
-use crate::policy::Policy;
+use crate::policy::{PermissionMode, Policy};
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,12 @@ impl Agent {
     pub fn label(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
+        }
+    }
+
+    pub fn permission_modes(self) -> &'static [PermissionMode] {
+        match self {
+            Agent::Claude => &[PermissionMode::Manual, PermissionMode::Auto, PermissionMode::FullAccess],
         }
     }
 
@@ -196,6 +202,8 @@ pub struct Thread {
     #[serde(default)]
     pub reported_model: Option<String>,
     pub status: Status,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub policy: Policy,
     pub messages: Vec<Message>,
     /// Provider session id, used to resume the conversation.
@@ -222,6 +230,7 @@ impl Thread {
             effort: None,
             reported_model: None,
             status: Status::Idle,
+            permission_mode: PermissionMode::default(),
             policy: Policy::default(),
             messages: vec![],
             session_id: None,
@@ -346,7 +355,7 @@ impl Store {
 
     /// Add a thread to project `p`, created at `now`; returns its id. It starts
     /// with the last model and reasoning choices the agent supports, and the
-    /// configured web access.
+    /// configured permission defaults.
     pub fn add_thread(&mut self, p: usize, agent: Agent, now: u64) -> Option<u64> {
         let project = self.projects.get_mut(p)?;
         self.next_id += 1;
@@ -358,6 +367,9 @@ impl Store {
             .filter(|id| agent.models().iter().any(|model| model.id == id.as_str()))
             .cloned();
         thread.effort = self.last_effort.filter(|effort| agent.efforts().contains(effort));
+        if agent.permission_modes().contains(&self.settings.permission_mode) {
+            thread.permission_mode = self.settings.permission_mode;
+        }
         thread.policy.network = self.settings.web;
         project.threads.push(thread);
         Some(id)

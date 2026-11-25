@@ -2,6 +2,7 @@
 
 use crate::process::{self, Process};
 use crate::AgentEvent;
+use kiln_core::policy::PermissionMode;
 use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,15 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             }
             if let Some(model) = v["model"].as_str() {
                 out.push(AgentEvent::Model(model.to_string()));
+            }
+            let mode = match v["permissionMode"].as_str() {
+                Some("default" | "manual") => Some(PermissionMode::Manual),
+                Some("auto") => Some(PermissionMode::Auto),
+                Some("bypassPermissions") => Some(PermissionMode::FullAccess),
+                _ => None,
+            };
+            if let Some(mode) = mode {
+                out.push(AgentEvent::PermissionMode(mode));
             }
         }
         Some("assistant") => {
@@ -166,6 +176,7 @@ pub struct Turn {
     pub model: Option<String>,
     /// Reasoning level; `None` uses the agent's configured default.
     pub effort: Option<String>,
+    pub permission_mode: PermissionMode,
     /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
     pub allowed_tools: Vec<String>,
     /// Tools the agent may not use this turn, whatever its own settings say.
@@ -175,9 +186,19 @@ pub struct Turn {
 /// Start a turn: its process, and the events it produces. The last event is
 /// `Done` or `Stopped`.
 pub fn run(turn: Turn) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)> {
+    process::spawn(command(turn), parse_line)
+}
+
+fn command(turn: Turn) -> Command {
+    let mode = match turn.permission_mode {
+        PermissionMode::Manual => "default",
+        PermissionMode::Auto => "auto",
+        PermissionMode::FullAccess => "bypassPermissions",
+    };
     let mut cmd = Command::new("claude");
     cmd.current_dir(&turn.dir)
         .args(["-p", &turn.prompt, "--output-format", "stream-json", "--verbose"])
+        .args(["--permission-mode", mode])
         // Privacy: no telemetry or non-essential traffic from the child.
         .env("DISABLE_TELEMETRY", "1")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
@@ -197,7 +218,7 @@ pub fn run(turn: Turn) -> io::Result<(Process, async_channel::Receiver<AgentEven
     if !turn.disallowed_tools.is_empty() {
         cmd.arg("--disallowedTools").args(&turn.disallowed_tools);
     }
-    process::spawn(cmd, parse_line)
+    cmd
 }
 
 #[cfg(test)]
@@ -205,10 +226,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resumed_turns_set_the_requested_permission_mode() {
+        for (permission_mode, expected) in [
+            (PermissionMode::Manual, "default"),
+            (PermissionMode::Auto, "auto"),
+            (PermissionMode::FullAccess, "bypassPermissions"),
+        ] {
+            let cmd = command(Turn {
+                dir: ".".into(),
+                prompt: "Continue.".into(),
+                resume: Some("session".into()),
+                model: None,
+                effort: None,
+                permission_mode,
+                allowed_tools: vec![],
+                disallowed_tools: vec![],
+            });
+            let args: Vec<_> = cmd.get_args().collect();
+            assert!(args.windows(2).any(|pair| pair == ["--permission-mode", expected]));
+            assert!(args.windows(2).any(|pair| pair == ["--resume", "session"]));
+        }
+    }
+
+    #[test]
     fn parses_init_text_tool_and_result() {
         assert_eq!(
-            parse_line(r#"{"type":"system","subtype":"init","session_id":"abc","model":"m-1"}"#),
-            vec![AgentEvent::Session("abc".into()), AgentEvent::Model("m-1".into())]
+            parse_line(r#"{"type":"system","subtype":"init","session_id":"abc","model":"m-1","permissionMode":"default"}"#),
+            vec![
+                AgentEvent::Session("abc".into()),
+                AgentEvent::Model("m-1".into()),
+                AgentEvent::PermissionMode(PermissionMode::Manual),
+            ]
         );
         assert_eq!(
             parse_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls -la","description":"List files"}}]}}"#),
@@ -320,6 +368,7 @@ mod live {
             resume: None,
             model: None,
             effort: None,
+            permission_mode: PermissionMode::Manual,
             allowed_tools: vec![],
             disallowed_tools: vec![],
         });
@@ -344,6 +393,7 @@ mod live {
             resume: session,
             model: None,
             effort: None,
+            permission_mode: PermissionMode::Manual,
             allowed_tools: vec![rule],
             disallowed_tools: vec![],
         });
@@ -372,6 +422,7 @@ mod live {
                 resume: None,
                 model: None,
                 effort: None,
+                permission_mode: PermissionMode::Manual,
                 allowed_tools,
                 disallowed_tools: vec![],
             };
@@ -408,6 +459,7 @@ mod live {
             resume,
             model: None,
             effort: None,
+            permission_mode: PermissionMode::Manual,
             allowed_tools: vec!["Bash(bash slow.sh)".into()],
             disallowed_tools: vec![],
         };
@@ -445,6 +497,7 @@ mod live {
             resume: None,
             model: None,
             effort: None,
+            permission_mode: PermissionMode::Manual,
             allowed_tools: vec![],
             disallowed_tools: vec![],
         };

@@ -14,7 +14,7 @@ use gpui::{
     Window,
 };
 use kiln_agent::{claude, process::Process, project, AgentEvent};
-use kiln_core::policy::{capability_for_tool, Capability, Decision, Place};
+use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, WEB_TOOLS};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
     Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
@@ -87,7 +87,7 @@ pub(crate) enum Menu {
     NewThread,
     Model,
     Effort,
-    Web,
+    Permissions,
     Project,
 }
 
@@ -368,6 +368,7 @@ impl Workspace {
         }
         // A new message supersedes anything still waiting for approval.
         thread.pending.clear();
+        thread.auto_allow.clear();
         if thread.title == NEW_THREAD_TITLE {
             thread.title = body.chars().take(40).collect();
         }
@@ -393,25 +394,35 @@ impl Workspace {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
+        if self.menu == Some(Menu::Permissions) {
+            self.menu = None;
+        }
         thread.status = Status::Running;
-        let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
         let mut granted = allowed_tools;
-        granted.extend(web_allowed.iter().map(|t| t.to_string()));
+        let permission_mode = thread.permission_mode;
+        let disallowed_tools = if permission_mode == PermissionMode::Manual {
+            let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
+            granted.extend(web_allowed.iter().map(|t| t.to_string()));
+            web_disallowed.iter().map(|t| t.to_string()).collect()
+        } else {
+            vec![]
+        };
         let started = claude::run(claude::Turn {
             dir,
             prompt,
             resume: thread.session_id.clone(),
             model: Some(thread.model().to_string()),
             effort: Some(thread.effort().id().to_string()),
+            permission_mode,
             allowed_tools: granted.clone(),
-            disallowed_tools: web_disallowed.iter().map(|t| t.to_string()).collect(),
+            disallowed_tools,
         });
         cx.notify();
         let (process, rx) = match started {
             Ok(started) => started,
             Err(e) => {
                 let error = Some(format!("could not start claude: {e}"));
-                self.apply(id, AgentEvent::Done { error }, &granted);
+                self.apply(id, AgentEvent::Done { error }, permission_mode, &granted);
                 self.save();
                 return;
             }
@@ -428,7 +439,7 @@ impl Workspace {
                             thread.record_work(turn.started.elapsed());
                         }
                     }
-                    let retry = this.apply(id, ev, &granted);
+                    let retry = this.apply(id, ev, permission_mode, &granted);
                     if done {
                         this.save();
                         // The turn may have switched branches.
@@ -450,15 +461,34 @@ impl Workspace {
 
     /// Returns rules to retry with when the policy pre-approved denied actions.
     /// `granted` holds the allow rules the turn was started with.
-    fn apply(&mut self, id: u64, ev: AgentEvent, granted: &[String]) -> Option<Vec<String>> {
+    fn apply(
+        &mut self,
+        id: u64,
+        ev: AgentEvent,
+        permission_mode: PermissionMode,
+        granted: &[String],
+    ) -> Option<Vec<String>> {
         let dir = self.store.project_dir_of(id)?;
         let thread = self.store.thread_mut(id)?;
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
             AgentEvent::Model(model) => thread.reported_model = Some(model),
+            AgentEvent::PermissionMode(mode) => {
+                if mode != permission_mode {
+                    thread.messages.push(Message::notice(format!(
+                        "Claude Code is using {} permissions instead of {}.",
+                        permission_label(mode), permission_label(permission_mode)
+                    )));
+                }
+            }
             AgentEvent::Text(text) => thread.messages.push(Message::agent(text).at(now())),
             AgentEvent::Tool { name, input } => {
                 thread.messages.push(Message::tool_call(name, input))
+            }
+            AgentEvent::Denied { tool, summary, .. } if permission_mode != PermissionMode::Manual => {
+                thread.messages.push(Message::notice(format!(
+                    "Blocked by Claude Code: {tool}\n{summary}"
+                )));
             }
             // Already granted, so something outside Kiln refused it and a
             // retry would only be refused again.
@@ -483,11 +513,17 @@ impl Workspace {
                         let note = format!("{why}: {tool}\n{summary}");
                         thread.messages.push(Message::notice(note));
                     }
-                    Decision::Ask => thread.pending.push(Approval { tool, summary, rule }),
+                    Decision::Ask => {
+                        let approval = Approval { tool, summary, rule };
+                        if !thread.pending.contains(&approval) {
+                            thread.pending.push(approval);
+                        }
+                    }
                 }
             }
             AgentEvent::Done { error } => {
                 if let Some(e) = error {
+                    thread.auto_allow.clear();
                     thread.touch(now());
                     thread.status = Status::NeedsInput;
                     thread.messages.push(Message::notice(format!("Error: {e}")));
@@ -511,7 +547,7 @@ impl Workspace {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
-        if idx >= thread.pending.len() {
+        if thread.status == Status::Running || idx >= thread.pending.len() {
             return;
         }
         let a = thread.pending.remove(idx);
@@ -527,7 +563,7 @@ impl Workspace {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
-        if idx >= thread.pending.len() {
+        if thread.status == Status::Running || idx >= thread.pending.len() {
             return;
         }
         let a = thread.pending.remove(idx);
@@ -545,7 +581,10 @@ impl Workspace {
         let theme = self.theme;
         let mut col = div().id("approvals").flex().flex_col().flex_shrink_0()
             .gap_2().px_6().max_h(px(240.)).overflow_y_scroll();
-        let pending = self.store.thread(id).map(|th| th.pending.clone()).unwrap_or_default();
+        let pending = self.store.thread(id)
+            .filter(|thread| thread.status != Status::Running)
+            .map(|thread| thread.pending.clone())
+            .unwrap_or_default();
         for (i, a) in pending.into_iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
                 div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
@@ -726,56 +765,104 @@ impl Workspace {
                 .child(if active { "✓" } else { "" }))
     }
 
-    fn set_web_access(&mut self, id: u64, access: Decision, cx: &mut Context<Self>) {
-        if let Some(thread) = self.store.thread_mut(id) {
-            thread.policy.network = access;
-            self.save();
-            cx.notify();
+    fn set_permission_mode(&mut self, id: u64, mode: PermissionMode) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if thread.status == Status::Running
+            || thread.permission_mode == mode
+            || !thread.agent.permission_modes().contains(&mode)
+        {
+            return;
         }
+        thread.permission_mode = mode;
+        thread.auto_allow.clear();
+        if !thread.pending.is_empty() {
+            thread.pending.clear();
+            thread.status = Status::Idle;
+            thread.messages.push(Message::notice("Pending approvals cleared after permissions changed."));
+        }
+        self.save();
     }
 
-    /// Toolbar button for the thread's web tools; the choice applies from the
-    /// next turn.
-    fn web_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn set_web_access(&mut self, id: u64, access: Decision) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if thread.status == Status::Running || thread.permission_mode != PermissionMode::Manual {
+            return;
+        }
+        thread.policy.network = access;
+        if access == Decision::Deny && !thread.pending.is_empty() {
+            thread.pending.retain(|approval| !WEB_TOOLS.contains(&approval.tool.as_str()));
+            if thread.pending.is_empty() {
+                thread.status = Status::Idle;
+            }
+        }
+        self.save();
+    }
+
+    /// Toolbar picker for the next turn's provider mode and Manual web rules.
+    fn permission_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let open = self.menu == Some(Menu::Web);
-        let current = thread.policy.network;
-        let (label, color) = match current {
-            Decision::Ask => ("Web: ask first", theme.ok),
-            Decision::Allow => ("Web: allowed", theme.warn),
-            Decision::Deny => ("Web: blocked", theme.ok),
+        let available = thread.status != Status::Running;
+        let open = available && self.menu == Some(Menu::Permissions);
+        let mode = thread.permission_mode;
+        let color = match mode {
+            PermissionMode::Manual => theme.ok,
+            PermissionMode::Auto => theme.accent,
+            PermissionMode::FullAccess => theme.warn,
         };
-        let button = div().id("web-picker").flex().items_center().gap_1p5().px_2p5().py_1()
-            .rounded_full().text_xs().text_color(theme.muted).cursor_pointer()
+        let button = div().id("permission-picker").flex().items_center().gap_1p5().px_2p5().py_1()
+            .rounded_full().text_xs().text_color(theme.muted).bg(theme.fill)
             .when(open, |d| d.bg(theme.selected).text_color(theme.text))
-            .when(!open, |d| d.bg(theme.fill).hover(|h| h.bg(theme.hover).text_color(theme.text)))
+            .when(available, |d| d.cursor_pointer()
+                .hover(|h| h.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Permissions, cx))))
             .child(div().size(px(6.)).rounded_full().bg(color))
-            .child(label)
-            .child("▾")
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Web, cx)));
+            .child(permission_label(mode))
+            .when(available, |d| d.child("▾"));
         let picker = div().relative().child(button);
         if !open {
             return picker;
         }
         let id = thread.id;
-        let mut menu = self.menu_panel("web-menu", "Web search and fetch").mt_2();
-        for (access, label) in [
-            (Decision::Ask, "Ask first"),
-            (Decision::Allow, "Allow"),
-            (Decision::Deny, "Block"),
-        ] {
-            let key = SharedString::from(format!("web-{label}"));
+        let mut menu = self.menu_panel("permission-menu", "Permissions for this thread").w(px(285.)).mt_2();
+        for &choice in thread.agent.permission_modes() {
+            let (key, detail) = match choice {
+                PermissionMode::Manual => ("permissions-manual", "Review approval requests"),
+                PermissionMode::Auto => ("permissions-auto", "Provider reviews actions"),
+                PermissionMode::FullAccess => ("permissions-full", "Run tools without asking"),
+            };
             menu = menu.child(
-                self.menu_item(key, None, label, None, current == access)
+                self.menu_item(key, None, permission_label(choice), Some(detail), mode == choice)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
-                        this.set_web_access(id, access, cx);
+                        this.set_permission_mode(id, choice);
+                        cx.notify();
                     })),
             );
         }
+        if mode == PermissionMode::Manual {
+            menu = menu.child(
+                div().mt_1().border_t_1().border_color(theme.border)
+                    .px_2().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted).child("Web search and fetch"),
+            );
+            for (key, access, label) in [
+                ("web-ask", Decision::Ask, "Ask first"),
+                ("web-allow", Decision::Allow, "Allow"),
+                ("web-block", Decision::Deny, "Block"),
+            ] {
+                menu = menu.child(
+                    self.menu_item(key, None, label, None, thread.policy.network == access)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.menu = None;
+                            this.set_web_access(id, access);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
         menu = menu.child(
             div().px_2().pt_1p5().pb_1().text_xs().text_color(theme.muted)
-                .child("Applies from the next turn. Commands and the model connection are not covered."),
+                .child("Changes apply to the next turn."),
         );
         // Anchored at the button's bottom-right corner, so the menu opens below it.
         picker
@@ -975,7 +1062,7 @@ impl Workspace {
                         d.child(self.project_picker(project, window, cx))
                     }),
             )
-            .child(self.web_picker(thread, window, cx))
+            .child(self.permission_picker(thread, window, cx))
     }
 
     fn thread(&self, id: u64, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -995,6 +1082,14 @@ impl Workspace {
             .child(self.approval_cards(id, cx))
             .child(self.composer(thread, window, cx))
             .into_any_element()
+    }
+}
+
+pub(crate) fn permission_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Manual => "Manual",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::FullAccess => "Full access",
     }
 }
 

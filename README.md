@@ -12,7 +12,8 @@ Kiln runs agents as local processes and gives you one place to start, watch, app
 - Projects added from local folders, each with its own threads. A project shows the icon found in its folder, such as `favicon.svg`, `assets/logo.png`, or the one its `index.html` links to, and its initials otherwise. To use another image, click the project name above a thread and choose **Change icon…**.
 - One thread list across projects, with each thread's branch. Settle the threads you are done with to move them out of the way; sending a message brings one back.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the agent. Support for others, such as Codex, is planned.
-- A model, a reasoning level, and a web access setting for each thread.
+- A model, a reasoning level, and a permission mode for each thread. **Manual** shows approval requests for commands and other tools when Claude Code requires permission, and includes web search and fetch controls. **Auto** uses Claude Code's automatic review where available. **Full access** skips routine approval prompts for commands and tools. Switch modes between turns using the thread toolbar.
+- Set the permission mode that new threads start with in **Settings**.
 - Markdown replies, with the tool calls and commands the agent runs. Once the agent has replied, the work before the reply folds under **Worked for …**, which also shows when the reply arrived; click it to see the work again.
 - Approving or denying actions the agent was refused.
 - Stopping a running turn with the stop button or Escape.

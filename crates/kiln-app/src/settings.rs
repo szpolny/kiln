@@ -1,11 +1,11 @@
 //! The workspace's settings dialog.
 use crate::theme::Theme;
-use crate::workspace::Workspace;
+use crate::workspace::{permission_label, Workspace};
 use gpui::{
     actions, div, prelude::*, px, relative, rgba, App, Context, Div, FocusHandle, Focusable,
     FontWeight, KeyBinding, KeyDownEvent, Window,
 };
-use kiln_core::{policy::Decision, Appearance, Settings};
+use kiln_core::{policy::Decision, Agent, Appearance, Settings};
 
 actions!(kiln, [OpenSettings]);
 
@@ -64,8 +64,17 @@ impl Workspace {
             |s, value| s.appearance = value,
             cx,
         );
+        let permissions = self.setting_choices(
+            "Permission mode for new threads",
+            settings.permission_mode,
+            Agent::default().permission_modes().iter().copied().map(|mode| {
+                (mode, permission_label(mode))
+            }),
+            |s, value| s.permission_mode = value,
+            cx,
+        );
         let web = self.setting_choices(
-            "Web access for new threads",
+            "Web access for new threads in Manual mode",
             settings.web,
             [
                 (Decision::Ask, "Ask first"),
@@ -170,9 +179,11 @@ impl Workspace {
                                         .flex()
                                         .flex_col()
                                         .flex_shrink_0()
+                                        .gap_4()
                                         .pt_4()
                                         .border_t_1()
                                         .border_color(theme.border)
+                                        .child(permissions)
                                         .child(web),
                                 ),
                         ),

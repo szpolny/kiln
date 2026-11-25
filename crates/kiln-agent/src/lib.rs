@@ -10,6 +10,8 @@ pub enum AgentEvent {
     Session(String),
     /// The model the provider says is running this turn.
     Model(String),
+    /// The permission mode the provider reports at startup.
+    PermissionMode(kiln_core::policy::PermissionMode),
     Text(String),
     /// A tool call: the provider's tool name and what it was called with.
     Tool { name: String, input: String },
