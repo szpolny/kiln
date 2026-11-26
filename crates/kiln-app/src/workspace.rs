@@ -15,11 +15,15 @@ use gpui::{
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathPromptOptions, Pixels, Render, RenderImage, ScrollHandle, SharedString, Task, Window,
 };
-use kiln_agent::{claude, codex, process::Process, project, AgentEvent, ApprovalId, ApprovalRequest, Client};
+use kiln_agent::{
+    claude, codex, process::Process, project, worktree, AgentEvent, ApprovalId, ApprovalRequest,
+    Client,
+};
+use kiln_core::checkout::{self, Checkout, MoveRequest, Sharing, DEFAULT_COMMIT_TYPE};
 use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
-    Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Fetch, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +52,8 @@ struct RunningTurn {
     client: Client,
     /// Requests the agent is waiting on, oldest first.
     approvals: Vec<ApprovalRequest>,
+    /// The agent asked to move the thread to a worktree; the turn is stopped.
+    move_request: Option<MoveRequest>,
 }
 
 impl RunningTurn {
@@ -60,10 +66,14 @@ pub struct Workspace {
     pub(crate) store: Store,
     /// None disables saving (e.g. the existing file could not be read).
     state_path: Option<std::path::PathBuf>,
+    /// Kiln's own folder, which holds the worktrees it makes.
+    data_dir: PathBuf,
     pub(crate) selected: Option<u64>,
     /// Each running turn, by thread id.
     turns: HashMap<u64, RunningTurn>,
     pub(crate) input: Entity<TextInput>,
+    /// The custom branch prefix in the settings dialog.
+    pub(crate) prefix_input: Entity<TextInput>,
     focus: FocusHandle,
     /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
@@ -106,6 +116,8 @@ pub struct Workspace {
     pub(crate) icon_rejected: bool,
     /// The pending write of a changed draft; replacing it restarts the wait.
     draft_save: Task<()>,
+    /// The pending write of a typed branch prefix.
+    pub(crate) prefix_save: Task<()>,
 }
 
 impl Drop for Workspace {
@@ -125,6 +137,7 @@ pub(crate) enum Menu {
     Effort,
     Permissions,
     Project,
+    Checkout,
 }
 
 impl Workspace {
@@ -145,6 +158,7 @@ impl Workspace {
         })
         .detach();
         let path = state_path();
+        let data_dir = path.parent().map(PathBuf::from).unwrap_or_default();
         let (store, state_path) = match persist::load(&path) {
             Ok(Loaded::Ok(store)) => (store, Some(path)),
             Ok(Loaded::Corrupt(aside)) => {
@@ -166,12 +180,21 @@ impl Workspace {
             InputEvent::Changed => this.keep_draft(cx),
         })
         .detach();
+        let prefix_input = cx.new(|cx| TextInput::new("Prefix, such as team/name", window, cx));
+        cx.subscribe(&prefix_input, |this, _, ev, cx| {
+            if let InputEvent::Changed = ev {
+                this.keep_branch_prefix(cx);
+            }
+        })
+        .detach();
         let mut this = Self {
             store,
             state_path,
+            data_dir,
             selected,
             turns: HashMap::new(),
             input,
+            prefix_input,
             focus: cx.focus_handle(),
             theme,
             settings_modal: None,
@@ -194,6 +217,7 @@ impl Workspace {
             model_scroll_grab: Rc::default(),
             icon_rejected: false,
             draft_save: Task::ready(()),
+            prefix_save: Task::ready(()),
         };
         this.show_draft(cx);
         this.sync_rows();
@@ -206,9 +230,10 @@ impl Workspace {
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.branches = self
             .store
-            .projects
-            .iter()
-            .filter_map(|p| Some((p.dir.clone(), project::branch(&p.dir)?)))
+            .checkout_dirs()
+            .into_iter()
+            .filter_map(|dir| Some((project::branch(&dir)?, dir)))
+            .map(|(branch, dir)| (dir, branch))
             .collect();
         self.load_icons(cx);
         cx.notify();
@@ -503,19 +528,80 @@ impl Workspace {
         }
     }
 
-    /// Run one agent turn and fold its events into the thread.
+    /// Run one agent turn and fold its events into the thread. A turn in the
+    /// shared project checkout first learns what else is working there.
     fn start_turn(&mut self, id: u64, prompt: String, cx: &mut Context<Self>) {
-        let Some(dir) = self.store.project_dir_of(id) else {
+        let Some((p, t)) = self.store.locate(id) else {
             return;
         };
+        let project = &self.store.projects[p];
+        let thread = &project.threads[t];
+        let dir = thread.checkout.dir(&project.dir).to_path_buf();
+        let shared = thread.checkout == Checkout::Project;
+        // Changes already there cannot be this thread's before its first reply.
+        let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
+        let prompt = if thread.handoff {
+            checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(&project.dir))
+        } else {
+            prompt
+        };
+        let running = if shared { self.store.running_beside(id) } else { vec![] };
+        let prefix = self.store.settings.branch_prefix.clone();
+        let fetches = self.store.settings.fetch == Fetch::Always;
+        if matches!(self.menu, Some(Menu::Permissions | Menu::Checkout)) {
+            self.menu = None;
+        }
+        self.store.projects[p].threads[t].status = Status::Running;
+        cx.notify();
+        let prepare = cx.background_executor().spawn(async move {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "The checkout at {} is missing. Choose where this thread runs from its branch \
+                     menu above.",
+                    dir.display()
+                ));
+            }
+            let mut sharing = Sharing::default();
+            if shared && worktree::is_repo(&dir) {
+                sharing.running = running;
+                if first {
+                    sharing.changed_files = worktree::changed_files(&dir).unwrap_or(0);
+                }
+            }
+            Ok((dir, checkout::sharing_note(&sharing, &prefix, fetches)))
+        });
+        cx.spawn(async move |this, cx| {
+            let prepared = prepare.await;
+            let _ = this.update(cx, |this, cx| this.launch(id, prompt, prepared, cx));
+        })
+        .detach();
+    }
+
+    /// Start the agent process of a turn once its checkout has been checked.
+    fn launch(
+        &mut self,
+        id: u64,
+        prompt: String,
+        prepared: Result<(PathBuf, Option<String>), String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
-        if self.menu == Some(Menu::Permissions) {
-            self.menu = None;
-        }
-        thread.status = Status::Running;
         let permission_mode = thread.permission_mode;
+        let (dir, note) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.apply(id, AgentEvent::Done { error: Some(error) }, permission_mode);
+                self.save();
+                cx.notify();
+                return;
+            }
+        };
+        let prompt = match note {
+            Some(note) => format!("{note}\n\n{prompt}"),
+            None => prompt,
+        };
         let agent = thread.agent;
         let policy = thread.policy.clone();
         let resume = thread.session_id.clone();
@@ -542,17 +628,25 @@ impl Workspace {
             }
         };
         self.turns.insert(id, RunningTurn {
-            process, client, started: Instant::now(), approvals: Vec::new(),
+            process, client, started: Instant::now(), approvals: Vec::new(), move_request: None,
         });
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 let done = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Stopped);
                 let _ = this.update(cx, |this, cx| {
+                    let mut ev = ev;
+                    let mut move_request = None;
                     if done {
                         let turn = this.turns.remove(&id);
                         if let (Some(turn), Some(thread)) = (turn, this.store.thread_mut(id)) {
                             thread.record_work(turn.started.elapsed());
+                            // Kiln stopped the turn to move it; a failed turn stays.
+                            let ended = matches!(ev, AgentEvent::Stopped | AgentEvent::Done { error: None });
+                            if let (true, Some(request)) = (ended, turn.move_request) {
+                                move_request = Some(request);
+                                ev = AgentEvent::Done { error: None };
+                            }
                         }
                     }
                     this.apply(id, ev, permission_mode);
@@ -560,6 +654,10 @@ impl Workspace {
                         this.save();
                         // The turn may have switched branches.
                         this.refresh(cx);
+                    }
+                    if let Some(request) = move_request {
+                        let fetch = this.store.settings.fetch == Fetch::Always;
+                        this.move_to_worktree(id, Some(request), fetch, cx);
                     }
                     cx.notify();
                 });
@@ -571,11 +669,175 @@ impl Workspace {
         .detach();
     }
 
+    /// Give the thread a new worktree of its project and run later turns there.
+    /// The user's worktrees start from the latest main branch. The agent's
+    /// `request` chooses its own start, and its request continues at once.
+    /// `fetch` fetches `origin` first.
+    pub(crate) fn move_to_worktree(
+        &mut self,
+        id: u64,
+        request: Option<MoveRequest>,
+        fetch: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((p, t)) = self.store.locate(id) else { return };
+        let project = &self.store.projects[p];
+        let thread = &project.threads[t];
+        if thread.status == Status::Running {
+            return;
+        }
+        let resume = request.is_some();
+        let request = request.unwrap_or_else(|| MoveRequest {
+            commit_type: Some(DEFAULT_COMMIT_TYPE.into()),
+            ..MoveRequest::default()
+        });
+        let prefix = self.store.settings.branch_prefix.resolve(request.commit_type.as_deref());
+        let plan = worktree::Plan {
+            branch: checkout::branch_name(&prefix, &request.name, &thread.title),
+            base: match request.base.filter(|base| !base.trim().is_empty()) {
+                Some(base) => worktree::Base::Ref(base),
+                None if resume => worktree::Base::Head,
+                None => worktree::Base::Main,
+            },
+            carry_changes: request.carry_changes,
+            fetch,
+        };
+        let repo = project.dir.clone();
+        let root = worktree::root(&self.data_dir, &project.name);
+        // Nothing else may start in the thread while its checkout is made.
+        self.store.projects[p].threads[t].status = Status::Running;
+        cx.notify();
+        let create = cx.background_executor()
+            .spawn(async move { worktree::create(&repo, &root, &plan) });
+        cx.spawn(async move |this, cx| {
+            let created = create.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(thread) = this.store.thread_mut(id) else { return };
+                thread.touch(now());
+                thread.status = Status::Idle;
+                let mut next = None;
+                match created {
+                    Ok(created) => {
+                        let mut note = String::new();
+                        if let Checkout::Worktree { path, branch, base } = &created.checkout {
+                            note = format!("Moved to a new worktree on {branch}, from {base}:\n{}", path.display());
+                        }
+                        let carried = match created.carried {
+                            Some(Ok(0)) => Some("There were no uncommitted changes to carry over.".to_string()),
+                            Some(Ok(n)) => Some(format!(
+                                "Copied the uncommitted changes in {n} {} here; the project checkout still has them.",
+                                if n == 1 { "file" } else { "files" }
+                            )),
+                            Some(Err(e)) => Some(format!(
+                                "Could not carry over the uncommitted changes, so the worktree starts clean: {e}"
+                            )),
+                            None => None,
+                        };
+                        let fetched = match created.fetched {
+                            Some(Ok(())) => Some("Fetched origin first.".to_string()),
+                            Some(Err(e)) => Some(format!(
+                                "Could not fetch origin, so it starts from what was fetched before: {e}"
+                            )),
+                            None => None,
+                        };
+                        for line in [&fetched, &carried].into_iter().flatten() {
+                            note = format!("{note}\n{line}");
+                        }
+                        thread.messages.push(Message::notice(note));
+                        thread.move_to(created.checkout);
+                        next = resume
+                            .then(|| thread.messages.iter().rev().find(|m| m.role == Role::User))
+                            .flatten()
+                            .map(|m| match &carried {
+                                Some(carried) => format!("<kiln-context>\n{carried}\n</kiln-context>\n\n{}", m.body),
+                                None => m.body.clone(),
+                            });
+                    }
+                    Err(e) => {
+                        if resume {
+                            thread.status = Status::NeedsInput;
+                        }
+                        thread.messages.push(Message::notice(format!(
+                            "Could not create a worktree: {e}"
+                        )));
+                    }
+                }
+                this.save();
+                this.refresh(cx);
+                if let Some(prompt) = next {
+                    this.start_turn(id, prompt, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Run the thread's later turns in the project checkout again. Its
+    /// worktree stays where it is.
+    pub(crate) fn return_to_project(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        let Checkout::Worktree { path, .. } = &thread.checkout else { return };
+        if thread.status == Status::Running {
+            return;
+        }
+        let note = format!("Back in the project checkout. The worktree stays at:\n{}", path.display());
+        thread.messages.push(Message::notice(note));
+        thread.move_to(Checkout::Project);
+        thread.touch(now());
+        self.save();
+        self.refresh(cx);
+    }
+
+    /// Remove the thread's worktree, which Git allows only while it holds no
+    /// uncommitted or untracked work, and go back to the project checkout. The
+    /// branch is kept.
+    pub(crate) fn remove_worktree(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(repo) = self.store.project_dir_of(id) else { return };
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        let Checkout::Worktree { path, branch, .. } = thread.checkout.clone() else { return };
+        if thread.status == Status::Running {
+            return;
+        }
+        thread.status = Status::Running;
+        cx.notify();
+        let at = path.clone();
+        let remove = cx.background_executor().spawn(async move { worktree::remove(&repo, &at) });
+        cx.spawn(async move |this, cx| {
+            let removed = remove.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(thread) = this.store.thread_mut(id) else { return };
+                thread.status = Status::Idle;
+                thread.touch(now());
+                let note = match removed {
+                    Ok(()) => {
+                        thread.move_to(Checkout::Project);
+                        format!(
+                            "Removed the worktree at {}. The branch {branch} is kept, and the \
+                             thread runs in the project checkout again.",
+                            path.display()
+                        )
+                    }
+                    Err(e) => format!(
+                        "Could not remove the worktree: {e}\nKiln never removes a worktree that \
+                         holds uncommitted or untracked work."
+                    ),
+                };
+                thread.messages.push(Message::notice(note));
+                this.save();
+                this.refresh(cx);
+            });
+        })
+        .detach();
+    }
+
     /// Fold one event of a running turn into its thread.
     fn apply(&mut self, id: u64, ev: AgentEvent, permission_mode: PermissionMode) {
         let Some(thread) = self.store.thread_mut(id) else { return };
         match ev {
-            AgentEvent::Session(id) => thread.session_id = Some(id),
+            AgentEvent::Session(id) => {
+                thread.session_id = Some(id);
+                thread.handoff = false;
+            }
             AgentEvent::Model(model) => thread.reported_model = Some(model),
             AgentEvent::PermissionMode(mode) => {
                 if mode != permission_mode {
@@ -585,7 +847,23 @@ impl Workspace {
                     )));
                 }
             }
-            AgentEvent::Text(text) => thread.messages.push(Message::agent(text).at(now())),
+            AgentEvent::Text(text) => {
+                // Only a thread in the shared checkout is offered the move.
+                let (text, request) = if thread.checkout == Checkout::Project {
+                    checkout::take_move_request(&text)
+                } else {
+                    (text, None)
+                };
+                // Nothing may be edited here once the agent chose to move.
+                if let (Some(request), Some(turn)) = (request, self.turns.get_mut(&id)) {
+                    turn.move_request.get_or_insert(request);
+                    turn.approvals.clear();
+                    turn.stop();
+                }
+                if !text.is_empty() {
+                    thread.messages.push(Message::agent(text).at(now()));
+                }
+            }
             AgentEvent::Tool { name, input, command_bytes } => {
                 let mut message = Message::tool_call(name, input);
                 message.command_bytes = command_bytes;
@@ -1428,7 +1706,9 @@ impl Workspace {
                     .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text).child(thread.title.clone()))
                     .when_some(project, |d, project| {
-                        d.child(self.project_picker(project, window, cx))
+                        d.child(div().flex().min_w_0().items_center().gap_1()
+                            .child(self.project_picker(project, window, cx))
+                            .children(self.checkout_picker(project, thread, window, cx)))
                     }),
             )
             .child(self.permission_picker(thread, window, cx))
@@ -1508,14 +1788,16 @@ impl Render for Workspace {
         self.theme = Theme::new(window.appearance(), self.store.settings.appearance, self.theme.font);
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
-        self.input.update(cx, |input, _| {
-            input.colors = text_input::Colors {
-                text: theme.text.into(),
-                placeholder: theme.muted.into(),
-                caret: theme.accent.into(),
-                selection: selection.into(),
-            }
-        });
+        for input in [&self.input, &self.prefix_input] {
+            input.update(cx, |input, _| {
+                input.colors = text_input::Colors {
+                    text: theme.text.into(),
+                    placeholder: theme.muted.into(),
+                    caret: theme.accent.into(),
+                    selection: selection.into(),
+                }
+            });
+        }
         self.sync_transcript();
         // No root background: the macOS sidebar lets the blur through.
         div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)

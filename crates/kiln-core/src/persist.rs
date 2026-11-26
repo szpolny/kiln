@@ -88,6 +88,8 @@ mod tests {
             appearance: Appearance::Dark,
             permission_mode: PermissionMode::FullAccess,
             web: Decision::Deny,
+            branch_prefix: crate::checkout::BranchPrefix::Custom("me".into()),
+            fetch: crate::Fetch::Always,
         };
         let second = store.projects[0].threads[1].id;
         store.thread_mut(second).unwrap().permission_mode = PermissionMode::Auto;

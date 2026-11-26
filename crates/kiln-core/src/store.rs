@@ -1,3 +1,4 @@
+use crate::checkout::Checkout;
 use crate::policy::{PermissionMode, Policy};
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
@@ -241,6 +242,17 @@ pub struct Thread {
     /// What the user typed in the composer and has not sent yet.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub draft: String,
+    /// Where the thread's turns run.
+    #[serde(default, skip_serializing_if = "is_project_checkout")]
+    pub checkout: Checkout,
+    /// The thread changed checkout, so the next turn starts a new session
+    /// and recaps the conversation to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handoff: bool,
+}
+
+fn is_project_checkout(checkout: &Checkout) -> bool {
+    *checkout == Checkout::Project
 }
 
 impl Thread {
@@ -260,7 +272,17 @@ impl Thread {
             updated_at: now,
             settled: false,
             draft: String::new(),
+            checkout: Checkout::Project,
+            handoff: false,
         }
+    }
+
+    /// Run later turns in `checkout`. The provider session belongs to the old
+    /// folder, so the next turn starts a new one.
+    pub fn move_to(&mut self, checkout: Checkout) {
+        self.checkout = checkout;
+        self.session_id = None;
+        self.handoff = !self.messages.is_empty();
     }
 
     /// Model the next turn runs with.
@@ -511,6 +533,39 @@ impl Store {
     pub fn project_dir_of(&self, id: u64) -> Option<PathBuf> {
         let (p, _) = self.locate(id)?;
         Some(self.projects[p].dir.clone())
+    }
+
+    /// The folder the thread's turns run in.
+    pub fn checkout_dir_of(&self, id: u64) -> Option<PathBuf> {
+        let (p, t) = self.locate(id)?;
+        let project = &self.projects[p];
+        Some(project.threads[t].checkout.dir(&project.dir).to_path_buf())
+    }
+
+    /// Every folder a thread runs in: the projects and their worktrees.
+    pub fn checkout_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.projects.iter().map(|p| p.dir.clone()).collect();
+        for p in &self.projects {
+            for t in &p.threads {
+                if let Checkout::Worktree { path, .. } = &t.checkout {
+                    dirs.push(path.clone());
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Titles of the threads other than `id` that are running in its folder.
+    pub fn running_beside(&self, id: u64) -> Vec<String> {
+        let Some(dir) = self.checkout_dir_of(id) else { return vec![] };
+        self.projects
+            .iter()
+            .flat_map(|p| p.threads.iter().map(move |t| (p, t)))
+            .filter(|(p, t)| {
+                t.id != id && t.status == Status::Running && t.checkout.dir(&p.dir) == dir
+            })
+            .map(|(_, t)| t.title.clone())
+            .collect()
     }
 
     /// The active or the settled threads of every project, latest activity
@@ -846,6 +901,39 @@ mod tests {
         fields.remove("settled");
         let thread: Thread = serde_json::from_value(value).unwrap();
         assert_eq!((thread.updated_at, thread.settled), (0, false));
+    }
+
+    #[test]
+    fn threads_report_who_else_runs_in_their_checkout() {
+        let mut s = Store::sample();
+        let (a, b) = (s.projects[0].threads[0].id, s.projects[0].threads[1].id);
+        let c = s.add_thread(0, Agent::Claude, 0).unwrap();
+        s.thread_mut(b).unwrap().title = "Other".into();
+        s.thread_mut(b).unwrap().status = Status::Running;
+        assert_eq!(s.running_beside(a), ["Other"]);
+        assert!(s.running_beside(b).is_empty());
+
+        let worktree = Checkout::Worktree {
+            path: "/tmp/kiln-wt".into(),
+            branch: "kiln/x".into(),
+            base: "main".into(),
+        };
+        s.thread_mut(a).unwrap().session_id = Some("old".into());
+        s.thread_mut(a).unwrap().messages.push(Message::user("hi"));
+        s.thread_mut(a).unwrap().move_to(worktree.clone());
+        assert_eq!(s.thread(a).unwrap().session_id, None);
+        assert!(s.thread(a).unwrap().handoff);
+        s.thread_mut(c).unwrap().move_to(Checkout::Project);
+        assert!(!s.thread(c).unwrap().handoff, "nothing to recap");
+        assert_eq!(s.checkout_dir_of(a).as_deref(), Some(Path::new("/tmp/kiln-wt")));
+        assert!(s.running_beside(a).is_empty());
+        assert_eq!(s.running_beside(c), ["Other"]);
+        assert!(s.checkout_dirs().contains(&PathBuf::from("/tmp/kiln-wt")));
+
+        let back: Thread = serde_json::from_value(serde_json::to_value(s.thread(a).unwrap()).unwrap()).unwrap();
+        assert_eq!(back.checkout, worktree);
+        let plain = serde_json::to_value(s.thread(c).unwrap()).unwrap();
+        assert!(plain.get("checkout").is_none());
     }
 
     #[test]

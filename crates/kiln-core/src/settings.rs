@@ -1,5 +1,6 @@
 //! App-wide preferences, saved with the rest of the local state.
 
+use crate::checkout::BranchPrefix;
 use crate::policy::{Decision, PermissionMode, Policy};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,18 @@ pub enum Appearance {
     Dark,
 }
 
+/// Whether `origin` is fetched before a new worktree is made, which reaches
+/// the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fetch {
+    /// The user picks with each worktree they make; the agent's never fetch.
+    #[default]
+    Ask,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -22,6 +35,10 @@ pub struct Settings {
     pub permission_mode: PermissionMode,
     /// Web access new threads start with.
     pub web: Decision,
+    /// What the branches of new worktrees start with.
+    pub branch_prefix: BranchPrefix,
+    /// Fetching before a new worktree is made.
+    pub fetch: Fetch,
 }
 
 impl Default for Settings {
@@ -30,6 +47,8 @@ impl Default for Settings {
             appearance: Appearance::default(),
             permission_mode: PermissionMode::default(),
             web: Policy::default().network,
+            branch_prefix: BranchPrefix::default(),
+            fetch: Fetch::default(),
         }
     }
 }
@@ -44,6 +63,8 @@ mod tests {
         assert_eq!(s.appearance, Appearance::System);
         assert_eq!(s.permission_mode, PermissionMode::Manual);
         assert_eq!(s.web, Decision::Ask);
+        assert_eq!(s.branch_prefix.resolve(None), "kiln");
+        assert_eq!(s.fetch, Fetch::Ask);
     }
 
     #[test]

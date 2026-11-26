@@ -5,7 +5,19 @@ use gpui::{
     actions, div, prelude::*, px, relative, rgba, App, Context, Div, FocusHandle, Focusable,
     FontWeight, KeyBinding, KeyDownEvent, Window,
 };
-use kiln_core::{policy::Decision, Agent, Appearance, Settings};
+use kiln_core::{checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, Settings};
+use std::time::Duration;
+
+/// How long typing pauses before a typed setting is written to disk.
+const TYPED_SAVE: Duration = Duration::from_secs(1);
+
+/// The kinds of branch prefix offered, apart from the custom text.
+#[derive(Clone, Copy, PartialEq)]
+enum PrefixKind {
+    Kiln,
+    CommitType,
+    Custom,
+}
 
 actions!(kiln, [OpenSettings]);
 
@@ -29,6 +41,11 @@ impl Workspace {
             return;
         }
         self.menu = None;
+        let custom = match &self.store.settings.branch_prefix {
+            BranchPrefix::Custom(text) => text.clone(),
+            _ => String::new(),
+        };
+        self.prefix_input.update(cx, |input, cx| input.set_text(&custom, cx));
         let focus = cx.focus_handle();
         let previous_focus = window.focused(cx);
         window.focus(&focus, cx);
@@ -37,6 +54,21 @@ impl Workspace {
             previous_focus,
         });
         cx.notify();
+    }
+
+    /// Use the typed text as the branch prefix, and write it once typing pauses.
+    pub(crate) fn keep_branch_prefix(&mut self, cx: &mut Context<Self>) {
+        let BranchPrefix::Custom(text) = &mut self.store.settings.branch_prefix else { return };
+        let typed = self.prefix_input.read(cx).text().replace('\n', "");
+        if *text == typed {
+            return;
+        }
+        *text = typed;
+        cx.notify();
+        self.prefix_save = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPED_SAVE).await;
+            let _ = this.update(cx, |this, _| this.save());
+        });
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -84,6 +116,65 @@ impl Workspace {
             |s, value| s.web = value,
             cx,
         );
+
+        let kind = match &settings.branch_prefix {
+            BranchPrefix::Kiln => PrefixKind::Kiln,
+            BranchPrefix::CommitType => PrefixKind::CommitType,
+            BranchPrefix::Custom(_) => PrefixKind::Custom,
+        };
+        let typed = self.prefix_input.read(cx).text().replace('\n', "");
+        let custom_text = typed.clone();
+        let prefix = self.setting_choices(
+            "Branch prefix for new worktrees",
+            kind,
+            [
+                (PrefixKind::Kiln, "kiln/"),
+                (PrefixKind::CommitType, "Commit type: feat/, fix/, …"),
+                (PrefixKind::Custom, "Custom"),
+            ],
+            move |s, kind| {
+                s.branch_prefix = match kind {
+                    PrefixKind::Kiln => BranchPrefix::Kiln,
+                    PrefixKind::CommitType => BranchPrefix::CommitType,
+                    PrefixKind::Custom => BranchPrefix::Custom(custom_text.clone()),
+                }
+            },
+            cx,
+        );
+        let example = match kind {
+            PrefixKind::CommitType => {
+                "The agent names the type of its work. Worktrees you make use feat/.".to_string()
+            }
+            _ => match settings.branch_prefix.resolve(None) {
+                p if p.is_empty() => "Branches get no prefix.".to_string(),
+                p => format!("Branches look like {p}/add-sidebar."),
+            },
+        };
+        let prefix = prefix
+            .when(kind == PrefixKind::Custom, |d| {
+                d.child(
+                    div().id("branch-prefix-input")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.prefix_input.focus_handle(cx), cx)
+                        }))
+                        .px_2p5().py_1p5().rounded_md().border_1().border_color(theme.border)
+                        .bg(theme.fill).text_sm().child(self.prefix_input.clone()),
+                )
+            })
+            .child(div().text_xs().text_color(theme.muted).child(example));
+
+        let fetch = self.setting_choices(
+            "Fetch origin before a new worktree",
+            settings.fetch,
+            [(Fetch::Ask, "Ask each time"), (Fetch::Always, "Always"), (Fetch::Never, "Never")],
+            |s, value| s.fetch = value,
+            cx,
+        )
+        .child(div().text_xs().text_color(theme.muted).child(match settings.fetch {
+            Fetch::Ask => "The branch menu offers both. Agents' worktrees do not fetch.",
+            Fetch::Always => "Every new worktree, also an agent's, fetches origin first.",
+            Fetch::Never => "New worktrees start from what was fetched before.",
+        }));
 
         Some(
             div()
@@ -185,6 +276,18 @@ impl Workspace {
                                         .border_color(theme.border)
                                         .child(permissions)
                                         .child(web),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_shrink_0()
+                                        .gap_4()
+                                        .pt_4()
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .child(prefix)
+                                        .child(fetch),
                                 ),
                         ),
                 ),
@@ -196,7 +299,7 @@ impl Workspace {
         label: &'static str,
         current: T,
         choices: impl IntoIterator<Item = (T, &'static str)>,
-        set: impl Fn(&mut Settings, T) + Copy + 'static,
+        set: impl Fn(&mut Settings, T) + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let theme = self.theme;
@@ -213,6 +316,7 @@ impl Workspace {
                     .flex_wrap()
                     .gap_1p5()
                     .children(choices.into_iter().map(|(value, name)| {
+                        let set = set.clone();
                         settings_button(name, theme, current == value)
                             .child(name)
                             .on_click(cx.listener(move |this, _, _, cx| {

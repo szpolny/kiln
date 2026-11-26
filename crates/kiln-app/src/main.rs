@@ -1,4 +1,5 @@
 mod assets;
+mod checkout_menu;
 mod markdown;
 mod project_icon;
 mod project_menu;

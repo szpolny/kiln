@@ -4,6 +4,7 @@ pub mod claude;
 pub mod codex;
 pub mod process;
 pub mod project;
+pub mod worktree;
 
 use process::Process;
 use serde_json::Value;

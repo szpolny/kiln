@@ -6,7 +6,7 @@ use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
     Focusable, FontWeight, IntoElement, SharedString, Stateful, Window,
 };
-use kiln_core::{Project, Status, Thread};
+use kiln_core::{Checkout, Project, Status, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
@@ -171,7 +171,11 @@ impl Workspace {
                 Status::Idle => (None, theme.muted),
             };
             let state = state.map_or(age, SharedString::from);
-            let branch = self.branches.get(&project.dir).cloned();
+            let branch = self.branches.get(thread.checkout.dir(&project.dir)).cloned();
+            let branch_icon = match thread.checkout {
+                Checkout::Project => Icon::GitBranch,
+                Checkout::Worktree { .. } => Icon::GitFork,
+            };
             base.flex().flex_col().gap_1().py_2()
                 .child(
                     div().flex().items_center().gap_2()
@@ -187,7 +191,7 @@ impl Workspace {
                         .text_color(theme.muted)
                         .child(div().flex().flex_1().min_w_0().items_center().gap_1()
                             .when_some(branch, |d, branch| {
-                                d.child(assets::icon(Icon::GitBranch, 11.))
+                                d.child(assets::icon(branch_icon, 11.))
                                     .child(div().min_w_0().truncate().child(branch))
                             }))
                         .child(agent_icon(thread.agent, 13., theme.text)),
