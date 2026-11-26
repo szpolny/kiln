@@ -1,7 +1,7 @@
 //! The child process of one turn: its output as events, and a way to stop it.
 
 use crate::AgentEvent;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -77,9 +77,24 @@ impl Process {
 
 /// Spawn a bidirectional provider. The driver closes its input and returns
 /// when the turn is over. Publish the terminal event after the child exits.
+///
+/// The last event is `Done`, or `Stopped` once a stopped process has exited, and
+/// the channel then closes. Dropping the receiver stops the process.
 pub(crate) fn spawn_protocol<F>(
+    cmd: Command,
+    driver: F,
+) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)>
+where
+    F: FnOnce(ChildStdin, ChildStdout, &async_channel::Sender<AgentEvent>) -> io::Result<()>
+        + Send + 'static,
+{
+    spawn_with_grace(cmd, driver, STOP_GRACE)
+}
+
+fn spawn_with_grace<F>(
     mut cmd: Command,
     driver: F,
+    grace: Duration,
 ) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)>
 where
     F: FnOnce(ChildStdin, ChildStdout, &async_channel::Sender<AgentEvent>) -> io::Result<()>
@@ -88,11 +103,15 @@ where
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let input = child.stdin.take().expect("piped stdin");
     let output = child.stdout.take().expect("piped stdout");
-    let process = Process::new(child, STOP_GRACE);
+    let process = Process::new(child, grace);
     let reader = process.clone();
     let (tx, rx) = async_channel::unbounded();
     thread::spawn(move || {
         let result = driver(input, output, &tx);
+        // Nobody is listening for the rest of the turn.
+        if tx.is_closed() {
+            reader.stop();
+        }
         reader.wait();
         let event = if reader.stop_requested() {
             AgentEvent::Stopped
@@ -104,75 +123,32 @@ where
     Ok((process, rx))
 }
 
-/// Spawn `cmd` and turn each line it prints into events with `parse`.
-///
-/// The last event is `Done`, or `Stopped` once a stopped process has exited, and
-/// the channel then closes. Dropping the receiver stops the process.
-pub(crate) fn spawn(
-    cmd: Command,
-    parse: fn(&str) -> Vec<AgentEvent>,
-) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)> {
-    spawn_with_grace(cmd, parse, STOP_GRACE)
-}
-
-fn spawn_with_grace(
-    mut cmd: Command,
-    parse: fn(&str) -> Vec<AgentEvent>,
-    grace: Duration,
-) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)> {
-    let name = cmd.get_program().to_string_lossy().into_owned();
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
-    let out = child.stdout.take();
-    let process = Process::new(child, grace);
-    let (tx, rx) = async_channel::unbounded();
-    let reader = process.clone();
-    thread::spawn(move || {
-        let mut finished = false;
-        let lines = out.into_iter().flat_map(|out| BufReader::new(out).lines());
-        'read: for line in lines.map_while(Result::ok) {
-            for ev in parse(&line) {
-                let outcome = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Denied { .. });
-                // A stopped turn has no outcome to act on, only what already happened.
-                if outcome && reader.stop_requested() {
-                    continue;
-                }
-                finished |= matches!(ev, AgentEvent::Done { .. });
-                if tx.send_blocking(ev).is_err() {
-                    reader.stop();
-                    break 'read;
-                }
-            }
-        }
-        reader.wait();
-        if !finished {
-            let last = if reader.stop_requested() {
-                AgentEvent::Stopped
-            } else {
-                AgentEvent::Done { error: Some(format!("{name} exited without a result")) }
-            };
-            let _ = tx.send_blocking(last);
-        }
-    });
-    Ok((process, rx))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::time::Instant;
 
-    /// Every line is a text event, except `done`.
-    fn parse(line: &str) -> Vec<AgentEvent> {
-        match line {
-            "done" => vec![AgentEvent::Done { error: None }],
-            text => vec![AgentEvent::Text(text.into())],
+    /// Every line is a text event, until `done`.
+    fn lines(
+        input: ChildStdin,
+        output: ChildStdout,
+        events: &async_channel::Sender<AgentEvent>,
+    ) -> io::Result<()> {
+        drop(input);
+        for line in BufReader::new(output).lines() {
+            match line?.as_str() {
+                "done" => return Ok(()),
+                text => events.send_blocking(AgentEvent::Text(text.into())).map_err(io::Error::other)?,
+            }
         }
+        Err(io::Error::other("exited without a result"))
     }
 
     fn shell(script: &str, grace: Duration) -> (Process, async_channel::Receiver<AgentEvent>) {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", script]);
-        spawn_with_grace(cmd, parse, grace).unwrap()
+        spawn_with_grace(cmd, lines, grace).unwrap()
     }
 
     fn rest(rx: &async_channel::Receiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -226,7 +202,7 @@ mod tests {
     #[test]
     fn exiting_without_a_result_is_an_error() {
         let (_process, rx) = shell("exit 1", Duration::from_secs(30));
-        let error = Some("sh exited without a result".into());
+        let error = Some("exited without a result".into());
         assert_eq!(rest(&rx), vec![AgentEvent::Done { error }]);
     }
 

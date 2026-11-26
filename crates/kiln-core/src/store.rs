@@ -70,16 +70,6 @@ impl Message {
     }
 }
 
-/// An action the agent was denied and a human must decide on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Approval {
-    pub tool: String,
-    /// What the user sees, e.g. the shell command.
-    pub summary: String,
-    /// Narrow allow rule used if the user approves.
-    pub rule: String,
-}
-
 /// Which provider runs a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Agent {
@@ -242,10 +232,6 @@ pub struct Thread {
     pub messages: Vec<Message>,
     /// Provider session id, used to resume the conversation.
     pub session_id: Option<String>,
-    /// Denied actions waiting for the user.
-    pub pending: Vec<Approval>,
-    /// Rules the policy already allows; sent with the automatic retry.
-    pub auto_allow: Vec<String>,
     /// Last activity in Unix seconds; 0 when unknown.
     #[serde(default)]
     pub updated_at: u64,
@@ -268,8 +254,6 @@ impl Thread {
             policy: Policy::default(),
             messages: vec![],
             session_id: None,
-            pending: vec![],
-            auto_allow: vec![],
             updated_at: now,
             settled: false,
         }
@@ -288,7 +272,7 @@ impl Thread {
 
     pub fn can_change_agent(&self) -> bool {
         self.status == Status::Idle && self.messages.is_empty()
-            && self.session_id.is_none() && self.pending.is_empty()
+            && self.session_id.is_none()
     }
 
     /// Record activity at `now`, which makes a settled thread active again.
@@ -297,9 +281,9 @@ impl Thread {
         self.settled = false;
     }
 
-    /// Whether nothing is running or waiting for the user's approval.
+    /// Whether nothing is running, so nothing can be waiting for the user.
     pub fn can_settle(&self) -> bool {
-        self.status != Status::Running && self.pending.is_empty()
+        self.status != Status::Running
     }
 
     /// Set the thread aside, which also dismisses a failed turn. Refused while
@@ -313,8 +297,8 @@ impl Thread {
         true
     }
 
-    /// Count time the agent ran toward the latest user message. A turn that
-    /// resumes after an approval adds to it.
+    /// Count time the agent ran toward the latest user message. A resumed
+    /// turn adds to it.
     pub fn record_work(&mut self, ran: Duration) {
         if let Some(m) = self.messages.iter_mut().rev().find(|m| m.role == Role::User) {
             let ms = u64::try_from(ran.as_millis()).unwrap_or(u64::MAX);
@@ -322,11 +306,9 @@ impl Thread {
         }
     }
 
-    /// End a turn the user stopped. Nothing it asked for stays waiting.
+    /// End a turn the user stopped.
     pub fn stop_turn(&mut self) {
         self.status = Status::Stopped;
-        self.pending.clear();
-        self.auto_allow.clear();
         self.messages.push(Message::notice("Stopped"));
     }
 
@@ -563,15 +545,8 @@ mod tests {
         t.status = Status::Running;
         t.session_id = Some("sess-1".into());
         t.messages.push(Message::user("go"));
-        t.auto_allow.push("WebSearch".into());
-        t.pending.push(Approval {
-            tool: "Bash".into(),
-            summary: "$ touch a".into(),
-            rule: "Bash(touch a)".into(),
-        });
         t.stop_turn();
         assert_eq!(t.status, Status::Stopped);
-        assert!(t.pending.is_empty() && t.auto_allow.is_empty());
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.messages.len(), 2);
         assert_eq!(t.messages[1].role, Role::Notice);
@@ -805,16 +780,10 @@ mod tests {
         let mut t = Thread::new(1, Agent::Claude, 0);
         t.status = Status::Running;
         assert!(!t.settle());
-        t.status = Status::NeedsInput;
-        t.pending.push(Approval {
-            tool: "Bash".into(),
-            summary: "$ touch a".into(),
-            rule: "Bash(touch a)".into(),
-        });
-        assert!(!t.settle() && !t.settled);
+        assert!(!t.settled);
 
         // A failed turn leaves nothing to approve, so settling dismisses it.
-        t.pending.clear();
+        t.status = Status::NeedsInput;
         assert!(t.settle());
         assert_eq!(t.status, Status::Idle);
     }

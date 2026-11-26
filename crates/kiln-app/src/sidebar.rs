@@ -174,7 +174,6 @@ impl Workspace {
             let (state, color) = match thread.status {
                 Status::Running if self.has_live_approval(id) => (Some("Approval"), theme.warn),
                 Status::Running => (Some("Working"), theme.accent),
-                _ if !thread.pending.is_empty() => (Some("Approval"), theme.warn),
                 Status::NeedsInput => (Some("Failed"), theme.warn),
                 Status::Stopped => (Some("Stopped"), theme.muted),
                 Status::Idle => (None, theme.muted),

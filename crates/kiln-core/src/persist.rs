@@ -64,7 +64,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{policy::{Decision, PermissionMode}, Agent, Appearance, Approval, Effort, Settings};
+    use crate::{policy::{Decision, PermissionMode}, Agent, Appearance, Effort, Settings};
 
     fn temp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kiln-test-{}-{name}", std::process::id()));
@@ -73,18 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_sessions_approvals_policy_and_settings() {
+    fn round_trips_sessions_policy_and_settings() {
         let path = temp("roundtrip");
         let mut store = Store::sample();
         let id = store.projects[0].threads[0].id;
         let t = store.thread_mut(id).unwrap();
         t.session_id = Some("sess-1".into());
         t.model = Some("claude-sonnet-5-5".into());
-        t.pending.push(Approval {
-            tool: "Bash".into(),
-            summary: "touch a".into(),
-            rule: "Bash(touch a)".into(),
-        });
         t.policy.network = crate::policy::Decision::Allow;
         t.updated_at = 42;
         t.settled = true;
@@ -104,7 +99,6 @@ mod tests {
         let t = back.thread(id).unwrap();
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.model.as_deref(), Some("claude-sonnet-5-5"));
-        assert_eq!(t.pending.len(), 1);
         assert_eq!(t.permission_mode, PermissionMode::Manual);
         assert_eq!(t.policy.network, crate::policy::Decision::Allow);
         assert_eq!((t.updated_at, t.settled), (42, true));

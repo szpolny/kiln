@@ -5,6 +5,10 @@ pub mod codex;
 pub mod process;
 pub mod project;
 
+use process::Process;
+use serde_json::Value;
+use std::io;
+
 /// Provider-neutral event stream a thread consumes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -22,20 +26,60 @@ pub enum AgentEvent {
         command_bytes: Option<usize>,
     },
     /// A live request that the provider is waiting for Kiln to answer.
-    ApprovalRequested(codex::ApprovalRequest),
+    ApprovalRequested(ApprovalRequest),
     /// The provider cleared a live request, for example on interruption.
-    ApprovalResolved(codex::ApprovalId),
+    ApprovalResolved(ApprovalId),
     Notice(String),
-    /// The provider refused an action pending human approval.
-    Denied {
-        tool: String,
-        summary: String,
-        rule: String,
-        /// What a file tool reaches; `None` for other tools or when unknown.
-        path: Option<std::path::PathBuf>,
-    },
     /// The turn finished. `error` carries a message when it failed.
     Done { error: Option<String> },
     /// The turn was stopped on request and its process has exited.
     Stopped,
+}
+
+/// Names a live request within its turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalId(pub(crate) Value);
+
+/// An action the provider holds until the user allows or denies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalRequest {
+    pub id: ApprovalId,
+    pub tool: String,
+    pub summary: String,
+    pub(crate) reply: Reply,
+}
+
+/// What an answer must carry back to the provider.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Reply {
+    /// A plain accept or decline.
+    Decision,
+    /// Only the permissions that were displayed may be granted.
+    Permissions(Value),
+    /// The tool runs with exactly the input that was displayed.
+    Input(Value),
+}
+
+/// The live connection of a turn, for answering its requests and stopping it.
+#[derive(Clone)]
+pub enum Client {
+    Claude(claude::Client),
+    Codex(codex::Client),
+}
+
+impl Client {
+    pub fn respond(&self, request: &ApprovalRequest, allow: bool) -> io::Result<()> {
+        match self {
+            Client::Claude(client) => client.respond(request, allow),
+            Client::Codex(client) => client.respond(request, allow),
+        }
+    }
+
+    /// Ask the agent to stop through its protocol, then end the process.
+    pub fn stop(&self, process: &Process) {
+        match self {
+            Client::Claude(client) => client.stop(process),
+            Client::Codex(client) => client.stop(process),
+        }
+    }
 }

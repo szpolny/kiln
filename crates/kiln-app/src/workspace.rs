@@ -15,11 +15,11 @@ use gpui::{
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathPromptOptions, Pixels, Render, RenderImage, ScrollHandle, SharedString, Task, Window,
 };
-use kiln_agent::{claude, codex, process::Process, project, AgentEvent};
-use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, WEB_TOOLS};
+use kiln_agent::{claude, codex, process::Process, project, AgentEvent, ApprovalId, ApprovalRequest, Client};
+use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
-    Agent, Approval, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -43,17 +43,14 @@ const SCROLLBAR_GUTTER: f32 = 10.;
 struct RunningTurn {
     process: Process,
     started: Instant,
-    codex: Option<codex::Client>,
-    approvals: Vec<codex::ApprovalRequest>,
+    client: Client,
+    /// Requests the agent is waiting on, oldest first.
+    approvals: Vec<ApprovalRequest>,
 }
 
 impl RunningTurn {
     fn stop(&self) {
-        if let Some(client) = &self.codex {
-            client.stop(&self.process);
-        } else {
-            self.process.stop();
-        }
+        self.client.stop(&self.process);
     }
 }
 
@@ -424,9 +421,6 @@ impl Workspace {
         if thread.status == Status::Running {
             return; // one turn at a time per thread
         }
-        // A new message supersedes anything still waiting for approval.
-        thread.pending.clear();
-        thread.auto_allow.clear();
         if thread.title == NEW_THREAD_TITLE {
             thread.title = body.chars().take(40).collect();
         }
@@ -435,24 +429,18 @@ impl Workspace {
         self.input.update(cx, |input, cx| input.clear(cx));
         self.transcript_thread = None; // show what was just sent
         self.save();
-        self.start_turn(id, body, vec![], cx);
+        self.start_turn(id, body, cx);
     }
 
     fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(prompt) = self.store.thread(id).and_then(Thread::resume_prompt) {
             self.transcript_thread = None;
-            self.start_turn(id, prompt, vec![], cx);
+            self.start_turn(id, prompt, cx);
         }
     }
 
     /// Run one agent turn and fold its events into the thread.
-    fn start_turn(
-        &mut self,
-        id: u64,
-        prompt: String,
-        allowed_tools: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_turn(&mut self, id: u64, prompt: String, cx: &mut Context<Self>) {
         let Some(dir) = self.store.project_dir_of(id) else {
             return;
         };
@@ -463,41 +451,34 @@ impl Workspace {
             self.menu = None;
         }
         thread.status = Status::Running;
-        let mut granted = allowed_tools;
         let permission_mode = thread.permission_mode;
         let agent = thread.agent;
-        let disallowed_tools = if agent == Agent::Claude && permission_mode == PermissionMode::Manual {
-            let (web_allowed, web_disallowed) = thread.policy.web_tool_rules();
-            granted.extend(web_allowed.iter().map(|t| t.to_string()));
-            web_disallowed.iter().map(|t| t.to_string()).collect()
-        } else {
-            vec![]
-        };
+        let policy = thread.policy.clone();
         let resume = thread.session_id.clone();
         let model = thread.model();
         let effort = thread.effort().id().to_string();
         let started = match agent {
             Agent::Claude => claude::run(claude::Turn {
                 dir, prompt, resume, model: Some(model.to_string()), effort: Some(effort),
-                permission_mode, allowed_tools: granted.clone(), disallowed_tools,
-            }).map(|(process, rx)| (process, None, rx)),
+                permission_mode, policy,
+            }),
             Agent::Codex => codex::run(codex::Turn {
                 dir, prompt, resume, model: Some(model.to_string()),
-                effort, permission_mode, policy: thread.policy.clone(),
-            }).map(|(process, client, rx)| (process, Some(client), rx)),
+                effort, permission_mode, policy,
+            }),
         };
         cx.notify();
-        let (process, codex, rx) = match started {
+        let (process, client, rx) = match started {
             Ok(started) => started,
             Err(e) => {
                 let error = Some(format!("Could not start {}: {e}", agent.name()));
-                self.apply(id, AgentEvent::Done { error }, permission_mode, &granted);
+                self.apply(id, AgentEvent::Done { error }, permission_mode);
                 self.save();
                 return;
             }
         };
         self.turns.insert(id, RunningTurn {
-            process, codex, started: Instant::now(), approvals: Vec::new(),
+            process, client, started: Instant::now(), approvals: Vec::new(),
         });
 
         cx.spawn(async move |this, cx| {
@@ -510,15 +491,11 @@ impl Workspace {
                             thread.record_work(turn.started.elapsed());
                         }
                     }
-                    let retry = this.apply(id, ev, permission_mode, &granted);
+                    this.apply(id, ev, permission_mode);
                     if done {
                         this.save();
                         // The turn may have switched branches.
                         this.refresh(cx);
-                    }
-                    if let Some(rules) = retry {
-                        let go = "Permission granted for the denied action. Continue.".to_string();
-                        this.start_turn(id, go, rules, cx);
                     }
                     cx.notify();
                 });
@@ -530,17 +507,9 @@ impl Workspace {
         .detach();
     }
 
-    /// Returns rules to retry with when the policy pre-approved denied actions.
-    /// `granted` holds the allow rules the turn was started with.
-    fn apply(
-        &mut self,
-        id: u64,
-        ev: AgentEvent,
-        permission_mode: PermissionMode,
-        granted: &[String],
-    ) -> Option<Vec<String>> {
-        let dir = self.store.project_dir_of(id)?;
-        let thread = self.store.thread_mut(id)?;
+    /// Fold one event of a running turn into its thread.
+    fn apply(&mut self, id: u64, ev: AgentEvent, permission_mode: PermissionMode) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
         match ev {
             AgentEvent::Session(id) => thread.session_id = Some(id),
             AgentEvent::Model(model) => thread.reported_model = Some(model),
@@ -569,54 +538,13 @@ impl Workspace {
                     turn.approvals.retain(|approval| approval.id != request);
                 }
             }
-            AgentEvent::Denied { tool, summary, .. } if permission_mode != PermissionMode::Manual => {
-                thread.messages.push(Message::notice(format!(
-                    "Blocked by {}: {tool}\n{summary}", thread.agent.name()
-                )));
-            }
-            // Already granted, so something outside Kiln refused it and a
-            // retry would only be refused again.
-            AgentEvent::Denied { tool, summary, rule, .. } if granted.contains(&rule) => {
-                thread.messages.push(Message::notice(format!(
-                    "Blocked by the agent's own settings: {tool}\n{summary}"
-                )))
-            }
-            AgentEvent::Denied { tool, summary, rule, path } => {
-                let place = path.map_or(Place::Outside, |path| {
-                    let resolved = project::inside(&dir, &path);
-                    Place::of(resolved.as_deref(), path.strip_prefix(&dir).unwrap_or(&path))
-                });
-                let capability = capability_for_tool(&tool, place);
-                match thread.policy.decide(capability) {
-                    Decision::Allow => thread.auto_allow.push(rule),
-                    Decision::Deny => {
-                        let why = match capability {
-                            Capability::OutsideFiles => "Blocked outside the project",
-                            _ => "Blocked by policy",
-                        };
-                        let note = format!("{why}: {tool}\n{summary}");
-                        thread.messages.push(Message::notice(note));
-                    }
-                    Decision::Ask => {
-                        let approval = Approval { tool, summary, rule };
-                        if !thread.pending.contains(&approval) {
-                            thread.pending.push(approval);
-                        }
-                    }
-                }
-            }
             AgentEvent::Done { error } => {
+                thread.touch(now());
                 if let Some(e) = error {
-                    thread.auto_allow.clear();
-                    thread.touch(now());
                     thread.status = Status::NeedsInput;
                     thread.messages.push(Message::notice(format!("Error: {e}")));
-                } else if !thread.auto_allow.is_empty() {
-                    return Some(std::mem::take(&mut thread.auto_allow));
                 } else {
-                    thread.touch(now());
-                    thread.status =
-                        if thread.pending.is_empty() { Status::Idle } else { Status::NeedsInput };
+                    thread.status = Status::Idle;
                 }
             }
             AgentEvent::Stopped => {
@@ -624,41 +552,6 @@ impl Workspace {
                 thread.stop_turn();
             }
         }
-        None
-    }
-
-    fn approve(&mut self, id: u64, idx: usize, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.thread_mut(id) else {
-            return;
-        };
-        if thread.status == Status::Running || idx >= thread.pending.len() {
-            return;
-        }
-        let a = thread.pending.remove(idx);
-        let note = format!("✓ Allowed: {}\n{}", a.tool, a.summary);
-        thread.messages.push(Message::notice(note));
-        thread.touch(now());
-        let go = "Permission granted for the denied action. Continue.".to_string();
-        self.save();
-        self.start_turn(id, go, vec![a.rule], cx);
-    }
-
-    fn deny(&mut self, id: u64, idx: usize, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.thread_mut(id) else {
-            return;
-        };
-        if thread.status == Status::Running || idx >= thread.pending.len() {
-            return;
-        }
-        let a = thread.pending.remove(idx);
-        let note = format!("✗ Denied: {}\n{}", a.tool, a.summary);
-        thread.messages.push(Message::notice(note));
-        thread.touch(now());
-        if thread.pending.is_empty() {
-            thread.status = Status::Idle;
-        }
-        self.save();
-        cx.notify();
     }
 
     pub(crate) fn has_live_approval(&self, id: u64) -> bool {
@@ -667,11 +560,11 @@ impl Workspace {
         })
     }
 
-    fn decide_codex(
+    fn decide(
         &mut self,
         id: u64,
         started: Instant,
-        request_id: &codex::ApprovalId,
+        request_id: &ApprovalId,
         allow: bool,
         cx: &mut Context<Self>,
     ) {
@@ -679,15 +572,14 @@ impl Workspace {
         if turn.started != started || turn.process.stop_requested() {
             return;
         }
-        let Some(client) = &turn.codex else { return };
         let Some(index) = turn.approvals.iter().position(|request| &request.id == request_id) else { return };
         let request = turn.approvals.remove(index);
-        let note = match client.respond(&request, allow) {
+        let note = match turn.client.respond(&request, allow) {
             Ok(()) => {
                 let decision = if allow { "✓ Allowed" } else { "✗ Denied" };
                 format!("{decision}: {}\n{}", request.tool, request.summary)
             }
-            Err(error) => format!("Could not answer Codex approval: {error}"),
+            Err(error) => format!("Could not answer the approval: {error}"),
         };
         if let Some(thread) = self.store.thread_mut(id) {
             thread.touch(now());
@@ -701,17 +593,10 @@ impl Workspace {
         let theme = self.theme;
         let mut col = div().id("approvals").flex().flex_col().flex_shrink_0()
             .gap_2().px_6().max_h(px(240.)).overflow_y_scroll();
-        let mut pending: Vec<_> = self.store.thread(id)
-            .filter(|thread| thread.status != Status::Running)
-            .into_iter().flat_map(|thread| thread.pending.iter())
-            .map(|approval| (approval.tool.clone(), approval.summary.clone(), None))
-            .collect();
-        if let Some(turn) = self.turns.get(&id).filter(|_| self.has_live_approval(id)) {
-            pending.extend(turn.approvals.iter().map(|request| {
-                (request.tool.clone(), request.summary.clone(), Some((turn.started, request.id.clone())))
-            }));
-        }
-        for (i, (tool, summary, request)) in pending.into_iter().enumerate() {
+        let Some(turn) = self.turns.get(&id).filter(|_| self.has_live_approval(id)) else {
+            return col;
+        };
+        for (i, request) in turn.approvals.iter().enumerate() {
             let button = |id: String, label: &'static str, primary: bool| {
                 div().id(SharedString::from(id)).px_3().py_1().rounded_md().text_xs()
                     .font_weight(FontWeight::MEDIUM).cursor_pointer()
@@ -720,7 +605,7 @@ impl Workspace {
                     .hover(|h| h.opacity(0.85))
                     .child(label)
             };
-            let deny_request = request.clone();
+            let (started, allow_id, deny_id) = (turn.started, request.id.clone(), request.id.clone());
             col = col.child(centered(
                 div().flex().items_start().gap_2().w_full()
                     .p_3().mb_2().rounded(px(12.)).bg(theme.card)
@@ -729,25 +614,17 @@ impl Workspace {
                         div().flex().flex_col().flex_1().min_w_0().gap_1()
                             .child(div().text_xs().font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.warn)
-                                .child(format!("{tool} needs approval")))
+                                .child(format!("{} needs approval", request.tool)))
                             .child(div().font_family(MONO).text_xs().text_color(theme.text)
-                                .child(summary)),
+                                .child(request.summary.clone())),
                     )
                     .child(button(format!("deny{i}"), "Deny", false)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some((started, request)) = &deny_request {
-                                this.decide_codex(id, *started, request, false, cx);
-                            } else {
-                                this.deny(id, i, cx);
-                            }
+                            this.decide(id, started, &deny_id, false, cx);
                         })))
                     .child(button(format!("allow{i}"), "Allow", true)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some((started, request)) = &request {
-                                this.decide_codex(id, *started, request, true, cx);
-                            } else {
-                                this.approve(id, i, cx);
-                            }
+                            this.decide(id, started, &allow_id, true, cx);
                         }))),
             ).flex_shrink_0());
         }
@@ -1082,12 +959,6 @@ impl Workspace {
             return;
         }
         thread.permission_mode = mode;
-        thread.auto_allow.clear();
-        if !thread.pending.is_empty() {
-            thread.pending.clear();
-            thread.status = Status::Idle;
-            thread.messages.push(Message::notice("Pending approvals cleared after permissions changed."));
-        }
         self.save();
     }
 
@@ -1097,12 +968,6 @@ impl Workspace {
             return;
         }
         thread.policy.network = access;
-        if access == Decision::Deny && !thread.pending.is_empty() {
-            thread.pending.retain(|approval| !WEB_TOOLS.contains(&approval.tool.as_str()));
-            if thread.pending.is_empty() {
-                thread.status = Status::Idle;
-            }
-        }
         self.save();
     }
 

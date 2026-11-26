@@ -1,15 +1,25 @@
 //! Claude Code adapter: one `claude -p` process per turn, resumed by session id.
+//!
+//! The prompt and the answers to permission requests go over stdin as stream
+//! JSON, so Claude waits on a request while the user decides.
 
 use crate::process::{self, Process};
-use crate::AgentEvent;
-use kiln_core::policy::PermissionMode;
-use serde_json::Value;
-use std::io;
+use crate::{project, AgentEvent, ApprovalId, ApprovalRequest, Reply};
+use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, Policy};
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command};
+use std::sync::{Arc, Mutex};
+
+/// What Claude is told when the user turns a request down.
+const DENIED: &str = "The user denied this action.";
+/// What Claude is told when Kiln's policy turns a request down.
+const BLOCKED: &str = "Kiln's permission policy blocks this action.";
 
 /// Parse one stream-json line into zero or more events.
-pub fn parse_line(line: &str) -> Vec<AgentEvent> {
+fn parse_line(line: &str) -> Vec<AgentEvent> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return vec![];
     };
@@ -53,22 +63,6 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                     _ => {}
                 }
             }
-        }
-        Some("result") => {
-            for d in v["permission_denials"].as_array().into_iter().flatten() {
-                if let Some(tool) = d["tool_name"].as_str() {
-                    let input = &d["tool_input"];
-                    out.push(AgentEvent::Denied {
-                        tool: tool.to_string(),
-                        summary: describe_input(input),
-                        rule: allow_rule(tool, input),
-                        path: target(tool, input),
-                    });
-                }
-            }
-            let error = (v["is_error"] == true)
-                .then(|| v["result"].as_str().unwrap_or("agent failed").to_string());
-            out.push(AgentEvent::Done { error });
         }
         _ => {}
     }
@@ -135,41 +129,6 @@ fn target(tool: &str, input: &Value) -> Option<PathBuf> {
     }
 }
 
-/// The narrowest allow rule for a denied call.
-///
-/// Claude Code matches file rules as patterns, only under the names `Read` and
-/// `Edit`, and reads a single leading slash as relative to its settings.
-fn allow_rule(tool: &str, input: &Value) -> String {
-    if let Some(command) = input["command"].as_str() {
-        return format!("{tool}({command})");
-    }
-    let (name, below) = match tool {
-        "Read" => ("Read", ""),
-        "Glob" | "Grep" => ("Read", "/**"),
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => ("Edit", ""),
-        _ => return tool.to_string(),
-    };
-    // Never fall back to a bare tool name: that would allow every file.
-    let Some(path) = target(tool, input) else {
-        return format!("{name}(./)");
-    };
-    let mut pattern = String::new();
-    for c in path.to_string_lossy().chars() {
-        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
-            pattern.push('\\');
-        }
-        pattern.push(c);
-    }
-    let root = if path.is_absolute() {
-        "/"
-    } else if path.starts_with(".") {
-        ""
-    } else {
-        "./"
-    };
-    format!("{name}({root}{pattern}{below})")
-}
-
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
@@ -179,19 +138,71 @@ pub struct Turn {
     /// Reasoning level; `None` uses the agent's configured default.
     pub effort: Option<String>,
     pub permission_mode: PermissionMode,
-    /// Allow rules for this turn only (e.g. `Bash(touch a.txt)`).
-    pub allowed_tools: Vec<String>,
-    /// Tools the agent may not use this turn, whatever its own settings say.
-    pub disallowed_tools: Vec<String>,
+    /// Decides the requests Claude makes in manual mode.
+    pub policy: Policy,
 }
 
-/// Start a turn: its process, and the events it produces. The last event is
-/// `Done` or `Stopped`.
-pub fn run(turn: Turn) -> io::Result<(Process, async_channel::Receiver<AgentEvent>)> {
-    process::spawn(command(turn), parse_line)
+/// The live connection for answering requests and stopping this turn.
+#[derive(Clone)]
+pub struct Client(Arc<Mutex<Option<ChildStdin>>>);
+
+impl Client {
+    pub fn respond(&self, request: &ApprovalRequest, allow: bool) -> io::Result<()> {
+        self.answer(request, allow, DENIED)
+    }
+
+    pub fn stop(&self, process: &Process) {
+        process.stop_with(|| {
+            self.send(json!({ "type": "control_request", "request_id": "kiln-interrupt",
+                "request": { "subtype": "interrupt" } }))
+        });
+    }
+
+    fn answer(&self, request: &ApprovalRequest, allow: bool, why: &str) -> io::Result<()> {
+        let response = match (&request.reply, allow) {
+            (Reply::Input(input), true) => json!({ "behavior": "allow", "updatedInput": input }),
+            _ => json!({ "behavior": "deny", "message": why }),
+        };
+        self.send(json!({ "type": "control_response", "response": {
+            "subtype": "success", "request_id": request.id.0, "response": response,
+        }}))
+    }
+
+    fn send(&self, message: Value) -> io::Result<()> {
+        let mut input = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let input = input.as_mut().ok_or_else(|| io::Error::other("Claude turn has ended"))?;
+        writeln!(input, "{message}")?;
+        input.flush()
+    }
+
+    fn close(&self) {
+        // EOF on stdin lets Claude exit once its turn is over.
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
-fn command(turn: Turn) -> Command {
+/// Start a turn: its process, its connection, and the events it produces. The
+/// last event is `Done` or `Stopped`.
+pub fn run(turn: Turn) -> io::Result<(Process, crate::Client, async_channel::Receiver<AgentEvent>)> {
+    run_command(command(&turn), turn)
+}
+
+fn run_command(
+    cmd: Command,
+    turn: Turn,
+) -> io::Result<(Process, crate::Client, async_channel::Receiver<AgentEvent>)> {
+    let client = Client(Arc::default());
+    let wire = client.clone();
+    let (process, events) = process::spawn_protocol(cmd, move |input, output, events| {
+        *wire.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
+        let result = drive(&wire, BufReader::new(output), events, &turn);
+        wire.close();
+        result
+    })?;
+    Ok((process, crate::Client::Claude(client), events))
+}
+
+fn command(turn: &Turn) -> Command {
     let mode = match turn.permission_mode {
         PermissionMode::Manual => "default",
         PermissionMode::Auto => "auto",
@@ -199,11 +210,22 @@ fn command(turn: Turn) -> Command {
     };
     let mut cmd = Command::new("claude");
     cmd.current_dir(&turn.dir)
-        .args(["-p", &turn.prompt, "--output-format", "stream-json", "--verbose"])
+        .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
         .args(["--permission-mode", mode])
         // Privacy: no telemetry or non-essential traffic from the child.
         .env("DISABLE_TELEMETRY", "1")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    if turn.permission_mode == PermissionMode::Manual {
+        // Ask Kiln over stdin instead of refusing what would need a prompt.
+        cmd.args(["--permission-prompt-tool", "stdio"]);
+        let (allowed, disallowed) = turn.policy.web_tool_rules();
+        if !allowed.is_empty() {
+            cmd.arg("--allowedTools").args(allowed);
+        }
+        if !disallowed.is_empty() {
+            cmd.arg("--disallowedTools").args(disallowed);
+        }
+    }
     if let Some(id) = &turn.resume {
         cmd.args(["--resume", id]);
     }
@@ -214,18 +236,115 @@ fn command(turn: Turn) -> Command {
         // The variable outranks the flag and would silently undo the choice.
         cmd.args(["--effort", effort]).env_remove("CLAUDE_CODE_EFFORT_LEVEL");
     }
-    if !turn.allowed_tools.is_empty() {
-        cmd.arg("--allowedTools").args(&turn.allowed_tools);
-    }
-    if !turn.disallowed_tools.is_empty() {
-        cmd.arg("--disallowedTools").args(&turn.disallowed_tools);
-    }
     cmd
+}
+
+fn drive(
+    wire: &Client,
+    output: impl BufRead,
+    events: &async_channel::Sender<AgentEvent>,
+    turn: &Turn,
+) -> io::Result<()> {
+    let emit = |event| events.send_blocking(event).map_err(io::Error::other);
+    wire.send(json!({ "type": "user", "message": { "role": "user", "content": turn.prompt } }))?;
+    // Tool calls Claude asked about; it lists them again among its denials.
+    let mut asked = HashSet::new();
+    for line in output.lines() {
+        let line = line?;
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match message["type"].as_str() {
+            Some("control_request") => {
+                let request = &message["request"];
+                if request["subtype"] != "can_use_tool" {
+                    // Unsupported requests must receive a response so they cannot stall the turn.
+                    wire.send(json!({ "type": "control_response", "response": {
+                        "subtype": "error", "request_id": message["request_id"],
+                        "error": "Request is unsupported by Kiln",
+                    }}))?;
+                    continue;
+                }
+                if let Some(id) = request["tool_use_id"].as_str() {
+                    asked.insert(id.to_string());
+                }
+                let (request, decision, why) = approval(&message["request_id"], request, turn);
+                match decision {
+                    Decision::Ask => emit(AgentEvent::ApprovalRequested(request))?,
+                    Decision::Allow => wire.answer(&request, true, "")?,
+                    Decision::Deny => {
+                        wire.answer(&request, false, BLOCKED)?;
+                        emit(AgentEvent::Notice(format!("{why}: {}\n{}", request.tool, request.summary)))?;
+                    }
+                }
+            }
+            Some("control_cancel_request") => {
+                emit(AgentEvent::ApprovalResolved(ApprovalId(message["request_id"].clone())))?;
+            }
+            Some("result") => {
+                let by = match turn.permission_mode {
+                    PermissionMode::Manual => "Blocked by the agent's own settings",
+                    _ => "Blocked by Claude",
+                };
+                for denial in message["permission_denials"].as_array().into_iter().flatten() {
+                    let unasked = denial["tool_use_id"].as_str().is_none_or(|id| !asked.contains(id));
+                    if let (true, Some(tool)) = (unasked, denial["tool_name"].as_str()) {
+                        let summary = describe_input(&denial["tool_input"]);
+                        emit(AgentEvent::Notice(format!("{by}: {tool}\n{summary}")))?;
+                    }
+                }
+                return match message["is_error"] == true {
+                    true => Err(io::Error::other(message["result"].as_str().unwrap_or("agent failed"))),
+                    false => Ok(()),
+                };
+            }
+            _ => {
+                for event in parse_line(&line) {
+                    emit(event)?;
+                }
+            }
+        }
+    }
+    Err(io::Error::other("claude exited without a result"))
+}
+
+/// A permission request as shown to the user, and what the policy says about it.
+fn approval(id: &Value, request: &Value, turn: &Turn) -> (ApprovalRequest, Decision, &'static str) {
+    let tool = request["tool_name"].as_str().unwrap_or("Tool");
+    let input = &request["input"];
+    let place = target(tool, input).map_or(Place::Outside, |path| {
+        let resolved = project::inside(&turn.dir, &path);
+        Place::of(resolved.as_deref(), path.strip_prefix(&turn.dir).unwrap_or(&path))
+    });
+    let capability = capability_for_tool(tool, place);
+    let why = match capability {
+        Capability::OutsideFiles => "Blocked outside the project",
+        _ => "Blocked by policy",
+    };
+    let request = ApprovalRequest {
+        id: ApprovalId(id.clone()),
+        tool: tool.to_string(),
+        summary: describe_input(input),
+        reply: Reply::Input(input.clone()),
+    };
+    (request, turn.policy.decide(capability), why)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(permission_mode: PermissionMode) -> Turn {
+        Turn {
+            dir: ".".into(),
+            prompt: "Continue.".into(),
+            resume: Some("session".into()),
+            model: None,
+            effort: None,
+            permission_mode,
+            policy: Policy::default(),
+        }
+    }
 
     #[test]
     fn resumed_turns_set_the_requested_permission_mode() {
@@ -234,24 +353,27 @@ mod tests {
             (PermissionMode::Auto, "auto"),
             (PermissionMode::FullAccess, "bypassPermissions"),
         ] {
-            let cmd = command(Turn {
-                dir: ".".into(),
-                prompt: "Continue.".into(),
-                resume: Some("session".into()),
-                model: None,
-                effort: None,
-                permission_mode,
-                allowed_tools: vec![],
-                disallowed_tools: vec![],
-            });
+            let cmd = command(&turn(permission_mode));
             let args: Vec<_> = cmd.get_args().collect();
             assert!(args.windows(2).any(|pair| pair == ["--permission-mode", expected]));
             assert!(args.windows(2).any(|pair| pair == ["--resume", "session"]));
+            let asks = args.windows(2).any(|pair| pair == ["--permission-prompt-tool", "stdio"]);
+            assert_eq!(asks, permission_mode == PermissionMode::Manual);
         }
     }
 
     #[test]
-    fn parses_init_text_tool_and_result() {
+    fn web_tools_follow_the_network_policy_in_manual_mode() {
+        let mut turn = turn(PermissionMode::Manual);
+        turn.policy.network = Decision::Deny;
+        let args: Vec<_> = command(&turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(args[at + 1..at + 3], ["WebFetch", "WebSearch"]);
+        assert!(!args.iter().any(|a| a == "--allowedTools"));
+    }
+
+    #[test]
+    fn parses_init_text_and_tool() {
         assert_eq!(
             parse_line(r#"{"type":"system","subtype":"init","session_id":"abc","model":"m-1","permissionMode":"default"}"#),
             vec![
@@ -271,56 +393,6 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(
-            parse_line(r#"{"type":"result","is_error":false,"result":"hi"}"#),
-            vec![AgentEvent::Done { error: None }]
-        );
-        assert_eq!(
-            parse_line(r#"{"type":"result","is_error":true,"result":"boom"}"#),
-            vec![AgentEvent::Done { error: Some("boom".into()) }]
-        );
-    }
-
-    #[test]
-    fn denials_become_scoped_rules() {
-        let evs = parse_line(
-            r#"{"type":"result","is_error":false,"permission_denials":[
-              {"tool_name":"Bash","tool_input":{"command":"touch a.txt"}},
-              {"tool_name":"Edit","tool_input":{"file_path":"/p/x.rs"}}]}"#,
-        );
-        assert_eq!(
-            evs[0],
-            AgentEvent::Denied {
-                tool: "Bash".into(),
-                summary: "$ touch a.txt".into(),
-                rule: "Bash(touch a.txt)".into(),
-                path: None,
-            }
-        );
-        assert_eq!(
-            evs[1],
-            AgentEvent::Denied {
-                tool: "Edit".into(),
-                summary: "file_path: /p/x.rs".into(),
-                rule: "Edit(//p/x.rs)".into(),
-                path: Some("/p/x.rs".into()),
-            }
-        );
-        assert_eq!(evs[2], AgentEvent::Done { error: None });
-    }
-
-    #[test]
-    fn file_rules_name_one_target_the_way_claude_matches_them() {
-        let rule = |tool, input| allow_rule(tool, &input);
-        let json = |v: &str| serde_json::from_str::<Value>(v).unwrap();
-        let file = json(r#"{"file_path":"/p/a b/[id]*.ts"}"#);
-        assert_eq!(rule("Write", file.clone()), r"Edit(//p/a b/\[id\]\*.ts)");
-        assert_eq!(rule("Read", file), r"Read(//p/a b/\[id\]\*.ts)");
-        let notebook = json(r#"{"notebook_path":"/p/n.ipynb"}"#);
-        assert_eq!(rule("NotebookEdit", notebook), "Edit(//p/n.ipynb)");
-        assert_eq!(rule("Grep", json(r#"{"path":"/p/src"}"#)), "Read(//p/src/**)");
-        assert_eq!(rule("Grep", json("{}")), "Read(./**)");
-        assert_eq!(rule("Edit", json("{}")), "Edit(./)");
     }
 
     #[test]
@@ -350,101 +422,170 @@ mod tests {
         assert!(parse_line("not json").is_empty());
         assert!(parse_line(r#"{"type":"rate_limit_event"}"#).is_empty());
     }
+
+    /// Run `script` as Claude after it has read the prompt.
+    fn fixture(script: &str, turn: Turn) -> (Process, crate::Client, async_channel::Receiver<AgentEvent>) {
+        let mut cmd = Command::new("sh");
+        // `has` fails unless the last line read holds every fragment, in any order.
+        let prompt = r#"
+            has() { for part; do case "$line" in *"$part"*) ;; *) exit 1 ;; esac; done; }
+            IFS= read -r line
+            has '"type":"user"' '"role":"user"' '"content":"Continue."'
+            echo '{"type":"system","subtype":"init","session_id":"session"}'
+        "#;
+        cmd.args(["-c", &format!("{prompt}\n{script}")]);
+        let (process, client, events) = run_command(cmd, turn).unwrap();
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Session("session".into()));
+        (process, client, events)
+    }
+
+    #[test]
+    fn a_live_request_waits_for_the_user_within_the_turn() {
+        let (_, client, events) = fixture(
+            r#"
+            echo '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch a"},"tool_use_id":"t1"}}'
+            IFS= read -r line
+            has '"type":"control_response"' '"subtype":"success"' '"request_id":"r1"' '"behavior":"deny"' '"message":"The user denied this action."'
+            echo '{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch b"},"tool_use_id":"t2"}}'
+            IFS= read -r line
+            has '"request_id":"r2"' '"behavior":"allow"' '"updatedInput":{"command":"touch b"}'
+            echo '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}'
+            echo '{"type":"result","is_error":false,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"touch a"}}]}'
+            if IFS= read -r line; then exit 1; fi
+        "#,
+            turn(PermissionMode::Manual),
+        );
+        for (command, allow) in [("$ touch a", false), ("$ touch b", true)] {
+            let AgentEvent::ApprovalRequested(request) = events.recv_blocking().unwrap() else {
+                panic!("expected a live approval");
+            };
+            assert_eq!((request.tool.as_str(), request.summary.as_str()), ("Bash", command));
+            client.respond(&request, allow).unwrap();
+        }
+        // The denial the user made is not reported again.
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("done".into()));
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
+        assert!(events.recv_blocking().is_err());
+    }
+
+    #[test]
+    fn the_policy_answers_what_it_already_decides() {
+        let dir = std::env::temp_dir().join(format!("kiln-claude-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut turn = turn(PermissionMode::Manual);
+        turn.dir = dir.clone();
+        let inside = dir.join("a.txt");
+        let script = format!(
+            r#"
+            echo '{{"type":"control_request","request_id":"r1","request":{{"subtype":"can_use_tool","tool_name":"Write","input":{{"file_path":"{inside}"}},"tool_use_id":"t1"}}}}'
+            IFS= read -r line
+            case "$line" in *'"behavior":"allow"'*) ;; *) exit 1 ;; esac
+            echo '{{"type":"control_request","request_id":"r2","request":{{"subtype":"can_use_tool","tool_name":"Read","input":{{"file_path":"/etc/hosts"}},"tool_use_id":"t2"}}}}'
+            IFS= read -r line
+            case "$line" in *'"behavior":"deny"'*) ;; *) exit 1 ;; esac
+            echo '{{"type":"result","is_error":false,"permission_denials":[{{"tool_name":"WebSearch","tool_use_id":"t3","tool_input":{{"query":"q"}}}}]}}'
+        "#,
+            inside = inside.display()
+        );
+        let (_, _, events) = fixture(&script, turn);
+        let rest: Vec<_> = std::iter::from_fn(|| events.recv_blocking().ok()).collect();
+        assert_eq!(rest, vec![
+            AgentEvent::Notice("Blocked outside the project: Read\nfile_path: /etc/hosts".into()),
+            AgentEvent::Notice("Blocked by the agent's own settings: WebSearch\nquery: q".into()),
+            AgentEvent::Done { error: None },
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stopping_a_waiting_request_interrupts_the_turn() {
+        let (process, client, events) = fixture(
+            r#"
+            echo '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch a"},"tool_use_id":"t1"}}'
+            IFS= read -r line
+            case "$line" in *'"subtype":"interrupt"'*) ;; *) exit 1 ;; esac
+            echo '{"type":"control_cancel_request","request_id":"r1"}'
+            echo '{"type":"result","is_error":true,"permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"touch a"}}]}'
+            if IFS= read -r line; then exit 1; fi
+        "#,
+            turn(PermissionMode::Manual),
+        );
+        let AgentEvent::ApprovalRequested(request) = events.recv_blocking().unwrap() else {
+            panic!("expected a live approval");
+        };
+        client.stop(&process);
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::ApprovalResolved(request.id));
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Stopped);
+        assert!(events.recv_blocking().is_err());
+    }
+
+    #[test]
+    fn unsupported_requests_are_answered() {
+        let (_, _, events) = fixture(
+            r#"
+            echo '{"type":"control_request","request_id":"r1","request":{"subtype":"mcp_message"}}'
+            IFS= read -r line
+            has '"request_id":"r1"' '"subtype":"error"'
+            echo '{"type":"result","is_error":true,"result":"boom"}'
+        "#,
+            turn(PermissionMode::Manual),
+        );
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: Some("boom".into()) });
+    }
 }
 
 #[cfg(test)]
 mod live {
-    /// Deny, then approve with a scoped rule and resume: the file appears.
-    #[test]
-    #[ignore]
-    fn live_denial_then_scoped_approval() {
-        use super::*;
-        let dir = std::env::temp_dir().join(format!("kiln-approval-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let collect = |t: Turn| -> Vec<AgentEvent> {
-            let (_process, rx) = run(t).unwrap();
-            std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
-        };
-        let first = collect(Turn {
-            dir: dir.clone(),
-            prompt: "run the shell command: touch approved.txt".into(),
-            resume: None,
-            model: None,
-            effort: None,
-            permission_mode: PermissionMode::Manual,
-            allowed_tools: vec![],
-            disallowed_tools: vec![],
-        });
-        let session = first.iter().find_map(|e| match e {
-            AgentEvent::Session(id) => Some(id.clone()),
-            _ => None,
-        });
-        let rule = first.iter().find_map(|e| match e {
-            AgentEvent::Denied { rule, .. } => Some(rule.clone()),
-            _ => None,
-        });
-        let Some(rule) = rule else {
-            // Claude's own rules decided not to ask in this directory; nothing to approve.
-            eprintln!("no denial in this directory; skipping approval half");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        };
-        assert!(!dir.join("approved.txt").exists());
-        collect(Turn {
-            dir: dir.clone(),
-            prompt: "Permission granted. Run it now.".into(),
-            resume: session,
-            model: None,
-            effort: None,
-            permission_mode: PermissionMode::Manual,
-            allowed_tools: vec![rule],
-            disallowed_tools: vec![],
-        });
-        assert!(dir.join("approved.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     use super::*;
 
-    /// Approving the rules Kiln writes lets the same file edits through.
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kiln-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn turn(dir: &Path, prompt: &str, resume: Option<String>) -> Turn {
+        Turn {
+            dir: dir.to_path_buf(),
+            prompt: prompt.into(),
+            resume,
+            model: None,
+            effort: None,
+            permission_mode: PermissionMode::Manual,
+            policy: Policy::default(),
+        }
+    }
+
+    /// Answer every live request with `allow`, and collect the turn's events.
+    fn answer_all(turn: Turn, allow: bool) -> Vec<AgentEvent> {
+        let (_process, client, rx) = run(turn).unwrap();
+        let mut events = vec![];
+        while let Ok(event) = rx.recv_blocking() {
+            if let AgentEvent::ApprovalRequested(request) = &event {
+                client.respond(request, allow).unwrap();
+            }
+            events.push(event);
+        }
+        events
+    }
+
+    /// A denied command does not run; an approved one runs in the same turn.
     #[test]
     #[ignore]
-    fn live_file_rules_are_accepted() {
-        let dir = std::env::temp_dir().join(format!("kiln-files-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
-        let file = dir.join("[id] (draft).txt");
-        let prompt = format!(
-            "Use the Write tool to create {} containing the word hi. Do not use Bash.",
-            file.display()
-        );
-        let turn = |allowed_tools| -> Vec<AgentEvent> {
-            let turn = Turn {
-                dir: dir.clone(),
-                prompt: prompt.clone(),
-                resume: None,
-                model: None,
-                effort: None,
-                permission_mode: PermissionMode::Manual,
-                allowed_tools,
-                disallowed_tools: vec![],
-            };
-            let (_process, rx) = run(turn).unwrap();
-            std::iter::from_fn(|| rx.recv_blocking().ok()).collect()
-        };
-        let rules: Vec<_> = turn(vec![])
-            .into_iter()
-            .filter_map(|e| match e {
-                AgentEvent::Denied { rule, .. } => Some(rule),
-                _ => None,
-            })
-            .collect();
-        if !rules.is_empty() {
-            assert!(!file.exists());
-            let events = turn(rules);
-            assert!(!events.iter().any(|e| matches!(e, AgentEvent::Denied { .. })));
+    fn live_approval_within_the_turn() {
+        let dir = temp("approval");
+        let prompt = "run the shell command: touch approved.txt";
+        let denied = answer_all(turn(&dir, prompt, None), false);
+        assert!(!dir.join("approved.txt").exists());
+        if !denied.iter().any(|e| matches!(e, AgentEvent::ApprovalRequested(_))) {
+            // Claude's own rules decided not to ask in this directory; nothing to approve.
+            eprintln!("no request in this directory; skipping approval half");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
         }
-        assert!(file.exists());
+        let approved = answer_all(turn(&dir, prompt, None), true);
+        assert_eq!(approved.last(), Some(&AgentEvent::Done { error: None }));
+        assert!(dir.join("approved.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -453,39 +594,28 @@ mod live {
     #[test]
     #[ignore]
     fn live_stop_then_resume() {
-        let dir = std::env::temp_dir().join(format!("kiln-stop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("stop");
         std::fs::write(dir.join("slow.sh"), "sleep 20\ntouch finished.txt\n").unwrap();
-        let turn = |prompt: &str, resume| Turn {
-            dir: dir.clone(),
-            prompt: prompt.into(),
-            resume,
-            model: None,
-            effort: None,
-            permission_mode: PermissionMode::Manual,
-            allowed_tools: vec!["Bash(bash slow.sh)".into()],
-            disallowed_tools: vec![],
-        };
-        let (process, rx) =
-            run(turn("run this shell command in the foreground: bash slow.sh", None)).unwrap();
+        let prompt = "run this shell command in the foreground: bash slow.sh";
+        let (process, client, rx) = run(turn(&dir, prompt, None)).unwrap();
         let mut session = None;
         loop {
             match rx.recv_blocking().expect("ended before running a tool") {
                 AgentEvent::Session(id) => session = Some(id),
+                AgentEvent::ApprovalRequested(request) => client.respond(&request, true).unwrap(),
                 AgentEvent::Tool { .. } => break,
                 _ => {}
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(3));
-        process.stop();
+        client.stop(&process);
         let after: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
         assert_eq!(after.last(), Some(&AgentEvent::Stopped));
         // Long enough for the command to finish, had it been left running.
         std::thread::sleep(std::time::Duration::from_secs(22));
         assert!(!dir.join("finished.txt").exists());
 
-        let (_process, rx) = run(turn("reply with the single word: ok", session)).unwrap();
-        let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
+        let events = answer_all(turn(&dir, "reply with the single word: ok", session), false);
         assert_eq!(events.last(), Some(&AgentEvent::Done { error: None }));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -494,18 +624,7 @@ mod live {
     #[test]
     #[ignore]
     fn live_turn_streams_session_text_and_done() {
-        let turn = Turn {
-            dir: std::env::temp_dir(),
-            prompt: "reply with the single word: ok".into(),
-            resume: None,
-            model: None,
-            effort: None,
-            permission_mode: PermissionMode::Manual,
-            allowed_tools: vec![],
-            disallowed_tools: vec![],
-        };
-        let (_process, rx) = run(turn).unwrap();
-        let events: Vec<_> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
+        let events = answer_all(turn(&std::env::temp_dir(), "reply with the single word: ok", None), false);
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Session(_))));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(_))));
         assert_eq!(events.last(), Some(&AgentEvent::Done { error: None }));

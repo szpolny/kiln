@@ -8,5 +8,5 @@ pub mod store;
 
 pub use settings::{Appearance, Settings};
 pub use store::{
-    Agent, Approval, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Agent, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };

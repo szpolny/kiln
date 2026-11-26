@@ -2,7 +2,7 @@
 
 use crate::{
     process::{self, Process},
-    project, AgentEvent,
+    project, AgentEvent, ApprovalId, ApprovalRequest, Reply,
 };
 use kiln_core::policy::{Capability, Decision, PermissionMode, Place, Policy};
 use serde_json::{json, Value};
@@ -22,29 +22,15 @@ pub struct Turn {
     pub policy: Policy,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ApprovalId(Value);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ApprovalRequest {
-    pub id: ApprovalId,
-    pub tool: String,
-    pub summary: String,
-    // For request_permissions, only grant the permissions that were displayed.
-    permissions: Option<Value>,
-}
-
-impl ApprovalRequest {
-    fn response(&self, allow: bool) -> Value {
-        let result = match &self.permissions {
-            Some(permissions) => json!({
-                "permissions": if allow { permissions.clone() } else { json!({}) },
-                "scope": "turn",
-            }),
-            None => json!({ "decision": if allow { "accept" } else { "decline" } }),
-        };
-        json!({ "id": self.id.0, "result": result })
-    }
+fn response(request: &ApprovalRequest, allow: bool) -> Value {
+    let result = match &request.reply {
+        Reply::Permissions(permissions) => json!({
+            "permissions": if allow { permissions.clone() } else { json!({}) },
+            "scope": "turn",
+        }),
+        _ => json!({ "decision": if allow { "accept" } else { "decline" } }),
+    };
+    json!({ "id": request.id.0, "result": result })
 }
 
 /// The live connection for replying to approvals and stopping this turn.
@@ -59,7 +45,7 @@ struct Connection {
 
 impl Client {
     pub fn respond(&self, request: &ApprovalRequest, allow: bool) -> io::Result<()> {
-        self.send(request.response(allow))
+        self.send(response(request, allow))
     }
 
     pub fn stop(&self, process: &Process) {
@@ -94,9 +80,10 @@ impl Connection {
     }
 }
 
-pub fn run(mut turn: Turn) -> io::Result<(Process, Client, async_channel::Receiver<AgentEvent>)> {
+pub fn run(mut turn: Turn) -> io::Result<(Process, crate::Client, async_channel::Receiver<AgentEvent>)> {
     turn.dir = turn.dir.canonicalize()?;
-    run_command(command(&turn), turn)
+    let (process, client, events) = run_command(command(&turn), turn)?;
+    Ok((process, crate::Client::Codex(client), events))
 }
 
 fn run_command(
@@ -495,7 +482,7 @@ fn approval(
         id: ApprovalId(id.clone()),
         tool: tool.to_string(),
         summary,
-        permissions,
+        reply: permissions.map_or(Reply::Decision, Reply::Permissions),
     };
     Some((request, decision))
 }
@@ -582,11 +569,11 @@ mod tests {
         assert_eq!(decision, Decision::Ask);
         assert!(request.summary.contains("touch kiln-test"));
         assert_eq!(
-            request.response(true),
+            response(&request, true),
             json!({ "id": id, "result": { "decision": "accept" } })
         );
         assert_eq!(
-            request.response(false),
+            response(&request, false),
             json!({ "id": id, "result": { "decision": "decline" } })
         );
 
@@ -608,13 +595,13 @@ mod tests {
         let (request, decision) = approval(method, &id, &params, &items, &turn).unwrap();
         assert_eq!(decision, Decision::Allow);
         assert_eq!(
-            request.response(true),
+            response(&request, true),
             json!({
                 "id": id, "result": { "permissions": permissions, "scope": "turn" }
             })
         );
         assert_eq!(
-            request.response(false),
+            response(&request, false),
             json!({
                 "id": id, "result": { "permissions": {}, "scope": "turn" }
             })
