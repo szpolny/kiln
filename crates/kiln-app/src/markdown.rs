@@ -2,11 +2,11 @@
 //!
 //! Images load locally from the thread checkout. Links open only on click.
 
-use crate::{file_reference::{self, ChipColors}, media};
+use crate::{assets, file_reference::{self, ChipColors}, media, output_selection::Document, tooltip::tip};
 use std::{ops::Range, path::{Path, PathBuf}};
 use crate::theme::{Theme, MONO};
 use gpui::{
-    canvas, div, font, prelude::*, px, relative, AnyElement, ClipboardItem, FontStyle, FontWeight,
+    canvas, div, font, prelude::*, px, relative, AnyElement, FontStyle, FontWeight,
     InteractiveText, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -304,12 +304,15 @@ fn opens(url: &str) -> bool {
 }
 
 /// Draw parsed blocks. `key` must be unique among messages on screen.
-pub fn render(blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>) -> impl IntoElement {
-    Painter { theme, key, next_id: 0, root }.column(blocks)
+pub fn render(
+    blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>, document: &mut Document,
+) -> gpui::Div {
+    Painter { theme, key, next_id: 0, root, document }.column(blocks)
 }
 
 struct Painter<'a> {
     root: Option<&'a Path>,
+    document: &'a mut Document,
     theme: Theme,
     key: usize,
     next_id: usize,
@@ -404,7 +407,11 @@ impl Painter<'_> {
 
     fn code(&mut self, language: &str, text: &str) -> impl IntoElement {
         let theme = self.theme;
-        let copy = SharedString::from(text.to_string());
+        let code = SharedString::from(text.to_owned());
+        let copy_id = self.id("copy");
+        let copied = self.document.code_copied(&copy_id);
+        let icon = if copied { assets::Icon::Check } else { assets::Icon::Copy };
+        let tooltip = if copied { "Copied" } else { "Copy code" };
         let language = if language.is_empty() { "code" } else { language };
         div().flex().flex_col().w_full().min_w_0().rounded(px(10.)).bg(theme.fill)
             .border_1().border_color(theme.border)
@@ -413,18 +420,18 @@ impl Painter<'_> {
                     .border_b_1().border_color(theme.border)
                     .child(div().flex_1().child(language.to_string()))
                     .child(
-                        div().id(self.id("copy")).px_1p5().rounded_md().cursor_pointer()
+                        div().id(copy_id.clone()).flex().items_center().justify_center()
+                            .size(px(24.)).rounded_md().cursor_pointer()
                             .hover(|h| h.bg(theme.hover).text_color(theme.text))
                             .active(|a| a.bg(theme.selected))
-                            .child("Copy")
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))
-                            }),
+                            .child(assets::icon(icon, 14.).when(copied, |d| d.text_color(theme.ok)))
+                            .tooltip(tip(tooltip, theme))
+                            .on_click(self.document.copy_code(copy_id, code.clone())),
                     ),
             )
             .child(
                 div().px_3().py_2().font_family(MONO).text_xs().line_height(relative(1.6))
-                    .text_color(theme.text).child(text.to_string()),
+                    .text_color(theme.text).child(self.document.plain(code)),
             )
     }
 
@@ -465,7 +472,7 @@ impl Painter<'_> {
                 runs.push(run);
             }
         }
-        linked_text(text, runs, links, self.id("link"), self.root, colors)
+        linked_text(text, runs, links, self.id("link"), self.root, colors, self.document)
     }
 }
 
@@ -477,9 +484,15 @@ enum Link {
 
 fn linked_text(
     text: String, runs: Vec<TextRun>, links: Vec<(Range<usize>, Link)>,
-    id: SharedString, root: Option<&Path>, colors: ChipColors,
+    id: SharedString, root: Option<&Path>, colors: ChipColors, document: &mut Document,
 ) -> AnyElement {
-    let text = StyledText::new(text).with_runs(runs);
+    let display = SharedString::from(text);
+    let text = StyledText::new(display.clone()).with_runs(runs);
+    let chips = links.iter().filter_map(|(range, link)| match link {
+        Link::File(path) => Some((range.clone(), path.to_string_lossy().into_owned())),
+        Link::Web(_) => None,
+    }).collect();
+    document.track(display, &text, chips);
     if links.is_empty() {
         return text.into_any_element();
     }
@@ -489,7 +502,11 @@ fn linked_text(
     }).collect::<Vec<_>>();
     let root = root.map(Path::to_path_buf);
     let (ranges, links): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let dragged = document.drag_guard();
     let interactive = InteractiveText::new(id, text).on_click(ranges, move |i, _, cx| {
+        if dragged() {
+            return;
+        }
         match &links[i] {
             Link::Web(url) => cx.open_url(url),
             Link::File(path) => {
@@ -513,10 +530,12 @@ fn linked_text(
         .into_any_element()
 }
 
-pub fn render_user(text: &str, theme: Theme, key: usize, root: Option<&Path>) -> AnyElement {
+pub fn render_user(
+    text: &str, theme: Theme, key: usize, root: Option<&Path>, document: &mut Document,
+) -> AnyElement {
     let references = file_reference::references(text, root);
     if references.is_empty() {
-        return SharedString::from(text.to_owned()).into_any_element();
+        return document.plain(text.to_owned()).into_any_element();
     }
     let colors = ChipColors { text: theme.on_accent.into(), border: theme.on_accent.opacity(0.5).into() };
     let run = TextRun {
@@ -540,7 +559,7 @@ pub fn render_user(text: &str, theme: Theme, key: usize, root: Option<&Path>) ->
         display.push_str(&text[at..]);
         runs.push(TextRun { len: text.len() - at, ..run });
     }
-    linked_text(display, runs, links, format!("user-links-{key}").into(), root, colors)
+    linked_text(display, runs, links, format!("user-links-{key}").into(), root, colors, document)
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ mod file_reference;
 mod commands;
 mod markdown;
 mod media;
+mod output_selection;
 mod project_icon;
 mod project_menu;
 mod settings;
@@ -25,6 +26,7 @@ fn main() {
     gpui_platform::application().with_assets(assets::Assets).run(|cx: &mut App| {
         assets::load_icon_font(cx).expect("failed to load the icon font");
         text_input::bind_keys(cx);
+        output_selection::bind_keys(cx);
         settings::bind_keys(cx);
         commands::bind_keys(cx);
         commands::set_menus(cx);

@@ -1,7 +1,7 @@
 use crate::assets;
 use crate::commands::Palette;
 use crate::file_reference;
-use crate::{markdown, media};
+use crate::{markdown, media, output_selection};
 use crate::project_icon;
 use crate::settings::SettingsModal;
 use crate::shell;
@@ -117,6 +117,7 @@ pub struct Workspace {
     /// Virtualized list over `entries`. It follows new output until the user
     /// scrolls up.
     transcript: ListState,
+    output_selection: Rc<output_selection::Selection>,
     /// The conversation's rows, in the order shown.
     entries: Vec<Entry>,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
@@ -263,6 +264,7 @@ impl Workspace {
             icons: HashMap::new(),
             icon_load: Task::ready(()),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            output_selection: Rc::new(output_selection::Selection::new(cx)),
             entries: Vec::new(),
             transcript_thread: None,
             transcript_built: None,
@@ -370,6 +372,7 @@ impl Workspace {
             )
         });
         if switched {
+            self.output_selection.reset();
             self.transcript.reset(entries.len());
             self.parsed.clear();
             self.reply_images.clear();
@@ -1984,6 +1987,7 @@ impl Workspace {
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
         let root = m.checkout_dir.as_deref().or_else(|| self.checkout_dir(id)).map(Path::to_path_buf);
+        let mut document = output_selection::Document::new(self.output_selection.clone(), ix);
         let content = match (&m.tool, m.role) {
             (Some(name), _) => {
                 if shell::is_shell(name) && self.open_tools.contains(&(id, ix)) {
@@ -1991,12 +1995,12 @@ impl Workspace {
                         shell::highlights(name, &m.body, m.command_bytes)
                     });
                 }
-                self.tool_call(id, ix, name, &m.body, cx).into_any_element()
+                self.tool_call(id, ix, name, &m.body, &mut document, cx).into_any_element()
             }
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
                     .bg(theme.accent).text_color(theme.on_accent)
-                    .when(!m.body.is_empty(), |d| d.child(markdown::render_user(&m.body, theme, ix, root.as_deref())))
+                    .when(!m.body.is_empty(), |d| d.child(markdown::render_user(&m.body, theme, ix, root.as_deref(), &mut document)))
                     .when(!m.attachments.is_empty(), |d| {
                         d.child(div().flex().flex_wrap().gap_1()
                             .children(m.attachments.iter().enumerate().map(|(i, attachment)| {
@@ -2014,17 +2018,23 @@ impl Workspace {
                         AttachmentContent::Text(_) => None,
                     }).collect()
                 });
-                body.when(!blocks.is_empty(), |d| d.child(markdown::render(blocks, theme, ix, root.as_deref())))
+                body.when(!blocks.is_empty(), |d| d.child(markdown::render(blocks, theme, ix, root.as_deref(), &mut document)))
                     .children(images.iter().enumerate().map(|(i, (name, picture))| {
                         media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
                     }))
                     .into_any_element()
             }
             (None, Role::Notice) => body.text_xs().text_color(theme.muted)
-                .child(m.body.clone())
+                .child(document.plain(m.body.clone()))
                 .into_any_element(),
         };
-        centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6().py_1p5().into_any_element()
+        let body = centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6().py_1p5();
+        let highlight = if m.role == Role::User && m.tool.is_none() {
+            theme.on_accent
+        } else {
+            theme.accent
+        };
+        document.render(body, highlight.opacity(0.3).into()).into_any_element()
     }
 
     fn tool_call(
@@ -2033,6 +2043,7 @@ impl Workspace {
         ix: usize,
         name: &str,
         input: &str,
+        document: &mut output_selection::Document,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -2081,8 +2092,12 @@ impl Workspace {
                     .font_family(MONO).text_xs().line_height(relative(1.6))
                     .text_color(theme.text);
                 let details = match self.shell_highlights.get(&ix).and_then(Option::as_deref) {
-                    Some(spans) => details.child(shell::render(input, spans, theme)),
-                    None => details.child(input.to_string()),
+                    Some(spans) => {
+                        let styled = shell::render(input, spans, theme);
+                        document.track(input.to_owned().into(), &styled, Vec::new());
+                        details.child(styled)
+                    }
+                    None => details.child(document.plain(input.to_owned())),
                 };
                 d.child(details)
             })
@@ -2212,13 +2227,15 @@ impl Workspace {
             .child(dot)
             .child(label))
             .px_6().py_1p5();
-        div().flex().flex_col().w_full()
+        let mut document = output_selection::Document::new(self.output_selection.clone(), key);
+        let content = div().flex().flex_col().w_full()
             .when_some(streamed, |d, blocks| {
                 d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
-                    .child(markdown::render(&blocks, theme, key, root.as_deref())))
+                    .child(markdown::render(&blocks, theme, key, root.as_deref(), &mut document)))
                     .px_6().py_1p5())
             })
-            .child(status)
+            .child(status);
+        document.render(content, theme.accent.opacity(0.3).into())
     }
 
     fn composer_ready(&self, thread: &Thread, cx: &Context<Self>) -> bool {
@@ -2349,7 +2366,11 @@ impl Workspace {
         .py(px(TRANSCRIPT_PADDING));
         div().flex().flex_col().flex_1().min_w_0().h_full().bg(self.theme.window)
             .child(self.toolbar(thread, window, cx))
-            .child(messages)
+            .child(div().flex().flex_col().flex_1().min_h_0()
+                .track_focus(&self.output_selection.focus)
+                .key_context("Transcript")
+                .on_action(cx.listener(|this, _: &text_input::Copy, _, cx| this.output_selection.copy(cx)))
+                .child(messages))
             .child(self.approval_cards(id, cx))
             .child(self.queue_panel(thread, cx))
             .child(self.composer(thread, window, cx))
