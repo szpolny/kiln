@@ -5,6 +5,8 @@
 //! work and branches are never lost.
 
 use kiln_core::checkout::Checkout;
+use kiln_core::Agent;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +36,51 @@ fn run(cmd: &mut Command) -> io::Result<String> {
 /// Whether `dir` is inside a Git working tree.
 pub fn is_repo(dir: &Path) -> bool {
     run(git(dir).args(["rev-parse", "--is-inside-work-tree"])).is_ok_and(|out| out == "true")
+}
+
+/// Load the provider's ignored instruction file from the project checkout when
+/// the worktree has no override of its own.
+pub fn local_instructions(repo: &Path, tree: &Path, agent: Agent) -> io::Result<Option<String>> {
+    let name = match agent {
+        Agent::Codex => "AGENTS.override.md",
+        Agent::Claude => "CLAUDE.local.md",
+    };
+    let source = repo.join(name);
+    let result = (|| {
+        match fs::symlink_metadata(tree.join(name)) {
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        match fs::metadata(&source) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let ignored = git(repo).args(["check-ignore", "-q", "--", name]).output()?;
+        match ignored.status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(None),
+            _ => return Err(io::Error::other(format!(
+                "git check-ignore exited with {}: {}",
+                ignored.status,
+                String::from_utf8_lossy(&ignored.stderr).trim(),
+            ))),
+        }
+        let instructions = fs::read_to_string(&source)?;
+        Ok((!instructions.trim().is_empty()).then(|| {
+            format!(
+                "<kiln-project-instructions>\n\
+                 The following local project instructions come from {name}. Apply them in this worktree.\n\n\
+                 {instructions}\n\
+                 </kiln-project-instructions>"
+            )
+        }))
+    })();
+    result.map_err(|e| {
+        io::Error::other(format!("Could not load local instructions from {}: {e}", source.display()))
+    })
 }
 
 /// How many files in the checkout at `dir` have uncommitted changes, untracked
@@ -209,7 +256,6 @@ pub fn root(data_dir: &Path, project: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn repo(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!("kiln-worktree-{name}-{}", std::process::id()));
@@ -233,6 +279,35 @@ mod tests {
     fn tree(created: &Created) -> (&Path, &str, &str) {
         let Checkout::Worktree { path, branch, base } = &created.checkout else { panic!("expected a worktree") };
         (path, branch, base)
+    }
+
+    #[test]
+    fn worktrees_inherit_only_ignored_instructions_for_their_provider() {
+        let repo = repo("instructions");
+        let root = repo.parent().unwrap().join("trees");
+        let created = create(&repo, &root, &plan("instructions", Base::Head, false)).unwrap();
+        let (tree, _, _) = tree(&created);
+        let codex = "AGENTS.override.md";
+        let claude = "CLAUDE.local.md";
+        fs::write(repo.join(".git/info/exclude"), format!("/{codex}\n")).unwrap();
+        fs::write(repo.join(codex), "Codex instructions").unwrap();
+        fs::write(repo.join(claude), "Claude instructions").unwrap();
+
+        let read = |agent| local_instructions(&repo, tree, agent).unwrap();
+        assert!(read(Agent::Codex).unwrap().contains("Codex instructions"));
+        assert!(read(Agent::Claude).is_none());
+        assert!(!tree.join(codex).exists());
+        assert_eq!(changed_files(tree).unwrap(), 0);
+
+        fs::write(repo.join(".git/info/exclude"), format!("/{codex}\n/{claude}\n")).unwrap();
+        fs::write(repo.join(codex), "Updated instructions").unwrap();
+        assert!(read(Agent::Codex).unwrap().contains("Updated instructions"));
+        assert!(read(Agent::Claude).unwrap().contains("Claude instructions"));
+        fs::write(tree.join(codex), "Worktree instructions").unwrap();
+        assert!(read(Agent::Codex).is_none());
+        fs::remove_file(repo.join(claude)).unwrap();
+        assert!(read(Agent::Claude).is_none());
+        fs::remove_dir_all(repo.parent().unwrap()).unwrap();
     }
 
     #[test]

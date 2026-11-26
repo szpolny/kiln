@@ -678,6 +678,8 @@ impl Workspace {
         let thread = &project.threads[t];
         let dir = thread.checkout.dir(&project.dir).to_path_buf();
         let shared = thread.checkout == Checkout::Project;
+        let project_dir = project.dir.clone();
+        let agent = thread.agent;
         // Changes already there cannot be this thread's before its first reply.
         let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
         let prompt = if thread.handoff {
@@ -710,11 +712,20 @@ impl Workspace {
                     sharing.changed_files = worktree::changed_files(&dir).unwrap_or(0);
                 }
             }
-            Ok((dir, checkout::sharing_note(&sharing, &prefix, fetches)))
+            let note = if shared {
+                checkout::sharing_note(&sharing, &prefix, fetches)
+            } else {
+                worktree::local_instructions(&project_dir, &dir, agent).map_err(|e| e.to_string())?
+            };
+            let prompt = match note {
+                Some(note) => format!("{note}\n\n{prompt}"),
+                None => prompt,
+            };
+            Ok((dir, prompt))
         });
         cx.spawn(async move |this, cx| {
             let prepared = prepare.await;
-            let _ = this.update(cx, |this, cx| this.launch(id, prompt, prepared, cx));
+            let _ = this.update(cx, |this, cx| this.launch(id, prepared, cx));
         })
         .detach();
     }
@@ -723,15 +734,14 @@ impl Workspace {
     fn launch(
         &mut self,
         id: u64,
-        prompt: String,
-        prepared: Result<(PathBuf, Option<String>), String>,
+        prepared: Result<(PathBuf, String), String>,
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
         let permission_mode = thread.permission_mode;
-        let (dir, note) = match prepared {
+        let (dir, prompt) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.apply(id, AgentEvent::Done { error: Some(error) }, permission_mode);
@@ -739,10 +749,6 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-        };
-        let prompt = match note {
-            Some(note) => format!("{note}\n\n{prompt}"),
-            None => prompt,
         };
         let agent = thread.agent;
         let policy = thread.policy.clone();
