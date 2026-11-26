@@ -1,14 +1,16 @@
 //! The sidebar: the threads of every project in one list, active ones as cards
 //! above the settled ones.
 use crate::assets::{self, Icon};
+use crate::theme::Theme;
 use crate::tooltip::tip;
 use crate::workspace::{agent_icon, Menu, Workspace, TOOLBAR};
 use gpui::{
-    anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
-    Focusable, FontWeight, IntoElement, ListOffset, SharedString, Stateful, Window,
+    anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Animation, AnimationExt,
+    Context, Div, ElementId, Focusable, FontWeight, HighlightStyle, IntoElement, ListOffset,
+    SharedString, Stateful, StyledText, Window,
 };
 use kiln_core::{Checkout, Project, Status, Thread};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
 const ROW: &str = "thread-row";
@@ -197,22 +199,30 @@ impl Workspace {
                 window.focus(&this.input.focus_handle(cx), cx);
             }));
         let age = age(thread.updated_at, now());
+        let status = |color| div().flex().items_center().gap_1().text_xs().text_color(color);
+        let status_icon = |color, icon, label| {
+            status(color).child(assets::icon(icon, 12.)).child(label)
+        };
         let row = if thread.settled {
             base.flex().items_center().gap_2().h(px(30.))
                 .child(self.project_mark(project))
                 .child(div().flex_1().min_w_0().truncate().text_sm().text_color(theme.muted)
                     .child(thread.title.clone()))
-                .child(self.row_end(thread, age, theme.muted, cx))
+                .child(self.row_end(thread, status(theme.muted).child(age), cx))
         } else {
-            let (state, color) = match thread.status {
-                Status::Running if self.has_live_approval(id) => (Some("Approval"), theme.warn),
-                Status::Running => (Some("Working"), theme.accent),
-                Status::NeedsInput => (Some("Failed"), theme.warn),
-                Status::Stopped => (Some("Stopped"), theme.muted),
-                Status::Idle if thread.unread => (Some("Unread"), theme.accent),
-                Status::Idle => (None, theme.muted),
+            let state = match thread.status {
+                Status::Running if self.is_stopping(id) => {
+                    status_icon(theme.muted, Icon::CircleStop, "Stopping…")
+                }
+                Status::Running if self.has_live_approval(id) => {
+                    status_icon(theme.warn, Icon::Hand, "Approval")
+                }
+                Status::Running => status(theme.accent).child(working_label(id, theme)),
+                Status::NeedsInput => status_icon(theme.warn, Icon::CircleAlert, "Failed"),
+                Status::Stopped => status_icon(theme.muted, Icon::CircleStop, "Stopped"),
+                Status::Idle if thread.unread => status_icon(theme.accent, Icon::Check, "Done"),
+                Status::Idle => status(theme.muted).child(age),
             };
-            let state = state.map_or(age, SharedString::from);
             let branch = self.branches.get(thread.checkout.dir(&project.dir)).cloned();
             let branch_icon = match thread.checkout {
                 Checkout::Project => Icon::GitBranch,
@@ -224,7 +234,7 @@ impl Workspace {
                         .child(self.project_mark(project))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).child(project.name.clone()))
-                        .child(self.row_end(thread, state, color, cx)),
+                        .child(self.row_end(thread, state, cx)),
                 )
                 .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text).child(thread.title.clone()))
@@ -247,8 +257,7 @@ impl Workspace {
     fn row_end(
         &self,
         thread: &Thread,
-        label: SharedString,
-        color: gpui::Rgba,
+        label: Div,
         cx: &mut Context<Self>,
     ) -> Div {
         let id = thread.id;
@@ -284,9 +293,7 @@ impl Workspace {
         // Wide enough for both actions, so showing them moves nothing.
         div().relative().flex().flex_shrink_0().items_center().justify_end()
             .min_w(px(40.)).h(px(16.))
-            .child(div().text_xs().text_color(color)
-                .when(has_actions, |d| d.group_hover(ROW, |s| s.invisible()))
-                .child(label))
+            .child(label.when(has_actions, |d| d.group_hover(ROW, |s| s.invisible())))
             .child(actions)
     }
 
@@ -314,6 +321,24 @@ impl Workspace {
             .tooltip(tip(label, theme))
             .child(assets::icon(icon, 14.))
     }
+}
+
+fn working_label(id: u64, theme: Theme) -> impl IntoElement {
+    const LABEL: &str = "Working";
+    const RADIUS: f32 = 3.0;
+    StyledText::new(LABEL).with_animation(
+        ("sidebar-activity", id),
+        Animation::new(Duration::from_millis(2400)).repeat().with_max_fps(20.),
+        move |text, phase| {
+            // Move the highlight fully past both ends so the loop joins at the base color.
+            let center = phase * (LABEL.len() as f32 - 1. + 2. * RADIUS) - RADIUS;
+            text.with_highlights((0..LABEL.len()).map(|index| {
+                let weight = (1. - (index as f32 - center).abs() / RADIUS).max(0.);
+                let color = theme.accent.blend(theme.text.opacity(0.5 * weight * weight));
+                (index..index + 1, HighlightStyle { color: Some(color.into()), ..Default::default() })
+            }))
+        },
+    )
 }
 
 /// A project's initials on a color that stays the same for its name.

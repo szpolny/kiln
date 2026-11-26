@@ -1386,6 +1386,10 @@ impl Workspace {
         })
     }
 
+    pub(crate) fn is_stopping(&self, id: u64) -> bool {
+        self.turns.get(&id).is_some_and(|turn| turn.process.stop_requested())
+    }
+
     fn decide(
         &mut self,
         id: u64,
@@ -2202,7 +2206,7 @@ impl Workspace {
             }).clone()
         });
         let root = self.checkout_dir(id).map(Path::to_path_buf);
-        let stopping = self.turns.get(&id).is_some_and(|turn| turn.process.stop_requested());
+        let stopping = self.is_stopping(id);
         let waiting = self.has_live_approval(id);
         let (label, color) = if stopping {
             ("Stopping…", theme.muted)
