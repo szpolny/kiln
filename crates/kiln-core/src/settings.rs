@@ -27,6 +27,34 @@ pub enum Fetch {
     Never,
 }
 
+/// What a message typed while a turn runs does by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowUp {
+    /// Send it to the running turn as guidance.
+    Steer,
+    /// Keep it for after the turn.
+    #[default]
+    Queue,
+}
+
+impl FollowUp {
+    /// The option the default does not pick.
+    pub fn other(self) -> Self {
+        match self {
+            FollowUp::Steer => FollowUp::Queue,
+            FollowUp::Queue => FollowUp::Steer,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FollowUp::Steer => "Steer",
+            FollowUp::Queue => "Queue",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -39,6 +67,8 @@ pub struct Settings {
     pub branch_prefix: BranchPrefix,
     /// Fetching before a new worktree is made.
     pub fetch: Fetch,
+    /// What Enter does with a message typed while a turn runs.
+    pub follow_up: FollowUp,
 }
 
 impl Default for Settings {
@@ -49,6 +79,7 @@ impl Default for Settings {
             web: Policy::default().network,
             branch_prefix: BranchPrefix::default(),
             fetch: Fetch::default(),
+            follow_up: FollowUp::default(),
         }
     }
 }
@@ -65,6 +96,8 @@ mod tests {
         assert_eq!(s.web, Decision::Ask);
         assert_eq!(s.branch_prefix.resolve(None), "kiln");
         assert_eq!(s.fetch, Fetch::Ask);
+        assert_eq!(s.follow_up, FollowUp::Queue);
+        assert_eq!(FollowUp::Queue.other(), FollowUp::Steer);
     }
 
     #[test]

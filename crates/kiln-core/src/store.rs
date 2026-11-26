@@ -249,6 +249,13 @@ pub struct Thread {
     /// and recaps the conversation to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handoff: bool,
+    /// Follow-ups saved during a turn, sent in order once a turn ends well.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<String>,
+    /// A turn ended while the thread was out of view, and its result has not
+    /// been seen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
 }
 
 fn is_project_checkout(checkout: &Checkout) -> bool {
@@ -274,6 +281,8 @@ impl Thread {
             draft: String::new(),
             checkout: Checkout::Project,
             handoff: false,
+            queue: vec![],
+            unread: false,
         }
     }
 
@@ -335,6 +344,22 @@ impl Thread {
             let ms = u64::try_from(ran.as_millis()).unwrap_or(u64::MAX);
             m.worked_ms = m.worked_ms.saturating_add(ms);
         }
+    }
+
+    /// Save a follow-up for after the running turn. Blank text is ignored.
+    pub fn enqueue(&mut self, body: &str) -> bool {
+        let body = body.trim();
+        if body.is_empty() {
+            return false;
+        }
+        self.queue.push(body.to_owned());
+        true
+    }
+
+    /// Take the next queued follow-up, but only when the last turn ended well.
+    /// A failed, stopped, or still running turn keeps the queue for the user.
+    pub fn next_queued(&mut self) -> Option<String> {
+        (self.status == Status::Idle && !self.queue.is_empty()).then(|| self.queue.remove(0))
     }
 
     /// End a turn the user stopped.
@@ -630,6 +655,35 @@ mod tests {
         assert_eq!(t.resume_prompt().as_deref(), Some("go"));
         assert!(t.settle());
         assert_eq!(t.resume_prompt(), None);
+    }
+
+    #[test]
+    fn queued_follow_ups_go_out_only_after_a_good_turn() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        assert!(!t.enqueue("  "));
+        assert!(t.enqueue(" first "));
+        assert!(t.enqueue("second"));
+        t.status = Status::Running;
+        assert_eq!(t.next_queued(), None);
+        for status in [Status::NeedsInput, Status::Stopped] {
+            t.status = status;
+            assert_eq!(t.next_queued(), None);
+        }
+        assert_eq!(t.queue, ["first", "second"]);
+        t.status = Status::Idle;
+        assert_eq!(t.next_queued().as_deref(), Some("first"));
+        assert_eq!(t.queue, ["second"]);
+    }
+
+    #[test]
+    fn queue_and_unread_are_saved_only_when_set() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        let plain = serde_json::to_value(&t).unwrap();
+        assert!(plain.get("queue").is_none() && plain.get("unread").is_none());
+        t.enqueue("later");
+        t.unread = true;
+        let back: Thread = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!((back.queue, back.unread), (vec!["later".to_string()], true));
     }
 
     #[test]

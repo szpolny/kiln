@@ -76,6 +76,14 @@ impl Client {
         }
     }
 
+    /// Send guidance to the running turn. Both providers fold it into the turn.
+    pub fn steer(&self, text: &str) -> io::Result<()> {
+        match self {
+            Client::Claude(client) => client.steer(text),
+            Client::Codex(client) => client.steer(text),
+        }
+    }
+
     /// Ask the agent to stop through its protocol, then end the process.
     pub fn stop(&self, process: &Process) {
         match self {

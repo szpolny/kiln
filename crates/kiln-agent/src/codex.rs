@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command};
 use std::sync::{Arc, Mutex};
 
+/// Request id of `turn/steer`; a refusal must not end the turn.
+const STEER_ID: u64 = 5;
+
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
@@ -46,6 +49,20 @@ struct Connection {
 impl Client {
     pub fn respond(&self, request: &ApprovalRequest, allow: bool) -> io::Result<()> {
         self.send(response(request, allow))
+    }
+
+    /// Add guidance to the turn in progress.
+    pub fn steer(&self, text: &str) -> io::Result<()> {
+        let mut connection = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (thread, turn) = connection
+            .turn
+            .clone()
+            .ok_or_else(|| io::Error::other("Codex turn has not started"))?;
+        connection.send(json!({ "id": STEER_ID, "method": "turn/steer", "params": {
+            "threadId": thread,
+            "input": [{ "type": "text", "text": text, "text_elements": [] }],
+            "expectedTurnId": turn,
+        }}))
     }
 
     pub fn stop(&self, process: &Process) {
@@ -240,6 +257,11 @@ fn drive(
             if let Some(event) = notification(method, params) {
                 emit(event)?;
             }
+            continue;
+        }
+        if let (Some(STEER_ID), Some(error)) = (message["id"].as_u64(), message.get("error")) {
+            let why = error["message"].as_str().unwrap_or("the turn did not accept it");
+            emit(AgentEvent::Notice(format!("Could not steer: {why}")))?;
             continue;
         }
         if let Some(error) = message.get("error") {
@@ -734,6 +756,28 @@ mod tests {
             AgentEvent::Done { error: None }
         );
         assert!(events.recv_blocking().is_err());
+    }
+
+    #[test]
+    fn steering_adds_guidance_to_the_running_turn_and_survives_a_refusal() {
+        let (_, client, events) = fixture(
+            r#"
+            echo '{"method":"item/completed","params":{"threadId":"session","item":{"type":"agentMessage","text":"working"}}}'
+            IFS= read -r line
+            case "$line" in *'"method":"turn/steer"'*) ;; *) exit 1 ;; esac
+            case "$line" in *'"expectedTurnId":"turn"'*) ;; *) exit 1 ;; esac
+            case "$line" in *'"text":"use tabs"'*) ;; *) exit 1 ;; esac
+            echo '{"id":5,"error":{"message":"turn is not steerable"}}'
+            echo '{"method":"turn/completed","params":{"threadId":"session","turn":{"status":"completed"}}}'
+        "#,
+        );
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("working".into()));
+        client.steer("use tabs").unwrap();
+        assert_eq!(
+            events.recv_blocking().unwrap(),
+            AgentEvent::Notice("Could not steer: turn is not steerable".into())
+        );
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
     }
 
     #[test]

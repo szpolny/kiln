@@ -7,10 +7,11 @@ use crate::shell;
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
+use crate::tooltip::tip;
 use crate::transcript::{self, Entry};
 use chrono::{Local, TimeZone};
 use gpui::{
-    anchored, canvas, deferred, div, fill, img, list, point, prelude::*, px, relative, rgb, size,
+    anchored, ClickEvent, canvas, deferred, div, fill, img, list, point, prelude::*, px, relative, rgb, size,
     svg, Anchor, AnchoredPositionMode, Animation, AnimationExt, Bounds, Context, DispatchPhase,
     Entity, FocusHandle, Focusable, FontWeight, HitboxBehavior, IntoElement, KeyDownEvent,
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -24,7 +25,7 @@ use kiln_core::checkout::{self, Checkout, MoveRequest, Sharing, DEFAULT_COMMIT_T
 use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::{
-    Fetch, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Fetch, FollowUp, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -178,7 +179,8 @@ impl Workspace {
         let theme = Theme::new(window.appearance(), store.settings.appearance, font);
         let input = cx.new(|cx| TextInput::new("Ask the agent to do something", window, cx));
         cx.subscribe(&input, |this, _, ev, cx| match ev {
-            InputEvent::Submit => this.submit(cx),
+            InputEvent::Submit => this.submit(false, cx),
+            InputEvent::SubmitAlternate => this.submit(true, cx),
             InputEvent::Changed => this.keep_draft(cx),
         })
         .detach();
@@ -193,6 +195,7 @@ impl Workspace {
             cx.new(|cx| TextInput::new("Type a command or a thread", window, cx));
         cx.subscribe_in(&palette_input, window, |this, _, ev, window, cx| match ev {
             InputEvent::Submit => this.pick_selected(window, cx),
+            InputEvent::SubmitAlternate => {}
             InputEvent::Changed => this.palette_changed(cx),
         })
         .detach();
@@ -398,6 +401,9 @@ impl Workspace {
         });
         let switched = self.selected != id;
         self.selected = id;
+        if let Some(thread) = id.and_then(|id| self.store.thread_mut(id)) {
+            thread.unread = false;
+        }
         if let Some(old) = left {
             self.discard(old);
         }
@@ -515,28 +521,125 @@ impl Workspace {
         }
     }
 
-    fn submit(&mut self, cx: &mut Context<Self>) {
-        let body = self.input.read(cx).text().trim().to_string();
+    /// Send the composer's text: as a new turn when the thread is free. While
+    /// a turn runs it steers or queues, as chosen in the settings; `alternate`
+    /// picks the other one.
+    fn submit(&mut self, alternate: bool, cx: &mut Context<Self>) {
         let Some(id) = self.selected else { return };
+        let Some(thread) = self.store.thread(id) else { return };
+        if thread.status == Status::Running {
+            match self.store.settings.follow_up {
+                mode if alternate == (mode == FollowUp::Queue) => self.steer(cx),
+                _ => self.queue(cx),
+            }
+            return;
+        }
+        let body = self.input.read(cx).text().trim().to_string();
         if body.is_empty() {
             return;
         }
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.draft.clear();
+        }
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.send(id, body, cx);
+    }
+
+    /// Keep the composer's text for after the running turn.
+    fn queue(&mut self, cx: &mut Context<Self>) {
+        let body = self.input.read(cx).text().trim().to_string();
+        let Some(id) = self.selected else { return };
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if thread.status == Status::Running && thread.enqueue(&body) {
+            thread.draft.clear();
+            self.input.update(cx, |input, cx| input.clear(cx));
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// Add `body` to the conversation as the user's message and run a turn for it.
+    fn send(&mut self, id: u64, body: String, cx: &mut Context<Self>) {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
-        if thread.status == Status::Running {
-            return; // one turn at a time per thread
-        }
         if thread.title == NEW_THREAD_TITLE {
             thread.title = body.chars().take(40).collect();
         }
         thread.messages.push(Message::user(body.clone()));
-        thread.draft.clear();
         thread.touch(now());
-        self.input.update(cx, |input, cx| input.clear(cx));
         self.transcript_thread = None; // show what was just sent
         self.save();
         self.start_turn(id, body, cx);
+    }
+
+    /// Send guidance to the turn that is running.
+    fn steer(&mut self, cx: &mut Context<Self>) {
+        let body = self.input.read(cx).text().trim().to_string();
+        let Some(id) = self.selected else { return };
+        let Some(thread) = self.store.thread(id) else { return };
+        if body.is_empty() || thread.status != Status::Running {
+            return;
+        }
+        let sent = match self.turns.get(&id).filter(|turn| !turn.process.stop_requested()) {
+            Some(turn) => turn.client.steer(&body),
+            None => Err(std::io::Error::other("the turn is ending")),
+        };
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        thread.draft.clear();
+        self.input.update(cx, |input, cx| input.clear(cx));
+        match sent {
+            Ok(()) => thread.messages.push(Message::user(body).at(now())),
+            // Too late to steer, so the message goes out after the turn instead.
+            Err(_) => {
+                thread.enqueue(&body);
+            }
+        }
+        self.transcript_thread = None;
+        self.save();
+        cx.notify();
+    }
+
+    /// Start the oldest queued follow-up if the last turn ended well.
+    fn send_queued(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(body) = self.store.thread_mut(id).and_then(Thread::next_queued) else {
+            return false;
+        };
+        self.send(id, body, cx);
+        true
+    }
+
+    /// Put a queued follow-up back in the composer to be changed.
+    fn edit_queued(&mut self, id: u64, i: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if i >= thread.queue.len() {
+            return;
+        }
+        let queued = thread.queue.remove(i);
+        let draft = self.input.read(cx).text();
+        let text = if draft.trim().is_empty() { queued } else { format!("{queued}\n\n{draft}") };
+        self.input.update(cx, |input, cx| input.set_text(&text, cx));
+        self.save();
+        cx.notify();
+    }
+
+    fn remove_queued(&mut self, id: u64, i: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if i < thread.queue.len() {
+            thread.queue.remove(i);
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// Start the first queued follow-up of a thread whose last turn did not
+    /// end well, once the user chooses to go on.
+    fn resume_queue(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if thread.status != Status::Running && !thread.queue.is_empty() {
+            let body = thread.queue.remove(0);
+            self.send(id, body, cx);
+        }
     }
 
     fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -676,6 +779,12 @@ impl Workspace {
                     if let Some(request) = move_request {
                         let fetch = this.store.settings.fetch == Fetch::Always;
                         this.move_to_worktree(id, Some(request), fetch, cx);
+                    } else if done && !this.send_queued(id, cx) && this.selected != Some(id) {
+                        // The result waits for the user in a thread out of view.
+                        if let Some(thread) = this.store.thread_mut(id) {
+                            thread.unread = true;
+                            this.save();
+                        }
                     }
                     cx.notify();
                 });
@@ -1620,7 +1729,7 @@ impl Workspace {
         let ready = !self.input.read(cx).text().trim().is_empty();
         self.round_button("send", ready)
             .child("↑")
-            .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
+            .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx)))
     }
 
     /// Takes the send button's place while a turn runs.
@@ -1633,6 +1742,51 @@ impl Workspace {
                 // The click took focus; hand it back for the next message.
                 window.focus(&this.input.focus_handle(cx), cx);
             }))
+    }
+
+    /// The follow-ups waiting for the thread's turn to end.
+    fn queue_panel(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let id = thread.id;
+        let running = thread.status == Status::Running;
+        let mut col = div().flex().flex_col().flex_shrink_0().gap_1().px_6();
+        if thread.queue.is_empty() {
+            return col;
+        }
+        let heading = if running {
+            "Queued — sent when this turn ends"
+        } else {
+            "Queued — not sent because the last turn did not finish"
+        };
+        let mut panel = div().flex().flex_col().gap_1().w_full().p_2().rounded(px(12.))
+            .bg(theme.card).border_1().border_color(theme.border)
+            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
+                .child(heading));
+        for (i, body) in thread.queue.iter().enumerate() {
+            let button = |id: (&'static str, usize), mark: assets::Icon, label: &'static str| {
+                div().id(id).flex().flex_shrink_0().items_center().justify_center().size(px(22.))
+                    .rounded_md().text_color(theme.muted).cursor_pointer()
+                    .hover(|h| h.bg(theme.hover).text_color(theme.text))
+                    .tooltip(tip(label, theme))
+                    .child(assets::icon(mark, 14.))
+            };
+            panel = panel.child(
+                div().flex().items_center().gap_1().child(
+                    div().flex_1().min_w_0().truncate().text_sm().text_color(theme.text)
+                        .child(body.lines().next().unwrap_or_default().to_string()),
+                )
+                .when(!running && i == 0, |d| {
+                    d.child(button(("queued-send", i), assets::Icon::ArrowUp, "Send now")
+                        .on_click(cx.listener(move |this, _, _, cx| this.resume_queue(id, cx))))
+                })
+                .child(button(("queued-edit", i), assets::Icon::Pencil, "Edit")
+                    .on_click(cx.listener(move |this, _, _, cx| this.edit_queued(id, i, cx))))
+                .child(button(("queued-remove", i), assets::Icon::X, "Remove")
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_queued(id, i, cx)))),
+            );
+        }
+        col = col.child(centered(panel).flex_shrink_0());
+        col
     }
 
     fn resume_button(&self, id: u64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -1678,13 +1832,31 @@ impl Workspace {
         let running = thread.status == Status::Running;
         let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
         let stopped = thread.status == Status::Stopped;
-        let has_draft = stopped && !self.input.read(cx).text().trim().is_empty();
-        let button = if running {
-            self.stop_button(thread.id, !stopping, cx)
+        let typed = !self.input.read(cx).text().trim().is_empty();
+        let has_draft = stopped && typed;
+        let mode = self.store.settings.follow_up;
+        let button = if running && typed && !stopping {
+            let mark = match mode {
+                FollowUp::Steer => assets::Icon::CornerDownRight,
+                FollowUp::Queue => assets::Icon::ListEnd,
+            };
+            let hint = match mode {
+                FollowUp::Steer => "Steer the running turn (Enter) · Ctrl+Enter to queue instead",
+                FollowUp::Queue => "Queue for after this turn (Enter) · Ctrl+Enter to steer instead",
+            };
+            self.round_button("follow-up", true)
+                .child(assets::icon(mark, 14.))
+                .tooltip(tip(hint, theme))
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    this.submit(ev.modifiers().control, cx);
+                }))
+                .into_any_element()
+        } else if running {
+            self.stop_button(thread.id, !stopping, cx).into_any_element()
         } else if stopped {
-            self.resume_button(thread.id, cx)
+            self.resume_button(thread.id, cx).into_any_element()
         } else {
-            self.send_button(cx)
+            self.send_button(cx).into_any_element()
         };
         centered(
             div().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
@@ -1747,6 +1919,7 @@ impl Workspace {
             .child(self.toolbar(thread, window, cx))
             .child(messages)
             .child(self.approval_cards(id, cx))
+            .child(self.queue_panel(thread, cx))
             .child(self.composer(thread, window, cx))
             .into_any_element()
     }

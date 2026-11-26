@@ -8,7 +8,7 @@ pub mod settings;
 pub mod store;
 
 pub use checkout::Checkout;
-pub use settings::{Appearance, Fetch, Settings};
+pub use settings::{Appearance, Fetch, FollowUp, Settings};
 pub use store::{
     Agent, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };

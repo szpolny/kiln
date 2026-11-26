@@ -5,7 +5,7 @@ use gpui::{
     actions, div, prelude::*, px, relative, rgba, App, Context, Div, FocusHandle, Focusable,
     FontWeight, KeyBinding, KeyDownEvent, Window,
 };
-use kiln_core::{checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, Settings};
+use kiln_core::{checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, FollowUp, Settings};
 use std::time::Duration;
 
 /// How long typing pauses before a typed setting is written to disk.
@@ -177,6 +177,18 @@ impl Workspace {
             Fetch::Never => "New worktrees start from what was fetched before.",
         }));
 
+        let follow_up = self.setting_choices(
+            "While an agent works, Enter",
+            settings.follow_up,
+            [(FollowUp::Queue, "Queues"), (FollowUp::Steer, "Steers")],
+            |s, value| s.follow_up = value,
+            cx,
+        )
+        .child(div().text_xs().text_color(theme.muted).child(match settings.follow_up {
+            FollowUp::Queue => "Enter saves the message for after the turn; Ctrl+Enter steers.",
+            FollowUp::Steer => "Enter sends the message to the running turn; Ctrl+Enter queues it.",
+        }));
+
         Some(
             div()
                 .absolute()
@@ -288,7 +300,8 @@ impl Workspace {
                                         .border_t_1()
                                         .border_color(theme.border)
                                         .child(prefix)
-                                        .child(fetch),
+                                        .child(fetch)
+                                        .child(follow_up),
                                 ),
                         ),
                 ),

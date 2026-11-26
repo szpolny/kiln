@@ -129,6 +129,10 @@ fn target(tool: &str, input: &Value) -> Option<PathBuf> {
     }
 }
 
+fn user_message(text: &str) -> Value {
+    json!({ "type": "user", "message": { "role": "user", "content": text } })
+}
+
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
@@ -149,6 +153,12 @@ pub struct Client(Arc<Mutex<Option<ChildStdin>>>);
 impl Client {
     pub fn respond(&self, request: &ApprovalRequest, allow: bool) -> io::Result<()> {
         self.answer(request, allow, DENIED)
+    }
+
+    /// Add guidance to the turn in progress; Claude folds a message sent
+    /// mid-turn into the same turn and answers with one result.
+    pub fn steer(&self, text: &str) -> io::Result<()> {
+        self.send(user_message(text))
     }
 
     pub fn stop(&self, process: &Process) {
@@ -246,7 +256,7 @@ fn drive(
     turn: &Turn,
 ) -> io::Result<()> {
     let emit = |event| events.send_blocking(event).map_err(io::Error::other);
-    wire.send(json!({ "type": "user", "message": { "role": "user", "content": turn.prompt } }))?;
+    wire.send(user_message(&turn.prompt))?;
     // Tool calls Claude asked about; it lists them again among its denials.
     let mut asked = HashSet::new();
     for line in output.lines() {
@@ -464,6 +474,24 @@ mod tests {
         }
         // The denial the user made is not reported again.
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("done".into()));
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
+        assert!(events.recv_blocking().is_err());
+    }
+
+    #[test]
+    fn steering_sends_another_user_message_into_the_same_turn() {
+        let (_, client, events) = fixture(
+            r#"
+            echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
+            IFS= read -r line
+            has '"type":"user"' '"content":"use tabs"'
+            echo '{"type":"result","is_error":false}'
+            if IFS= read -r line; then exit 1; fi
+        "#,
+            turn(PermissionMode::Manual),
+        );
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("working".into()));
+        client.steer("use tabs").unwrap();
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
         assert!(events.recv_blocking().is_err());
     }

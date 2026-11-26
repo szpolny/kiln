@@ -46,6 +46,7 @@ actions!(
         Paste,
         Newline,
         Submit,
+        SubmitAlternate,
     ]
 );
 
@@ -79,6 +80,7 @@ fn key_bindings(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("shift-home", SelectHome, c),
         KeyBinding::new("shift-end", SelectEnd, c),
         KeyBinding::new("enter", Submit, c),
+        KeyBinding::new("ctrl-enter", SubmitAlternate, c),
         KeyBinding::new("shift-enter", Newline, c),
     ];
     if mac {
@@ -134,6 +136,8 @@ pub enum InputEvent {
     Changed,
     /// Enter was pressed.
     Submit,
+    /// Ctrl+Enter was pressed.
+    SubmitAlternate,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -457,6 +461,9 @@ impl TextInput {
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(InputEvent::Submit);
     }
+    fn submit_alternate(&mut self, _: &SubmitAlternate, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::SubmitAlternate);
+    }
 }
 
 impl EntityInputHandler for TextInput {
@@ -605,6 +612,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::submit_alternate))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .child(TextElement { input: cx.entity() })
     }

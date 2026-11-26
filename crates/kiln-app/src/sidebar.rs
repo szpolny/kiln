@@ -168,6 +168,7 @@ impl Workspace {
                 Status::Running => (Some("Working"), theme.accent),
                 Status::NeedsInput => (Some("Failed"), theme.warn),
                 Status::Stopped => (Some("Stopped"), theme.muted),
+                Status::Idle if thread.unread => (Some("Unread"), theme.accent),
                 Status::Idle => (None, theme.muted),
             };
             let state = state.map_or(age, SharedString::from);
