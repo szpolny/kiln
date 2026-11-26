@@ -42,6 +42,15 @@ fn parse_line(line: &str) -> Vec<AgentEvent> {
                 out.push(AgentEvent::PermissionMode(mode));
             }
         }
+        // Partial text of the main agent's message; a subagent's would interleave.
+        Some("stream_event") if v["parent_tool_use_id"].is_null() => {
+            let event = &v["event"];
+            if event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta" {
+                if let Some(t) = event["delta"]["text"].as_str() {
+                    out.push(AgentEvent::TextDelta(t.to_string()));
+                }
+            }
+        }
         Some("assistant") => {
             for block in v["message"]["content"].as_array().into_iter().flatten() {
                 match block["type"].as_str() {
@@ -221,6 +230,7 @@ fn command(turn: &Turn) -> Command {
     let mut cmd = Command::new("claude");
     cmd.current_dir(&turn.dir)
         .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
+        .arg("--include-partial-messages")
         .args(["--permission-mode", mode])
         // Privacy: no telemetry or non-essential traffic from the child.
         .env("DISABLE_TELEMETRY", "1")
@@ -403,6 +413,18 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn streams_only_the_main_agents_text() {
+        let delta = |parent: &str, kind: &str| {
+            parse_line(&format!(
+                r#"{{"type":"stream_event","parent_tool_use_id":{parent},"event":{{"type":"content_block_delta","index":0,"delta":{{"type":"{kind}","text":"he","partial_json":"{{"}}}}}}"#
+            ))
+        };
+        assert_eq!(delta("null", "text_delta"), vec![AgentEvent::TextDelta("he".into())]);
+        assert!(delta(r#""toolu_1""#, "text_delta").is_empty());
+        assert!(delta("null", "input_json_delta").is_empty());
     }
 
     #[test]
@@ -652,9 +674,14 @@ mod live {
     #[test]
     #[ignore]
     fn live_turn_streams_session_text_and_done() {
-        let events = answer_all(turn(&std::env::temp_dir(), "reply with the single word: ok", None), false);
+        let prompt = "reply with the words one to ten, one per line, and no tools";
+        let events = answer_all(turn(&std::env::temp_dir(), prompt, None), false);
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Session(_))));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Text(_))));
+        let streamed: String = events.iter()
+            .filter_map(|e| match e { AgentEvent::TextDelta(t) => Some(t.as_str()), _ => None })
+            .collect();
+        let text = events.iter().find_map(|e| match e { AgentEvent::Text(t) => Some(t), _ => None });
+        assert_eq!(Some(&streamed), text, "the deltas spell out the whole message");
         assert_eq!(events.last(), Some(&AgentEvent::Done { error: None }));
     }
 }

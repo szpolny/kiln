@@ -2,6 +2,8 @@
 //! on the way there is folded under one "Worked" row.
 
 use chrono::{DateTime, Datelike, TimeZone};
+use kiln_core::checkout::MOVE_REQUEST;
+use kiln_core::title::TITLE_REQUEST;
 use kiln_core::{Message, Role};
 use std::fmt::Display;
 
@@ -109,6 +111,23 @@ fn reply(turn: &[Message]) -> Option<(usize, usize)> {
     Some((first, last))
 }
 
+/// How many bytes of a message still being written to show: up to its last
+/// whole word, and only whole lines once a line may be one Kiln takes out:
+/// a request to move the thread, or its title.
+pub fn stream_shown(text: &str) -> usize {
+    let words = text
+        .char_indices()
+        .rfind(|(_, c)| c.is_whitespace())
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let line = text[..words].rfind('\n').map_or(0, |at| at + 1);
+    let current = text[line..].trim_start();
+    if [MOVE_REQUEST, TITLE_REQUEST].iter().any(|kiln| current.starts_with(kiln)) {
+        line
+    } else {
+        words
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Entry::{Activity, Message as M};
@@ -117,6 +136,20 @@ mod tests {
 
     fn work(start: usize, reply: usize) -> Entry {
         Entry::Work { start, reply }
+    }
+
+    #[test]
+    fn a_stream_shows_whole_words_and_holds_back_a_move_request() {
+        fn shown(text: &str) -> &str {
+            &text[..stream_shown(text)]
+        }
+        assert_eq!(shown("Hel"), "");
+        assert_eq!(shown("Hello wor"), "Hello ");
+        assert_eq!(shown("- one\n- tw"), "- one\n- ");
+        assert_eq!(shown("a\u{a0}b"), "a\u{a0}");
+        assert_eq!(shown("Done.\nKILN_MOVE_TO_WORKTREE {\"name\": "), "Done.\n");
+        assert_eq!(shown("Done.\nKILN_MOVE_TO_WORKTREE {}\nok "), "Done.\nKILN_MOVE_TO_WORKTREE {}\nok ");
+        assert_eq!(shown("KILN_THREAD_TITLE Fix the lo"), "");
     }
 
     #[test]

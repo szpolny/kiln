@@ -18,7 +18,10 @@ pub enum AgentEvent {
     Model(String),
     /// The permission mode the provider reports at startup.
     PermissionMode(kiln_core::policy::PermissionMode),
+    /// A finished message of the agent's reply.
     Text(String),
+    /// Text of the message being written, ahead of its `Text`, which repeats it whole.
+    TextDelta(String),
     /// A tool call: the provider's tool name and what it was called with.
     Tool {
         name: String,

@@ -57,6 +57,18 @@ struct RunningTurn {
     approvals: Vec<ApprovalRequest>,
     /// The agent asked to move the thread to a worktree; the turn is stopped.
     move_request: Option<MoveRequest>,
+    /// The message the agent is writing.
+    stream: Stream,
+}
+
+/// A message arriving in pieces, shown a finished word at a time.
+#[derive(Default)]
+struct Stream {
+    text: String,
+    /// How much of `text` is shown; see [`transcript::stream_shown`].
+    shown: usize,
+    /// The shown text parsed, made when next drawn.
+    blocks: Option<Rc<[markdown::Block]>>,
 }
 
 impl RunningTurn {
@@ -753,11 +765,13 @@ impl Workspace {
         };
         self.turns.insert(id, RunningTurn {
             process, client, started: Instant::now(), approvals: Vec::new(), move_request: None,
+            stream: Stream::default(),
         });
 
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 let done = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Stopped);
+                let delta = matches!(ev, AgentEvent::TextDelta(_));
                 let _ = this.update(cx, |this, cx| {
                     let mut ev = ev;
                     let mut move_request = None;
@@ -765,6 +779,11 @@ impl Workspace {
                         let turn = this.turns.remove(&id);
                         if let (Some(turn), Some(thread)) = (turn, this.store.thread_mut(id)) {
                             thread.record_work(turn.started.elapsed());
+                            // A reply cut short by a stop or a failure keeps what was written.
+                            let partial = shown_reply(&turn.stream.text, &thread.checkout);
+                            if !partial.is_empty() {
+                                thread.messages.push(Message::agent(partial).at(now()));
+                            }
                             // Kiln stopped the turn to move it; a failed turn stays.
                             let ended = matches!(ev, AgentEvent::Stopped | AgentEvent::Done { error: None });
                             if let (true, Some(request)) = (ended, turn.move_request) {
@@ -773,7 +792,13 @@ impl Workspace {
                             }
                         }
                     }
+                    let shown = |this: &Self| this.turns.get(&id).map(|turn| turn.stream.shown);
+                    let before = shown(this);
                     this.apply(id, ev, permission_mode);
+                    // Text within an unfinished word changes nothing on screen.
+                    if delta && shown(this) == before {
+                        return;
+                    }
                     if done {
                         this.save();
                         // The turn may have switched branches.
@@ -997,6 +1022,22 @@ impl Workspace {
                 if !text.is_empty() {
                     thread.messages.push(Message::agent(text).at(now()));
                 }
+                // The whole message replaces what streamed of it.
+                if let Some(turn) = self.turns.get_mut(&id) {
+                    turn.stream = Stream::default();
+                }
+                self.remeasure_activity(id);
+            }
+            AgentEvent::TextDelta(delta) => {
+                let Some(turn) = self.turns.get_mut(&id) else { return };
+                let stream = &mut turn.stream;
+                stream.text.push_str(&delta);
+                let shown = transcript::stream_shown(&stream.text);
+                if shown != stream.shown {
+                    stream.shown = shown;
+                    stream.blocks = None;
+                    self.remeasure_activity(id);
+                }
             }
             AgentEvent::Tool { name, input, command_bytes } => {
                 let mut message = Message::tool_call(name, input);
@@ -1027,6 +1068,14 @@ impl Workspace {
                 thread.touch(now());
                 thread.stop_turn();
             }
+        }
+    }
+
+    /// Have the list measure the live row of thread `id` again, as its height changed.
+    fn remeasure_activity(&mut self, id: u64) {
+        if self.transcript_thread == Some(id) && self.entries.last() == Some(&Entry::Activity) {
+            let row = self.entries.len() - 1;
+            self.transcript.remeasure_items(row..row + 1);
         }
     }
 
@@ -1807,8 +1856,17 @@ impl Workspace {
             }))
     }
 
-    fn turn_activity(&self, id: u64) -> impl IntoElement {
+    fn turn_activity(&mut self, id: u64) -> impl IntoElement {
         let theme = self.theme;
+        // The streamed reply takes the index its whole message will have.
+        let (key, checkout) = self.store.thread(id)
+            .map_or((0, Checkout::Project), |t| (t.messages.len(), t.checkout.clone()));
+        let streamed = self.turns.get_mut(&id).filter(|turn| turn.stream.shown > 0).map(|turn| {
+            let stream = &mut turn.stream;
+            stream.blocks.get_or_insert_with(|| {
+                markdown::parse(&shown_reply(&stream.text[..stream.shown], &checkout)).into()
+            }).clone()
+        });
         let stopping = self.turns.get(&id).is_some_and(|turn| turn.process.stop_requested());
         let waiting = self.has_live_approval(id);
         let (label, color) = if stopping {
@@ -1828,10 +1886,17 @@ impl Workspace {
                 |dot, phase| dot.opacity(1. - 1.2 * phase.min(1. - phase)),
             ).into_any_element()
         };
-        centered(div().flex().items_center().gap_2().text_xs().text_color(theme.muted)
+        let status = centered(div().flex().items_center().gap_2().text_xs().text_color(theme.muted)
             .child(dot)
             .child(label))
-            .px_6().py_1p5()
+            .px_6().py_1p5();
+        div().flex().flex_col().w_full()
+            .when_some(streamed, |d, blocks| {
+                d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
+                    .child(markdown::render(&blocks, theme, key)))
+                    .px_6().py_1p5())
+            })
+            .child(status)
     }
 
     fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1950,6 +2015,16 @@ pub(crate) fn permission_label(mode: PermissionMode) -> &'static str {
         PermissionMode::Manual => "Manual",
         PermissionMode::Auto => "Auto",
         PermissionMode::FullAccess => "Full access",
+    }
+}
+
+/// Agent text as the thread shows it: never the title line, and in the
+/// project checkout never the line that asks to move the thread.
+fn shown_reply(text: &str, place: &Checkout) -> String {
+    let text = title::take_title(text).0;
+    match place {
+        Checkout::Project => checkout::take_move_request(&text).0,
+        Checkout::Worktree { .. } => text,
     }
 }
 

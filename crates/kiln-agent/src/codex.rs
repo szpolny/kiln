@@ -344,6 +344,9 @@ fn notification(method: &str, params: &Value) -> Option<AgentEvent> {
     let item = &params["item"];
     let kind = item["type"].as_str();
     let (name, input) = match (method, kind) {
+        ("item/agentMessage/delta", _) => {
+            return Some(AgentEvent::TextDelta(params["delta"].as_str()?.to_string()));
+        }
         ("item/completed", Some("agentMessage")) => {
             return Some(AgentEvent::Text(item["text"].as_str()?.to_string()));
         }
@@ -573,7 +576,7 @@ mod tests {
         );
         assert_eq!(
             notification("item/agentMessage/delta", &json!({"delta":"h"})),
-            None
+            Some(AgentEvent::TextDelta("h".into()))
         );
         assert!(turn_result(&json!({ "status": "completed" })).is_ok());
         let error = json!({ "status": "failed", "error": { "message": "sign in" } });
@@ -830,6 +833,7 @@ mod tests {
             .unwrap();
             let mut approved = false;
             let mut replied = false;
+            let mut streamed = String::new();
             while let Ok(event) = events.recv_blocking() {
                 match event {
                     AgentEvent::Session(id) => {
@@ -846,7 +850,11 @@ mod tests {
                         client.respond(&request, allow).unwrap();
                         approved |= allow;
                     }
-                    AgentEvent::Text(text) => replied |= text.contains("DONE"),
+                    AgentEvent::TextDelta(delta) => streamed.push_str(&delta),
+                    AgentEvent::Text(text) => {
+                        assert_eq!(std::mem::take(&mut streamed), text, "the deltas spell out the message");
+                        replied |= text.contains("DONE");
+                    }
                     AgentEvent::Done { error } => assert_eq!(error, None),
                     _ => {}
                 }
