@@ -29,13 +29,6 @@ Then build and launch:
 cargo run -p kiln-app
 ```
 
-### Local instructions in worktrees
-
-Kiln checks the project checkout for the selected agent's Git-ignored local
-instruction file when a worktree has no override of its own. It reads the file
-on each turn and passes the text to the agent as context. This works with
-existing worktrees and requires no files to be copied into them.
-
 ## Development
 
 | Crate | Contents |
