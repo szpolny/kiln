@@ -42,3 +42,7 @@ Run `cargo clippy --all-targets` and `cargo test` before committing. Set `KILN_S
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Acknowledgments
+
+Kiln is heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code).
