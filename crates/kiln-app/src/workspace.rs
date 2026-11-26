@@ -24,6 +24,7 @@ use kiln_agent::{
 use kiln_core::checkout::{self, Checkout, MoveRequest, Sharing, DEFAULT_COMMIT_TYPE};
 use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
+use kiln_core::title;
 use kiln_core::{
     Fetch, FollowUp, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
@@ -663,6 +664,8 @@ impl Workspace {
         let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
         let prompt = if thread.handoff {
             checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(&project.dir))
+        } else if first {
+            format!("{}\n\n{prompt}", title::title_note())
         } else {
             prompt
         };
@@ -975,6 +978,10 @@ impl Workspace {
                 }
             }
             AgentEvent::Text(text) => {
+                let (text, title) = title::take_title(&text);
+                if let Some(title) = title {
+                    thread.title = title;
+                }
                 // Only a thread in the shared checkout is offered the move.
                 let (text, request) = if thread.checkout == Checkout::Project {
                     checkout::take_move_request(&text)

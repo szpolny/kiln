@@ -6,6 +6,7 @@ pub mod persist;
 pub mod policy;
 pub mod settings;
 pub mod store;
+pub mod title;
 
 pub use checkout::Checkout;
 pub use settings::{Appearance, Fetch, FollowUp, Settings};
