@@ -7,7 +7,7 @@ pub use lucide_icons::Icon;
 use std::borrow::Cow;
 
 /// Family name inside the Lucide font file.
-const ICON_FONT: &str = "lucide";
+pub(crate) const ICON_FONT: &str = "lucide";
 
 /// Make [`icon`] drawable. Call once at startup.
 pub fn load_icon_font(cx: &App) -> Result<()> {

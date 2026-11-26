@@ -1,7 +1,9 @@
 mod assets;
 mod checkout_menu;
+mod file_reference;
 mod commands;
 mod markdown;
+mod media;
 mod project_icon;
 mod project_menu;
 mod settings;

@@ -6,6 +6,7 @@ pub mod process;
 pub mod project;
 pub mod worktree;
 
+use kiln_core::{Attachment, AttachmentContent};
 use process::Process;
 use serde_json::Value;
 use std::io;
@@ -20,6 +21,10 @@ pub enum AgentEvent {
     PermissionMode(kiln_core::policy::PermissionMode),
     /// A finished message of the agent's reply.
     Text(String),
+    /// Image output supplied directly by the provider.
+    Image(Attachment),
+    /// Generated output saved by the provider on this machine.
+    ImageFile(std::path::PathBuf),
     /// Text of the message being written, ahead of its `Text`, which repeats it whole.
     TextDelta(String),
     /// A tool call: the provider's tool name and what it was called with.
@@ -64,6 +69,29 @@ pub(crate) enum Reply {
     Input(Value),
 }
 
+fn reply_image(mime: &str, base64: &str) -> AgentEvent {
+    if base64.len() > 14 * 1024 * 1024 || !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+        return AgentEvent::Notice("This reply contains an oversized or unsupported image.".into());
+    }
+    AgentEvent::Image(Attachment {
+        name: "Agent image".into(),
+        content: AttachmentContent::Image { mime: mime.into(), base64: base64.into() },
+    })
+}
+
+/// Text attachments go into the prompt as named content, even outside the checkout.
+fn prompt_text(text: &str, attachments: &[Attachment]) -> String {
+    use std::fmt::Write;
+    let mut prompt = text.to_owned();
+    for attachment in attachments {
+        if let AttachmentContent::Text(content) = &attachment.content {
+            let _ = write!(prompt, "\n\nAttached text file {:?} ({} bytes):\n{content}",
+                attachment.name, content.len());
+        }
+    }
+    prompt
+}
+
 /// The live connection of a turn, for answering its requests and stopping it.
 #[derive(Clone)]
 pub enum Client {
@@ -80,10 +108,10 @@ impl Client {
     }
 
     /// Send guidance to the running turn. Both providers fold it into the turn.
-    pub fn steer(&self, text: &str) -> io::Result<()> {
+    pub fn steer(&self, text: &str, attachments: &[Attachment]) -> io::Result<()> {
         match self {
-            Client::Claude(client) => client.steer(text),
-            Client::Codex(client) => client.steer(text),
+            Client::Claude(client) => client.steer_with(text, attachments),
+            Client::Codex(client) => client.steer_with(text, attachments),
         }
     }
 

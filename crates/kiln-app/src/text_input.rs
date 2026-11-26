@@ -1,5 +1,6 @@
 //! A multi-line text field with a blinking caret, keyboard and mouse
 //! selection, the clipboard, and input method composition.
+use crate::file_reference::{self, ChipColors, Reference};
 use crate::text_edit::Buffer;
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, App, AvailableSpace, Bounds,
@@ -9,7 +10,7 @@ use gpui::{
     ScrollHandle, SharedString, Style, Subscription, Task, TextAlign, TextRun, UTF16Selection,
     UnderlineStyle, Window, WrappedLine,
 };
-use std::ops::Range;
+use std::{ops::Range, path::{Path, PathBuf}};
 use std::time::Duration;
 
 actions!(
@@ -134,10 +135,12 @@ fn key_bindings(mac: bool) -> Vec<KeyBinding> {
 pub enum InputEvent {
     /// The text changed.
     Changed,
+    CaretMoved,
     /// Enter was pressed.
     Submit,
     /// Ctrl+Enter was pressed.
     SubmitAlternate,
+    Images(std::sync::Arc<[gpui::Image]>),
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -146,11 +149,16 @@ pub struct Colors {
     pub placeholder: Hsla,
     pub caret: Hsla,
     pub selection: Hsla,
+    pub reference: ChipColors,
 }
 
 pub struct TextInput {
     focus: FocusHandle,
     buffer: Buffer,
+    pub paste_images: bool,
+    pub file_references: bool,
+    references: Vec<Reference>,
+    checkout: Option<PathBuf>,
     placeholder: SharedString,
     pub colors: Colors,
     /// Geometry from the last paint, for hit testing and vertical movement.
@@ -183,6 +191,10 @@ impl TextInput {
         Self {
             focus,
             buffer: Buffer::default(),
+            paste_images: false,
+            file_references: false,
+            references: vec![],
+            checkout: None,
             placeholder: placeholder.into(),
             colors: Colors::default(),
             layout: None,
@@ -200,6 +212,24 @@ impl TextInput {
         self.buffer.text()
     }
 
+    pub fn reference_query(&self) -> Option<crate::file_reference::Query> {
+        if self.buffer.selection().is_empty() && self.buffer.marked().is_none() {
+            let ranges = self.references.iter().map(|reference| reference.source.clone()).collect::<Vec<_>>();
+            file_reference::query(self.text(), self.buffer.cursor(), &ranges)
+        } else {
+            None
+        }
+    }
+
+    pub fn replace_reference(&mut self, query: crate::file_reference::Query, path: &str, cx: &mut Context<Self>) {
+        let mut text = crate::file_reference::markup(path);
+        if query.range.end == self.text().len() {
+            text.push(' ');
+        }
+        self.buffer.replace(Some(query.range), &text);
+        self.edited(cx);
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.buffer.clear();
         self.edited(cx);
@@ -210,6 +240,7 @@ impl TextInput {
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer.clear();
         self.buffer.replace(None, text);
+        self.update_references();
         self.moved(cx);
     }
 
@@ -233,20 +264,53 @@ impl TextInput {
     fn moved(&mut self, cx: &mut Context<Self>) {
         self.goal_x = None;
         self.show_caret(cx);
+        if self.file_references {
+            cx.emit(InputEvent::CaretMoved);
+        }
+    }
+
+    pub fn set_checkout(&mut self, checkout: Option<&Path>) {
+        if self.checkout.as_deref() != checkout {
+            self.checkout = checkout.map(Path::to_path_buf);
+            self.update_references();
+        }
+    }
+
+    fn update_references(&mut self) {
+        if self.file_references {
+            self.references = file_reference::references(self.text(), self.checkout.as_deref());
+        }
     }
 
     fn edited(&mut self, cx: &mut Context<Self>) {
+        self.update_references();
         self.moved(cx);
         cx.emit(InputEvent::Changed);
     }
 
+    fn chip_edge(&self, offset: usize) -> usize {
+        let cursor = self.buffer.cursor();
+        self.references.iter().find(|r| r.source.start < offset && offset < r.source.end)
+            .map_or(offset, |r| if offset < cursor { r.source.start } else { r.source.end })
+    }
+
+    fn whole_chips(&self, mut range: Range<usize>) -> Range<usize> {
+        for reference in &self.references {
+            if reference.source.start < range.end && range.start < reference.source.end {
+                range.start = range.start.min(reference.source.start);
+                range.end = range.end.max(reference.source.end);
+            }
+        }
+        range
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.buffer.move_to(offset);
+        self.buffer.move_to(self.chip_edge(offset));
         self.moved(cx);
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.buffer.select_to(offset);
+        self.buffer.select_to(self.chip_edge(offset));
         self.moved(cx);
     }
 
@@ -266,7 +330,7 @@ impl TextInput {
     fn delete_to(&mut self, to: impl Fn(&Buffer, usize) -> usize, cx: &mut Context<Self>) {
         if self.buffer.selection().is_empty() {
             let cursor = self.buffer.cursor();
-            self.buffer.select_to(to(&self.buffer, cursor));
+            self.buffer.select_to(self.chip_edge(to(&self.buffer, cursor)));
         }
         if !self.buffer.selection().is_empty() {
             self.buffer.replace(None, "");
@@ -335,12 +399,24 @@ impl TextInput {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        if ev.click_count == 1 && !ev.modifiers.shift {
+            if let Some((root, layout)) = self.checkout.as_deref().zip(self.layout.as_ref()) {
+                if let Some((i, _)) = layout.chips.iter().enumerate().find(|(_, chip)| chip.bounds.contains(&ev.position)) {
+                    if let Some(reference) = layout.spans.get(i).and_then(|span| {
+                        self.references.iter().find(|reference| reference.source == span.source)
+                    }) {
+                        file_reference::reveal(root, &reference.path, cx);
+                        return;
+                    }
+                }
+            }
+        }
         let at = self.index_for(ev.position);
         match ev.click_count {
             1 if ev.modifiers.shift => self.select_to(at, cx),
             1 => self.move_to(at, cx),
             2 => {
-                self.buffer.select(self.buffer.word_at(at));
+                self.buffer.select(self.whole_chips(self.buffer.word_at(at)));
                 self.moved(cx);
             }
             _ => {
@@ -451,7 +527,18 @@ impl TextInput {
         }
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(clipboard) = cx.read_from_clipboard() else { return };
+        if self.paste_images && clipboard.entries().iter().any(|entry| {
+            matches!(entry, gpui::ClipboardEntry::Image(_))
+        }) {
+            let images = clipboard.into_entries().filter_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some(image),
+                _ => None,
+            }).collect();
+            cx.emit(InputEvent::Images(images));
+            return;
+        }
+        if let Some(text) = clipboard.text() {
             self.insert(&text.replace("\r\n", "\n"), cx);
         }
     }
@@ -506,7 +593,7 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range.map(|r| self.buffer.range_from_utf16(&r));
+        let range = range.map(|r| self.whole_chips(self.buffer.range_from_utf16(&r)));
         self.buffer.replace(range, text);
         self.edited(cx);
     }
@@ -519,7 +606,7 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range.map(|r| self.buffer.range_from_utf16(&r));
+        let range = range.map(|r| self.whole_chips(self.buffer.range_from_utf16(&r)));
         // `selected` counts UTF-16 units within the new text.
         let selected = selected.map(|s| {
             let at = |units: usize| {
@@ -619,7 +706,35 @@ impl Render for TextInput {
 }
 
 /// Shaped paragraphs and where they were painted.
+#[derive(Clone)]
+struct ChipSpan {
+    source: Range<usize>,
+    visible: Range<usize>,
+}
+
+fn map_offset(
+    offset: usize,
+    spans: &[ChipSpan],
+    ranges: impl Fn(&ChipSpan) -> (&Range<usize>, &Range<usize>),
+) -> usize {
+    let (mut from_end, mut to_end) = (0, 0);
+    for span in spans {
+        let (from, to) = ranges(span);
+        if offset <= from.start {
+            break;
+        }
+        if offset < from.end {
+            return if offset - from.start < from.end - offset { to.start } else { to.end };
+        }
+        from_end = from.end;
+        to_end = to.end;
+    }
+    to_end + offset - from_end
+}
+
 struct Layout {
+    spans: Vec<ChipSpan>,
+    chips: Vec<gpui::Hitbox>,
     lines: Vec<WrappedLine>,
     /// Byte offset where each paragraph starts.
     starts: Vec<usize>,
@@ -640,11 +755,15 @@ impl Layout {
             start += line.len() + 1;
             top += line.size(line_height).height;
         }
-        Self { lines, starts, tops, origin, height: top.max(line_height), line_height }
+        Self { spans: vec![], chips: vec![], lines, starts, tops, origin, height: top.max(line_height), line_height }
     }
 
     /// Window position of the top of the caret at `offset`.
     fn position(&self, offset: usize) -> Point<Pixels> {
+        self.visible_position(map_offset(offset, &self.spans, |s| (&s.source, &s.visible)))
+    }
+
+    fn visible_position(&self, offset: usize) -> Point<Pixels> {
         let i = self.starts.partition_point(|&s| s <= offset).saturating_sub(1);
         let Some(line) = self.lines.get(i) else { return self.origin };
         let local = line
@@ -662,7 +781,7 @@ impl Layout {
         let row = ((y - self.tops[i]) / self.line_height).floor().clamp(0., (rows - 1) as f32);
         let local = point(p.x - self.origin.x, self.line_height * (row + 0.5));
         let (Ok(ix) | Err(ix)) = line.closest_index_for_position(local, self.line_height);
-        self.starts[i] + ix
+        map_offset(self.starts[i] + ix, &self.spans, |s| (&s.visible, &s.source))
     }
 }
 
@@ -674,6 +793,7 @@ struct Shaping {
     text: SharedString,
     runs: Vec<TextRun>,
     font_size: Pixels,
+    spans: Vec<ChipSpan>,
 }
 
 struct Prepaint {
@@ -703,7 +823,7 @@ impl Element for TextElement {
     ) -> (LayoutId, Shaping) {
         let input = self.input.read(cx);
         let style = window.text_style();
-        let (text, color) = if input.buffer.is_empty() {
+        let (mut text, color) = if input.buffer.is_empty() {
             (input.placeholder.clone(), input.colors.placeholder)
         } else {
             (SharedString::from(input.buffer.text().to_string()), input.colors.text)
@@ -716,21 +836,46 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = match input.buffer.marked() {
-            Some(m) => [
-                TextRun { len: m.start, ..run.clone() },
-                TextRun {
-                    len: m.len(),
-                    underline: Some(UnderlineStyle { color: Some(color), thickness: px(1.), wavy: false }),
-                    ..run.clone()
-                },
-                TextRun { len: text.len() - m.end, ..run },
-            ]
-            .into_iter()
-            .filter(|r| r.len > 0)
-            .collect(),
-            None => vec![run],
+        let mut spans = vec![];
+        let mut runs = vec![];
+        let mut visible = String::new();
+        let marked = input.buffer.marked();
+        let plain = |range: Range<usize>, visible: &mut String, runs: &mut Vec<TextRun>| {
+            if range.is_empty() {
+                return;
+            }
+            visible.push_str(&text[range.clone()]);
+            if let Some(marked) = marked.as_ref().filter(|m| m.start < range.end && range.start < m.end) {
+                let start = marked.start.max(range.start);
+                let end = marked.end.min(range.end);
+                runs.extend([
+                    TextRun { len: start - range.start, ..run.clone() },
+                    TextRun {
+                        len: end - start,
+                        underline: Some(UnderlineStyle { color: Some(color), thickness: px(1.), wavy: false }),
+                        ..run.clone()
+                    },
+                    TextRun { len: range.end - end, ..run.clone() },
+                ].into_iter().filter(|r| r.len > 0));
+            } else {
+                runs.push(TextRun { len: range.len(), ..run.clone() });
+            }
         };
+        let mut at = 0;
+        for reference in &input.references {
+            let source = reference.source.clone();
+            if marked.as_ref().is_some_and(|m| m.start < source.end && source.start < m.end) {
+                continue;
+            }
+            plain(at..source.start, &mut visible, &mut runs);
+            let chip = file_reference::append_chip(
+                &reference.path, &mut visible, &mut runs, &run, input.colors.reference,
+            );
+            at = source.end;
+            spans.push(ChipSpan { source, visible: chip });
+        }
+        plain(at..text.len(), &mut visible, &mut runs);
+        text = visible.into();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
 
@@ -749,7 +894,7 @@ impl Element for TextElement {
             let height = lines.iter().fold(px(0.), |h, l| h + l.size(line_height).height);
             size(width.unwrap_or_default(), height.max(line_height))
         });
-        (id, Shaping { text, runs, font_size })
+        (id, Shaping { text, runs, font_size, spans })
     }
 
     fn prepaint(
@@ -767,7 +912,14 @@ impl Element for TextElement {
             .text_system()
             .shape_text(shaping.text.clone(), shaping.font_size, &shaping.runs, Some(bounds.size.width), None)
             .unwrap_or_default();
-        let layout = Layout::new(lines.into_vec(), bounds.origin, line_height);
+        let mut layout = Layout::new(lines.into_vec(), bounds.origin, line_height);
+        layout.spans.clone_from(&shaping.spans);
+        layout.chips = layout.spans.iter().map(|span| {
+            let bounds = file_reference::chip_bounds(&span.visible, line_height, |offset| {
+                layout.visible_position(offset)
+            });
+            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+        }).collect();
         let empty = input.buffer.is_empty();
         let sel = input.buffer.selection();
         let at = |o: usize| if empty { bounds.origin } else { layout.position(o) };
@@ -813,10 +965,15 @@ impl Element for TextElement {
         let focused = focus.is_focused(window);
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.input.clone()), cx);
 
+        let layout = prepaint.layout.take().expect("prepaint always lays out");
+        let colors = self.input.read(cx).colors.reference;
+        for chip in &layout.chips {
+            window.set_cursor_style(CursorStyle::PointingHand, chip);
+            window.paint_quad(file_reference::chip_border(chip.bounds, colors));
+        }
         for quad in prepaint.selection.drain(..) {
             window.paint_quad(quad);
         }
-        let layout = prepaint.layout.take().expect("prepaint always lays out");
         for (line, top) in layout.lines.iter().zip(&layout.tops) {
             let origin = point(layout.origin.x, layout.origin.y + *top);
             let _ = line.paint(origin, layout.line_height, TextAlign::Left, None, window, cx);
@@ -878,6 +1035,18 @@ impl Element for TextElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chip_offsets_never_put_the_caret_in_markup() {
+        let chips = [
+            ChipSpan { source: 4..30, visible: 4..16 },
+            ChipSpan { source: 37..52, visible: 23..47 },
+        ];
+        let to_source = |offset| map_offset(offset, &chips, |span| (&span.visible, &span.source));
+        let to_visible = |offset| map_offset(offset, &chips, |span| (&span.source, &span.visible));
+        assert_eq!((to_source(6), to_source(12), to_source(19), to_source(48)), (4, 30, 33, 53));
+        assert_eq!((to_visible(4), to_visible(30), to_visible(37), to_visible(53)), (4, 16, 23, 48));
+    }
 
     /// GPUI panics on a shortcut it cannot read, which would stop the app at launch.
     #[test]

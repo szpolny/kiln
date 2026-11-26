@@ -3,6 +3,7 @@ use crate::policy::{PermissionMode, Policy};
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What resuming a stopped thread says to its agent, and shows in the thread.
@@ -24,10 +25,65 @@ pub enum Role {
     Notice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub content: AttachmentContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentContent {
+    Text(Arc<str>),
+    Image { mime: String, base64: Arc<str> },
+}
+
+impl Attachment {
+    pub fn stored_bytes(&self) -> usize {
+        match &self.content {
+            AttachmentContent::Text(text) => text.len(),
+            AttachmentContent::Image { base64, .. } => base64.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredPrompt")]
+pub struct Prompt {
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredPrompt {
+    Text(String),
+    WithAttachments { body: String, #[serde(default)] attachments: Vec<Attachment> },
+}
+
+impl From<StoredPrompt> for Prompt {
+    fn from(value: StoredPrompt) -> Self {
+        match value {
+            StoredPrompt::Text(body) => Self { body, attachments: vec![] },
+            StoredPrompt::WithAttachments { body, attachments } => Self { body, attachments },
+        }
+    }
+}
+
+impl Prompt {
+    pub fn is_empty(&self) -> bool {
+        self.body.trim().is_empty() && self.attachments.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_dir: Option<PathBuf>,
     /// Set when this is a tool call: the tool's name, with `body` its input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -49,7 +105,7 @@ fn is_zero(n: &u64) -> bool {
 
 impl Message {
     fn new(role: Role, body: impl Into<String>) -> Self {
-        Self { role, body: body.into(), tool: None, command_bytes: None, at: 0, worked_ms: 0 }
+        Self { role, body: body.into(), attachments: vec![], checkout_dir: None, tool: None, command_bytes: None, at: 0, worked_ms: 0 }
     }
 
     pub fn user(body: impl Into<String>) -> Self {
@@ -245,6 +301,8 @@ pub struct Thread {
     /// What the user typed in the composer and has not sent yet.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub draft: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draft_attachments: Vec<Attachment>,
     /// Where the thread's turns run.
     #[serde(default, skip_serializing_if = "is_project_checkout")]
     pub checkout: Checkout,
@@ -254,7 +312,7 @@ pub struct Thread {
     pub handoff: bool,
     /// Follow-ups saved during a turn, sent in order once a turn ends well.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queue: Vec<String>,
+    pub queue: Vec<Prompt>,
     /// A turn ended while the thread was out of view, and its result has not
     /// been seen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -282,6 +340,7 @@ impl Thread {
             updated_at: now,
             settled: false,
             draft: String::new(),
+            draft_attachments: vec![],
             checkout: Checkout::Project,
             handoff: false,
             queue: vec![],
@@ -315,7 +374,7 @@ impl Thread {
 
     /// Nothing was sent or typed, so leaving the thread loses nothing.
     pub fn is_untouched(&self) -> bool {
-        self.can_change_agent() && self.draft.trim().is_empty()
+        self.can_change_agent() && self.draft.trim().is_empty() && self.draft_attachments.is_empty()
     }
 
     /// Record activity at `now`, which makes a settled thread active again.
@@ -350,18 +409,17 @@ impl Thread {
     }
 
     /// Save a follow-up for after the running turn. Blank text is ignored.
-    pub fn enqueue(&mut self, body: &str) -> bool {
-        let body = body.trim();
-        if body.is_empty() {
+    pub fn enqueue(&mut self, prompt: Prompt) -> bool {
+        if prompt.is_empty() {
             return false;
         }
-        self.queue.push(body.to_owned());
+        self.queue.push(prompt);
         true
     }
 
     /// Take the next queued follow-up, but only when the last turn ended well.
     /// A failed, stopped, or still running turn keeps the queue for the user.
-    pub fn next_queued(&mut self) -> Option<String> {
+    pub fn next_queued(&mut self) -> Option<Prompt> {
         (self.status == Status::Idle && !self.queue.is_empty()).then(|| self.queue.remove(0))
     }
 
@@ -373,16 +431,16 @@ impl Thread {
 
     /// Ask the provider session to carry on, or send the latest request again
     /// if the turn stopped before there was a session to resume.
-    pub fn resume_prompt(&self) -> Option<String> {
+    pub fn resume_prompt(&self) -> Option<Prompt> {
         if self.status != Status::Stopped {
             return None;
         }
         let request = self.messages.iter().rev()
             .find(|m| m.role == Role::User && m.body != CONTINUE_PROMPT)?;
         Some(if self.session_id.is_some() {
-            CONTINUE_PROMPT.to_string()
+            Prompt { body: CONTINUE_PROMPT.into(), attachments: vec![] }
         } else {
-            request.body.clone()
+            Prompt { body: request.body.clone(), attachments: request.attachments.clone() }
         })
     }
 }
@@ -652,13 +710,13 @@ mod tests {
         assert_eq!(t.messages.len(), 2);
         assert_eq!(t.messages[1].role, Role::Notice);
         assert_eq!(
-            t.resume_prompt().as_deref(),
+            t.resume_prompt().map(|p| p.body).as_deref(),
             Some(CONTINUE_PROMPT),
         );
         t.messages.push(Message::user(CONTINUE_PROMPT));
-        assert_eq!(t.resume_prompt().as_deref(), Some(CONTINUE_PROMPT));
+        assert_eq!(t.resume_prompt().map(|p| p.body).as_deref(), Some(CONTINUE_PROMPT));
         t.session_id = None;
-        assert_eq!(t.resume_prompt().as_deref(), Some("go"));
+        assert_eq!(t.resume_prompt().map(|p| p.body).as_deref(), Some("go"));
         assert!(t.settle());
         assert_eq!(t.resume_prompt(), None);
     }
@@ -666,19 +724,19 @@ mod tests {
     #[test]
     fn queued_follow_ups_go_out_only_after_a_good_turn() {
         let mut t = Thread::new(1, Agent::Claude, 0);
-        assert!(!t.enqueue("  "));
-        assert!(t.enqueue(" first "));
-        assert!(t.enqueue("second"));
+        assert!(!t.enqueue(Prompt { body: "  ".trim().into(), attachments: vec![] }));
+        assert!(t.enqueue(Prompt { body: " first ".trim().into(), attachments: vec![] }));
+        assert!(t.enqueue(Prompt { body: "second".trim().into(), attachments: vec![] }));
         t.status = Status::Running;
         assert_eq!(t.next_queued(), None);
         for status in [Status::NeedsInput, Status::Stopped] {
             t.status = status;
             assert_eq!(t.next_queued(), None);
         }
-        assert_eq!(t.queue, ["first", "second"]);
+        assert_eq!(t.queue.iter().map(|p| p.body.as_str()).collect::<Vec<_>>(), ["first", "second"]);
         t.status = Status::Idle;
-        assert_eq!(t.next_queued().as_deref(), Some("first"));
-        assert_eq!(t.queue, ["second"]);
+        assert_eq!(t.next_queued().map(|p| p.body).as_deref(), Some("first"));
+        assert_eq!(t.queue[0].body, "second");
     }
 
     #[test]
@@ -686,10 +744,14 @@ mod tests {
         let mut t = Thread::new(1, Agent::Claude, 0);
         let plain = serde_json::to_value(&t).unwrap();
         assert!(plain.get("queue").is_none() && plain.get("unread").is_none());
-        t.enqueue("later");
+        t.enqueue(Prompt { body: "later".trim().into(), attachments: vec![] });
         t.unread = true;
         let back: Thread = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
-        assert_eq!((back.queue, back.unread), (vec!["later".to_string()], true));
+        assert_eq!((back.queue[0].body.as_str(), back.unread), ("later", true));
+        let mut legacy = plain;
+        legacy["queue"] = serde_json::json!(["from an older Kiln"]);
+        let back: Thread = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.queue[0].body, "from an older Kiln");
     }
 
     #[test]

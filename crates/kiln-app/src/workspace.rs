@@ -1,6 +1,7 @@
 use crate::assets;
 use crate::commands::Palette;
-use crate::markdown;
+use crate::file_reference;
+use crate::{markdown, media};
 use crate::project_icon;
 use crate::settings::SettingsModal;
 use crate::shell;
@@ -26,11 +27,11 @@ use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::title;
 use kiln_core::{
-    Fetch, FollowUp, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Attachment, AttachmentContent, Prompt, Fetch, FollowUp, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,6 +76,12 @@ impl RunningTurn {
     fn stop(&self) {
         self.client.stop(&self.process);
     }
+}
+
+struct FileIndex {
+    root: PathBuf,
+    loaded_at: Instant,
+    files: Option<Vec<file_reference::File>>,
 }
 
 pub struct Workspace {
@@ -135,6 +142,13 @@ pub struct Workspace {
     pub(crate) icon_rejected: bool,
     /// The pending write of a changed draft; replacing it restarts the wait.
     draft_save: Task<()>,
+    file_index: Option<FileIndex>,
+    file_index_load: Task<()>,
+    file_suggestions: Vec<String>,
+    dismissed_file_query: Option<file_reference::Query>,
+    attachment_jobs: HashSet<u64>,
+    attachment_errors: HashMap<u64, String>,
+    reply_images: HashMap<usize, Vec<(String, media::Picture)>>,
     /// The pending write of a typed branch prefix.
     pub(crate) prefix_save: Task<()>,
 }
@@ -191,11 +205,27 @@ impl Workspace {
         let selected = store.first_thread_id();
         let font = ui_font(&cx.text_system().all_font_names());
         let theme = Theme::new(window.appearance(), store.settings.appearance, font);
-        let input = cx.new(|cx| TextInput::new("Ask the agent to do something", window, cx));
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Ask the agent to do something", window, cx);
+            input.paste_images = true;
+            input.file_references = true;
+            input
+        });
         cx.subscribe(&input, |this, _, ev, cx| match ev {
             InputEvent::Submit => this.submit(false, cx),
             InputEvent::SubmitAlternate => this.submit(true, cx),
             InputEvent::Changed => this.keep_draft(cx),
+            InputEvent::CaretMoved => this.suggest_files(cx),
+            InputEvent::Images(images) => {
+                if let Some(id) = this.selected {
+                    let images = images.clone();
+                    this.load_attachments(id, move || {
+                        images.iter().take(media::COUNT_LIMIT + 1).map(|image| {
+                            media::attach_image("Clipboard image".into(), &image.bytes)
+                        }).collect()
+                    }, cx);
+                }
+            }
         })
         .detach();
         let prefix_input = cx.new(|cx| TextInput::new("Prefix, such as team/name", window, cx));
@@ -209,7 +239,7 @@ impl Workspace {
             cx.new(|cx| TextInput::new("Type a command or a thread", window, cx));
         cx.subscribe_in(&palette_input, window, |this, _, ev, window, cx| match ev {
             InputEvent::Submit => this.pick_selected(window, cx),
-            InputEvent::SubmitAlternate => {}
+            InputEvent::SubmitAlternate | InputEvent::CaretMoved | InputEvent::Images(_) => {}
             InputEvent::Changed => this.palette_changed(cx),
         })
         .detach();
@@ -246,6 +276,13 @@ impl Workspace {
             model_scroll_grab: Rc::default(),
             icon_rejected: false,
             draft_save: Task::ready(()),
+            file_index: None,
+            file_index_load: Task::ready(()),
+            file_suggestions: vec![],
+            dismissed_file_query: None,
+            attachment_jobs: HashSet::new(),
+            attachment_errors: HashMap::new(),
+            reply_images: HashMap::new(),
             prefix_save: Task::ready(()),
         };
         this.show_draft(cx);
@@ -335,6 +372,7 @@ impl Workspace {
         if switched {
             self.transcript.reset(entries.len());
             self.parsed.clear();
+            self.reply_images.clear();
             self.shell_highlights.clear();
             self.transcript_thread = self.selected;
         } else {
@@ -412,7 +450,7 @@ impl Workspace {
     /// is discarded if nothing was sent or typed in it.
     pub(crate) fn select(&mut self, id: Option<u64>, cx: &mut Context<Self>) {
         let left = self.selected.filter(|&old| {
-            Some(old) != id && self.store.thread(old).is_some_and(Thread::is_untouched)
+            Some(old) != id && !self.attachment_jobs.contains(&old) && self.store.thread(old).is_some_and(Thread::is_untouched)
         });
         let switched = self.selected != id;
         self.selected = id;
@@ -431,9 +469,15 @@ impl Workspace {
 
     /// Put the shown thread's draft in the composer.
     fn show_draft(&mut self, cx: &mut Context<Self>) {
+        self.file_suggestions.clear();
+        self.dismissed_file_query = None;
         let draft = self.selected.and_then(|id| self.store.thread(id)).map_or("", |t| &t.draft);
         let draft = draft.to_owned();
-        self.input.update(cx, |input, cx| input.set_text(&draft, cx));
+        let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
+        self.input.update(cx, |input, cx| {
+            input.set_checkout(checkout.as_deref());
+            input.set_text(&draft, cx);
+        });
     }
 
     /// Store the composer's text with the shown thread, and write it once
@@ -489,6 +533,7 @@ impl Workspace {
         self.open_work.retain(|&(thread, _)| thread != id);
         self.open_tools.retain(|&(thread, _)| thread != id);
         self.open_tool_groups.retain(|&(thread, _)| thread != id);
+        self.attachment_errors.remove(&id);
         true
     }
 
@@ -496,6 +541,7 @@ impl Workspace {
         if self.store.remove_project(p) {
             self.open_tools.retain(|&(id, _)| self.store.locate(id).is_some());
             self.open_tool_groups.retain(|&(id, _)| self.store.locate(id).is_some());
+            self.attachment_errors.retain(|id, _| self.store.locate(*id).is_some());
             if self.selected.is_some_and(|id| self.store.locate(id).is_none()) {
                 self.select(self.store.first_thread_id(), cx);
             }
@@ -506,7 +552,7 @@ impl Workspace {
 
     /// Escape closes an open menu, or else stops the shown thread's turn. Text
     /// editing is the composer's.
-    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         // A held key must not close a menu and then go on to stop the turn.
         if ev.keystroke.key != "escape" || ev.is_held {
             return;
@@ -515,6 +561,10 @@ impl Workspace {
             self.menu = Some(Menu::Model { agent, expanded, choosing_provider: false });
             cx.notify();
         } else if self.menu.take().is_some() {
+            cx.notify();
+        } else if self.suggestions_visible(window, cx) {
+            self.dismissed_file_query = self.input.read(cx).reference_query();
+            self.file_suggestions.clear();
             cx.notify();
         } else if let Some(id) = self.selected {
             self.stop(id, cx);
@@ -536,79 +586,253 @@ impl Workspace {
         }
     }
 
-    /// Send the composer's text: as a new turn when the thread is free. While
-    /// a turn runs it steers or queues, as chosen in the settings; `alternate`
-    /// picks the other one.
-    fn submit(&mut self, alternate: bool, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else { return };
-        let Some(thread) = self.store.thread(id) else { return };
-        if thread.status == Status::Running {
-            match self.store.settings.follow_up {
-                mode if alternate == (mode == FollowUp::Queue) => self.steer(cx),
-                _ => self.queue(cx),
-            }
-            return;
-        }
-        let body = self.input.read(cx).text().trim().to_string();
-        if body.is_empty() {
-            return;
-        }
-        if let Some(thread) = self.store.thread_mut(id) {
-            thread.draft.clear();
-        }
-        self.input.update(cx, |input, cx| input.clear(cx));
-        self.send(id, body, cx);
+    fn checkout_dir(&self, id: u64) -> Option<&Path> {
+        let (p, t) = self.store.locate(id)?;
+        let project = &self.store.projects[p];
+        Some(project.threads[t].checkout.dir(&project.dir))
     }
 
-    /// Keep the composer's text for after the running turn.
-    fn queue(&mut self, cx: &mut Context<Self>) {
-        let body = self.input.read(cx).text().trim().to_string();
-        let Some(id) = self.selected else { return };
-        let Some(thread) = self.store.thread_mut(id) else { return };
-        if thread.status == Status::Running && thread.enqueue(&body) {
-            thread.draft.clear();
-            self.input.update(cx, |input, cx| input.clear(cx));
-            self.save();
+    fn suggest_files(&mut self, cx: &mut Context<Self>) {
+        let query = self.input.read(cx).reference_query();
+        if self.dismissed_file_query == query && self.dismissed_file_query.is_some() {
+            return;
+        }
+        self.dismissed_file_query = None;
+        self.file_suggestions.clear();
+        cx.notify();
+        let Some(query) = query else { return };
+        let Some(root) = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf) else { return };
+        if let Some(index) = self.file_index.as_ref().filter(|index| index.root == root) {
+            match &index.files {
+                Some(files) => {
+                    self.file_suggestions = file_reference::matches(files, &query);
+                    if index.loaded_at.elapsed() < REFRESH {
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
+
+        self.file_index = Some(FileIndex { root: root.clone(), loaded_at: Instant::now(), files: None });
+        let dir = root.clone();
+        let load = cx.background_executor().spawn(async move { file_reference::index(&dir) });
+        self.file_index_load = cx.spawn(async move |this, cx| {
+            let files = load.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(index) = this.file_index.as_mut().filter(|index| index.root == root) else {
+                    return;
+                };
+                index.files = Some(files);
+                index.loaded_at = Instant::now();
+                this.suggest_files(cx);
+            });
+        });
+    }
+
+    fn suggestions_visible(&self, window: &Window, cx: &Context<Self>) -> bool {
+        !self.file_suggestions.is_empty() && self.menu.is_none()
+            && self.input.focus_handle(cx).is_focused(window)
+            && self.selected.and_then(|id| self.checkout_dir(id))
+                == self.file_index.as_ref().map(|index| index.root.as_path())
+    }
+
+    fn choose_reference(&mut self, id: u64, query: file_reference::Query, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected != Some(id) || self.input.read(cx).reference_query() != Some(query.clone()) {
+            return;
+        }
+        let exists = self.checkout_dir(id).and_then(|root| media::scoped_path(root, Path::new(path)))
+            .is_some_and(|path| path.is_file());
+        if exists {
+            self.input.update(cx, |input, cx| input.replace_reference(query, path, cx));
+            window.focus(&self.input.focus_handle(cx), cx);
+        } else {
+            self.file_suggestions.retain(|candidate| candidate != path);
             cx.notify();
         }
     }
 
-    /// Add `body` to the conversation as the user's message and run a turn for it.
-    fn send(&mut self, id: u64, body: String, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.thread_mut(id) else {
-            return;
-        };
-        if thread.title == NEW_THREAD_TITLE {
-            thread.title = body.chars().take(40).collect();
+    fn file_menu(&self, id: u64, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.suggestions_visible(window, cx) {
+            return None;
         }
-        thread.messages.push(Message::user(body.clone()));
-        thread.touch(now());
-        self.transcript_thread = None; // show what was just sent
-        self.save();
-        self.start_turn(id, body, cx);
+        let query = self.input.read(cx).reference_query()?;
+        let theme = self.theme;
+        let width = (window.viewport_size().width - px(328.)).clamp(px(160.), px(440.));
+        let menu = self.menu_surface("file-suggestions").w(width).children(
+            self.file_suggestions.iter().enumerate().map(|(i, path)| {
+                let path = path.clone();
+                let query = query.clone();
+                div().id(("file-suggestion", i)).flex().items_center().gap_2().h(px(MENU_ROW_HEIGHT))
+                    .px_2().rounded_md().text_sm().cursor_pointer()
+                    .hover(|d| d.bg(theme.hover))
+                    .child({
+                        let (icon, tint) = file_reference::file_icon(Path::new(&path));
+                        assets::icon(icon, 14.).text_color(tint.map_or(theme.muted, rgb))
+                    })
+                    .child(div().min_w_0().truncate().child(path.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| this.choose_reference(id, query.clone(), &path, window, cx)))
+            }),
+        );
+        Some(div().absolute().top_0().left_0().child(
+            deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window().child(menu.mb_2()))
+                .with_priority(2),
+        ))
     }
 
-    /// Send guidance to the turn that is running.
-    fn steer(&mut self, cx: &mut Context<Self>) {
-        let body = self.input.read(cx).text().trim().to_string();
-        let Some(id) = self.selected else { return };
-        let Some(thread) = self.store.thread(id) else { return };
-        if body.is_empty() || thread.status != Status::Running {
+    fn pick_files(&mut self, id: u64, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let _ = this.update(cx, |this, cx| this.add_files(id, paths, cx));
+        }).detach();
+    }
+
+    fn add_files(&mut self, id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.load_attachments(id, move || {
+            paths.into_iter().take(media::COUNT_LIMIT + 1)
+                .map(|path| media::attach_file(&path).map_err(|error| {
+                    format!("{} · {error}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
+                })).collect()
+        }, cx);
+    }
+
+    fn set_attachment_error(&mut self, id: u64, error: Option<String>, cx: &mut Context<Self>) {
+        self.attachment_errors.remove(&id);
+        if let Some(error) = error {
+            self.attachment_errors.insert(id, error);
+        }
+        cx.notify();
+    }
+
+    fn load_attachments(
+        &mut self,
+        id: u64,
+        load: impl FnOnce() -> Vec<Result<Attachment, String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store.thread(id).is_none() {
             return;
         }
+        if !self.attachment_jobs.insert(id) {
+            self.set_attachment_error(id, Some("Finish adding the current files before adding more.".into()), cx);
+            return;
+        }
+        self.set_attachment_error(id, None, cx);
+        let task = cx.background_executor().spawn(async move { load() });
+        cx.spawn(async move |this, cx| {
+            let loaded = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.attachment_jobs.remove(&id);
+                let Some(thread) = this.store.thread_mut(id) else { return };
+                let mut errors = vec![];
+                let draft = &mut thread.draft_attachments;
+                let mut size = draft.iter().map(Attachment::stored_bytes).sum::<usize>();
+                for result in loaded {
+                    match result {
+                        Ok(file) => {
+                            size += file.stored_bytes();
+                            if draft.len() >= media::COUNT_LIMIT || size > media::TOTAL_LIMIT {
+                                errors.push("A draft can hold up to 8 attachments and 20 MiB of stored data.".into());
+                                break;
+                            }
+                            draft.push(file);
+                        }
+                        Err(error) => errors.push(error),
+                    }
+                }
+                this.save();
+                this.set_attachment_error(id, (!errors.is_empty()).then(|| errors.join("\n")), cx);
+            });
+        }).detach();
+    }
+
+    fn composer_prompt(&self, thread: &Thread, cx: &Context<Self>) -> Prompt {
+        Prompt {
+            body: self.input.read(cx).text().trim().to_owned(),
+            attachments: thread.draft_attachments.clone(),
+        }
+    }
+
+    fn clear_composer(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.draft.clear();
+            thread.draft_attachments.clear();
+        }
+        self.attachment_errors.remove(&id);
+        self.input.update(cx, |input, cx| input.clear(cx));
+    }
+
+    /// Send a new turn or a follow-up to the thread that is running.
+    fn submit(&mut self, alternate: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else { return };
+        let Some(thread) = self.store.thread(id) else { return };
+        if self.attachment_jobs.contains(&id) {
+            return;
+        }
+        let prompt = self.composer_prompt(thread, cx);
+        if prompt.is_empty() {
+            return;
+        }
+        self.clear_composer(id, cx);
+        if self.store.thread(id).is_some_and(|thread| thread.status == Status::Running) {
+            match self.store.settings.follow_up {
+                mode if alternate == (mode == FollowUp::Queue) => self.steer(id, prompt, cx),
+                _ => {
+                    if let Some(thread) = self.store.thread_mut(id) {
+                        thread.enqueue(prompt);
+                    }
+                    self.save();
+                    cx.notify();
+                }
+            }
+        } else {
+            self.send(id, prompt, cx);
+        }
+    }
+
+    fn send(&mut self, id: u64, prompt: Prompt, cx: &mut Context<Self>) {
+        let checkout = self.checkout_dir(id).map(Path::to_path_buf);
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        if thread.title == NEW_THREAD_TITLE {
+            let label = if prompt.body.is_empty() {
+                prompt.attachments.first().map_or(NEW_THREAD_TITLE, |file| file.name.as_str())
+            } else {
+                &prompt.body
+            };
+            thread.title = label.chars().take(40).collect();
+        }
+        let mut message = Message::user(prompt.body.clone());
+        message.attachments = prompt.attachments.clone();
+        message.checkout_dir = checkout;
+        thread.messages.push(message);
+        thread.touch(now());
+        self.transcript_thread = None;
+        self.save();
+        self.start_turn(id, prompt, cx);
+    }
+
+    fn steer(&mut self, id: u64, prompt: Prompt, cx: &mut Context<Self>) {
         let sent = match self.turns.get(&id).filter(|turn| !turn.process.stop_requested()) {
-            Some(turn) => turn.client.steer(&body),
+            Some(turn) => turn.client.steer(&prompt.body, &prompt.attachments),
             None => Err(std::io::Error::other("the turn is ending")),
         };
+        let checkout = self.checkout_dir(id).map(Path::to_path_buf);
         let Some(thread) = self.store.thread_mut(id) else { return };
-        thread.draft.clear();
-        self.input.update(cx, |input, cx| input.clear(cx));
         match sent {
-            Ok(()) => thread.messages.push(Message::user(body).at(now())),
-            // Too late to steer, so the message goes out after the turn instead.
-            Err(_) => {
-                thread.enqueue(&body);
+            Ok(()) => {
+                let mut message = Message::user(prompt.body).at(now());
+                message.attachments = prompt.attachments;
+                message.checkout_dir = checkout;
+                thread.messages.push(message);
             }
+            // Too late to steer, so the message goes out after the turn instead.
+            Err(_) => { thread.enqueue(prompt); }
         }
         self.transcript_thread = None;
         self.save();
@@ -630,9 +854,21 @@ impl Workspace {
         if i >= thread.queue.len() {
             return;
         }
+        let queued = &thread.queue[i];
+        let size = queued.attachments.iter().chain(&thread.draft_attachments)
+            .map(Attachment::stored_bytes).sum::<usize>();
+        if queued.attachments.len() + thread.draft_attachments.len() > media::COUNT_LIMIT
+            || size > media::TOTAL_LIMIT
+        {
+            self.set_attachment_error(id, Some("Remove draft attachments before editing this follow-up.".into()), cx);
+            return;
+        }
         let queued = thread.queue.remove(i);
+        thread.draft_attachments.extend(queued.attachments);
+        let queued = queued.body;
         let draft = self.input.read(cx).text();
         let text = if draft.trim().is_empty() { queued } else { format!("{queued}\n\n{draft}") };
+        thread.draft.clone_from(&text);
         self.input.update(cx, |input, cx| input.set_text(&text, cx));
         self.save();
         cx.notify();
@@ -662,7 +898,7 @@ impl Workspace {
         let Some(prompt) = thread.resume_prompt() else { return };
         // A resent request is already in the thread; a nudge is a new message.
         if thread.session_id.is_some() {
-            thread.messages.push(Message::user(prompt.clone()).at(now()));
+            thread.messages.push(Message::user(prompt.body.clone()).at(now()));
             thread.touch(now());
             self.save();
         }
@@ -672,7 +908,7 @@ impl Workspace {
 
     /// Run one agent turn and fold its events into the thread. A turn in the
     /// shared project checkout first learns what else is working there.
-    fn start_turn(&mut self, id: u64, prompt: String, cx: &mut Context<Self>) {
+    fn start_turn(&mut self, id: u64, request: Prompt, cx: &mut Context<Self>) {
         let Some((p, t)) = self.store.locate(id) else {
             return;
         };
@@ -684,6 +920,7 @@ impl Workspace {
         let agent = thread.agent;
         // Changes already there cannot be this thread's before its first reply.
         let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
+        let Prompt { body: prompt, attachments } = request;
         let prompt = if thread.handoff {
             checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(&project.dir))
         } else if first {
@@ -723,7 +960,7 @@ impl Workspace {
                 Some(note) => format!("{note}\n\n{prompt}"),
                 None => prompt,
             };
-            Ok((dir, prompt))
+            Ok((dir, Prompt { body: prompt, attachments }))
         });
         cx.spawn(async move |this, cx| {
             let prepared = prepare.await;
@@ -736,14 +973,14 @@ impl Workspace {
     fn launch(
         &mut self,
         id: u64,
-        prepared: Result<(PathBuf, String), String>,
+        prepared: Result<(PathBuf, Prompt), String>,
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self.store.thread_mut(id) else {
             return;
         };
         let permission_mode = thread.permission_mode;
-        let (dir, prompt) = match prepared {
+        let (dir, Prompt { body: prompt, attachments }) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.apply(id, AgentEvent::Done { error: Some(error) }, permission_mode);
@@ -759,11 +996,11 @@ impl Workspace {
         let effort = thread.effort().id().to_string();
         let started = match agent {
             Agent::Claude => claude::run(claude::Turn {
-                dir, prompt, resume, model: Some(model.to_string()), effort: Some(effort),
+                dir: dir.clone(), prompt, attachments, resume, model: Some(model.to_string()), effort: Some(effort),
                 permission_mode, policy,
             }),
             Agent::Codex => codex::run(codex::Turn {
-                dir, prompt, resume, model: Some(model.to_string()),
+                dir: dir.clone(), prompt, attachments, resume, model: Some(model.to_string()),
                 effort, permission_mode, policy,
             }),
         };
@@ -783,7 +1020,16 @@ impl Workspace {
         });
 
         cx.spawn(async move |this, cx| {
-            while let Ok(ev) = rx.recv().await {
+            while let Ok(mut ev) = rx.recv().await {
+                if let AgentEvent::ImageFile(path) = ev {
+                    let root = dir.clone();
+                    ev = cx.background_executor().spawn(async move {
+                        match media::generated_image(&path, &root) {
+                            Ok(image) => AgentEvent::Image(image),
+                            Err(error) => AgentEvent::Notice(error),
+                        }
+                    }).await;
+                }
                 let done = matches!(ev, AgentEvent::Done { .. } | AgentEvent::Stopped);
                 let delta = matches!(ev, AgentEvent::TextDelta(_));
                 let _ = this.update(cx, |this, cx| {
@@ -796,7 +1042,9 @@ impl Workspace {
                             // A reply cut short by a stop or a failure keeps what was written.
                             let partial = shown_reply(&turn.stream.text, &thread.checkout);
                             if !partial.is_empty() {
-                                thread.messages.push(Message::agent(partial).at(now()));
+                                let mut message = Message::agent(partial).at(now());
+                                message.checkout_dir = Some(dir.clone());
+                                thread.messages.push(message);
                             }
                             // Kiln stopped the turn to move it; a failed turn stays.
                             let ended = matches!(ev, AgentEvent::Stopped | AgentEvent::Done { error: None });
@@ -917,9 +1165,12 @@ impl Workspace {
                         next = resume
                             .then(|| thread.messages.iter().rev().find(|m| m.role == Role::User))
                             .flatten()
-                            .map(|m| match &carried {
-                                Some(carried) => format!("<kiln-context>\n{carried}\n</kiln-context>\n\n{}", m.body),
-                                None => m.body.clone(),
+                            .map(|m| Prompt {
+                                body: match &carried {
+                                    Some(carried) => format!("<kiln-context>\n{carried}\n</kiln-context>\n\n{}", m.body),
+                                    None => m.body.clone(),
+                                },
+                                attachments: m.attachments.clone(),
                             });
                     }
                     Err(e) => {
@@ -1001,6 +1252,11 @@ impl Workspace {
 
     /// Fold one event of a running turn into its thread.
     fn apply(&mut self, id: u64, ev: AgentEvent, permission_mode: PermissionMode) {
+        let root = if matches!(ev, AgentEvent::Text(_)) {
+            self.checkout_dir(id).map(Path::to_path_buf)
+        } else {
+            None
+        };
         let Some(thread) = self.store.thread_mut(id) else { return };
         match ev {
             AgentEvent::Session(id) => {
@@ -1034,13 +1290,23 @@ impl Workspace {
                     turn.stop();
                 }
                 if !text.is_empty() {
-                    thread.messages.push(Message::agent(text).at(now()));
+                    let mut message = Message::agent(text).at(now());
+                    message.checkout_dir = root;
+                    thread.messages.push(message);
                 }
                 // The whole message replaces what streamed of it.
                 if let Some(turn) = self.turns.get_mut(&id) {
                     turn.stream = Stream::default();
                 }
                 self.remeasure_activity(id);
+            }
+            AgentEvent::Image(image) => {
+                let mut message = Message::agent("").at(now());
+                message.attachments.push(image);
+                thread.messages.push(message);
+            }
+            AgentEvent::ImageFile(_) => {
+                thread.messages.push(Message::notice("The generated image is unavailable."));
             }
             AgentEvent::TextDelta(delta) => {
                 let Some(turn) = self.turns.get_mut(&id) else { return };
@@ -1697,6 +1963,7 @@ impl Workspace {
             return div().into_any_element();
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
+        let root = m.checkout_dir.as_deref().or_else(|| self.checkout_dir(id)).map(Path::to_path_buf);
         let content = match (&m.tool, m.role) {
             (Some(name), _) => {
                 if shell::is_shell(name) && self.open_tools.contains(&(id, ix)) {
@@ -1709,11 +1976,29 @@ impl Workspace {
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
                     .bg(theme.accent).text_color(theme.on_accent)
-                    .child(m.body.clone()))
+                    .when(!m.body.is_empty(), |d| d.child(markdown::render_user(&m.body, theme, ix, root.as_deref())))
+                    .when(!m.attachments.is_empty(), |d| {
+                        d.child(div().flex().flex_wrap().gap_1()
+                            .children(m.attachments.iter().enumerate().map(|(i, attachment)| {
+                                attachment_button(format!("sent-{ix}-{i}"), attachment, theme)
+                            })))
+                    }))
                 .into_any_element(),
             (None, Role::Agent) => {
-                let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse(&m.body).into());
-                body.child(markdown::render(blocks, theme, ix)).into_any_element()
+                let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse_at(&m.body, root.as_deref()).into());
+                let images = self.reply_images.entry(ix).or_insert_with(|| {
+                    m.attachments.iter().filter_map(|attachment| match &attachment.content {
+                        AttachmentContent::Image { base64, .. } => {
+                            Some((attachment.name.clone(), media::Picture::embedded(base64.clone())))
+                        }
+                        AttachmentContent::Text(_) => None,
+                    }).collect()
+                });
+                body.when(!blocks.is_empty(), |d| d.child(markdown::render(blocks, theme, ix, root.as_deref())))
+                    .children(images.iter().enumerate().map(|(i, (name, picture))| {
+                        media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
+                    }))
+                    .into_any_element()
             }
             (None, Role::Notice) => body.text_xs().text_color(theme.muted)
                 .child(m.body.clone())
@@ -1796,7 +2081,8 @@ impl Workspace {
     }
 
     fn send_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let ready = !self.input.read(cx).text().trim().is_empty();
+        let ready = self.selected.and_then(|id| self.store.thread(id))
+            .is_some_and(|thread| self.composer_ready(thread, cx));
         self.round_button("send", ready)
             .child("↑")
             .tooltip(tip("Send", self.theme))
@@ -1834,7 +2120,7 @@ impl Workspace {
             .bg(theme.card).border_1().border_color(theme.border)
             .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
                 .child(heading));
-        for (i, body) in thread.queue.iter().enumerate() {
+        for (i, prompt) in thread.queue.iter().enumerate() {
             let button = |id: (&'static str, usize), mark: assets::Icon, label: &'static str| {
                 div().id(id).flex().flex_shrink_0().items_center().justify_center().size(px(22.))
                     .rounded_md().text_color(theme.muted).cursor_pointer()
@@ -1845,7 +2131,7 @@ impl Workspace {
             panel = panel.child(
                 div().flex().items_center().gap_1().child(
                     div().flex_1().min_w_0().truncate().text_sm().text_color(theme.text)
-                        .child(body.lines().next().unwrap_or_default().to_string()),
+                        .child(prompt.body.lines().next().filter(|line| !line.is_empty()).unwrap_or("Attachments").to_string()),
                 )
                 .when(!running && i == 0, |d| {
                     d.child(button(("queued-send", i), assets::Icon::ArrowUp, "Send now")
@@ -1882,6 +2168,7 @@ impl Workspace {
                 markdown::parse(&shown_reply(&stream.text[..stream.shown], &checkout)).into()
             }).clone()
         });
+        let root = self.checkout_dir(id).map(Path::to_path_buf);
         let stopping = self.turns.get(&id).is_some_and(|turn| turn.process.stop_requested());
         let waiting = self.has_live_approval(id);
         let (label, color) = if stopping {
@@ -1908,10 +2195,25 @@ impl Workspace {
         div().flex().flex_col().w_full()
             .when_some(streamed, |d, blocks| {
                 d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
-                    .child(markdown::render(&blocks, theme, key)))
+                    .child(markdown::render(&blocks, theme, key, root.as_deref())))
                     .px_6().py_1p5())
             })
             .child(status)
+    }
+
+    fn composer_ready(&self, thread: &Thread, cx: &Context<Self>) -> bool {
+        !self.attachment_jobs.contains(&thread.id)
+            && (!thread.draft_attachments.is_empty() || !self.input.read(cx).text().trim().is_empty())
+    }
+
+    fn remove_attachment(&mut self, id: u64, i: usize, cx: &mut Context<Self>) {
+        if let Some(thread) = self.store.thread_mut(id) {
+            if i < thread.draft_attachments.len() {
+                thread.draft_attachments.remove(i);
+                self.save();
+                self.set_attachment_error(id, None, cx);
+            }
+        }
     }
 
     fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1919,7 +2221,9 @@ impl Workspace {
         let running = thread.status == Status::Running;
         let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
         let stopped = thread.status == Status::Stopped;
-        let typed = !self.input.read(cx).text().trim().is_empty();
+        let id = thread.id;
+        let loading = self.attachment_jobs.contains(&id);
+        let typed = self.composer_ready(thread, cx);
         let mode = self.store.settings.follow_up;
         let button = if running && typed && !stopping {
             let mark = match mode {
@@ -1939,14 +2243,33 @@ impl Workspace {
                 .into_any_element()
         } else if running {
             self.stop_button(thread.id, !stopping, cx).into_any_element()
-        } else if stopped && !typed {
+        } else if stopped && !typed && !loading {
             self.resume_button(thread.id, cx).into_any_element()
         } else {
             self.send_button(cx).into_any_element()
         };
         centered(
-            div().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
+            div().id("composer-card").relative().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
                 .bg(theme.card).border_1().border_color(theme.border).shadow_md()
+                .on_drop(cx.listener(move |this, files: &gpui::ExternalPaths, _, cx| {
+                    this.add_files(id, files.paths().to_vec(), cx);
+                }))
+                .when(!thread.draft_attachments.is_empty(), |d| {
+                    d.child(div().flex().flex_wrap().gap_1().px_2()
+                        .children(thread.draft_attachments.iter().enumerate().map(|(i, attachment)| {
+                            div().flex().items_center().rounded_md().bg(theme.fill).text_color(theme.text)
+                                .child(attachment_button(format!("draft-preview-{i}"), attachment, theme))
+                                .child(div().id(("remove-attachment", i)).p_1()
+                                    .cursor_pointer().hover(|h| h.bg(theme.hover))
+                                    .tooltip(tip("Remove attachment", theme))
+                                    .child(assets::icon(assets::Icon::X, 12.))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(id, i, cx))))
+                        })))
+                })
+                .when_some(self.attachment_errors.get(&id), |d, error| {
+                    d.child(div().px_2().text_xs().text_color(theme.warn).child(error.clone()))
+                })
+                .children(self.file_menu(id, window, cx))
                 .child(
                     div().id("composer")
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1956,12 +2279,16 @@ impl Workspace {
                 )
                 .child(
                     div().flex().items_center().gap_3().pl_0p5()
+                        .child(composer_tool("attach-file", assets::Icon::Paperclip, theme)
+                            .tooltip(tip("Attach text files or images", theme))
+                            .on_click(cx.listener(move |this, _, _, cx| this.pick_files(id, cx))))
                         .child(div().flex().items_center().gap_0p5()
                             .child(self.model_picker(thread, window, cx))
                             .child(self.effort_picker(thread, window, cx)))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
-                            .when(running && !stopping, |d| d.child("Esc to stop")))
+                            .when(loading, |d| d.child("Adding attachments…"))
+                            .when(!loading && running && !stopping, |d| d.child("Esc to stop")))
                         .child(button),
                 ),
         )
@@ -2008,6 +2335,28 @@ impl Workspace {
             .child(self.composer(thread, window, cx))
             .into_any_element()
     }
+}
+
+fn composer_tool(id: &'static str, icon: assets::Icon, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    div().id(id).flex().flex_shrink_0().items_center().justify_center()
+        .size(px(26.)).rounded_md().text_color(theme.muted).cursor_pointer()
+        .hover(|h| h.bg(theme.hover).text_color(theme.text))
+        .child(assets::icon(icon, 14.))
+}
+
+fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    let preview = attachment.clone();
+    let icon = match attachment.content {
+        AttachmentContent::Text(_) => assets::Icon::FileText,
+        AttachmentContent::Image { .. } => assets::Icon::Image,
+    };
+    div().id(SharedString::from(id)).flex().items_center().gap_1()
+        .rounded_md().px_2().py_1().max_w(px(250.)).text_xs()
+        .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
+        .child(assets::icon(icon, 12.))
+        .child(div().min_w_0().truncate().child(attachment.name.clone()))
+        .tooltip(tip("Open attachment preview", theme))
+        .on_click(move |_, _, cx| media::preview_attachment(&preview, theme, cx))
 }
 
 fn tool_icon(name: &str) -> assets::Icon {
@@ -2074,6 +2423,8 @@ impl Render for Workspace {
         self.theme = Theme::new(window.appearance(), self.store.settings.appearance, self.theme.font);
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
+        let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
+        self.input.update(cx, |input, _| input.set_checkout(checkout.as_deref()));
         for input in [&self.input, &self.prefix_input, &self.palette_input] {
             input.update(cx, |input, _| {
                 input.colors = text_input::Colors {
@@ -2081,6 +2432,10 @@ impl Render for Workspace {
                     placeholder: theme.muted.into(),
                     caret: theme.accent.into(),
                     selection: selection.into(),
+                    reference: file_reference::ChipColors {
+                        text: theme.text.into(),
+                        border: theme.accent.opacity(0.55).into(),
+                    },
                 }
             });
         }
@@ -2088,7 +2443,7 @@ impl Render for Workspace {
         // No root background: the macOS sidebar lets the blur through.
         let root = div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)));
+            .on_key_down(cx.listener(|this, ev, window, cx| this.on_key(ev, window, cx)));
         self.command_handlers(root, cx)
             .child(self.sidebar(window, cx))
             .child(match self.selected {

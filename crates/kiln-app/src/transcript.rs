@@ -75,6 +75,10 @@ pub fn entries(
             out.push(Entry::Work { start, reply: start + last });
             if !work_open(start) {
                 shown = start + first;
+                // Generated images remain visible when later tool work is folded.
+                out.extend((start..shown).filter(|&i| {
+                    messages[i].role == Role::Agent && !messages[i].attachments.is_empty()
+                }).map(Entry::Message));
             }
         }
         let mut index = shown;
@@ -192,6 +196,23 @@ mod tests {
     #[test]
     fn work_before_the_reply_is_folded() {
         assert_eq!(entries(&turn(), false, |_| false, |_| false), [M(0), work(1, 3), M(3)]);
+    }
+
+    #[test]
+    fn generated_images_stay_visible_when_later_work_is_folded() {
+        let mut image = Message::agent("");
+        image.attachments.push(kiln_core::Attachment {
+            name: "Diagram".into(),
+            content: kiln_core::AttachmentContent::Image {
+                mime: "image/png".into(),
+                base64: "AA==".into(),
+            },
+        });
+        let messages = [Message::user("Draw a diagram"), image, tool(), Message::agent("Done")];
+        assert_eq!(
+            entries(&messages, false, |_| false, |_| false),
+            [Entry::Message(0), work(1, 3), Entry::Message(1), Entry::Message(3)]
+        );
     }
 
     #[test]

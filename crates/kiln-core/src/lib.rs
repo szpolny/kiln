@@ -11,5 +11,5 @@ pub mod title;
 pub use checkout::Checkout;
 pub use settings::{Appearance, Fetch, FollowUp, Settings};
 pub use store::{
-    Agent, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    Agent, Attachment, AttachmentContent, Prompt, Effort, Message, Project, Role, Status, Store, Thread, NEW_THREAD_TITLE,
 };

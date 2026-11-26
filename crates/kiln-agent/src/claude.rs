@@ -6,6 +6,7 @@
 use crate::process::{self, Process};
 use crate::{project, AgentEvent, ApprovalId, ApprovalRequest, Reply};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, Policy};
+use kiln_core::{Attachment, AttachmentContent};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
@@ -58,6 +59,16 @@ fn parse_line(line: &str) -> Vec<AgentEvent> {
                         if let Some(t) = block["text"].as_str() {
                             out.push(AgentEvent::Text(t.to_string()));
                         }
+                    }
+                    Some("image") => {
+                        let source = &block["source"];
+                        let image = match (source["media_type"].as_str(), source["data"].as_str()) {
+                            (Some(mime), Some(data)) if source["type"] == "base64" => {
+                                crate::reply_image(mime, data)
+                            }
+                            _ => AgentEvent::Notice("This reply contains an unsupported image.".into()),
+                        };
+                        out.push(image);
                     }
                     Some("tool_use") => {
                         if let Some(n) = block["name"].as_str() {
@@ -138,13 +149,31 @@ fn target(tool: &str, input: &Value) -> Option<PathBuf> {
     }
 }
 
-fn user_message(text: &str) -> Value {
-    json!({ "type": "user", "message": { "role": "user", "content": text } })
+fn user_message(text: &str, attachments: &[Attachment]) -> Value {
+    let text = crate::prompt_text(text, attachments);
+    let images = attachments.iter().filter_map(|attachment| match &attachment.content {
+        AttachmentContent::Image { mime, base64 } => Some(json!({
+            "type": "image", "source": { "type": "base64", "media_type": mime, "data": base64.as_ref() }
+        })),
+        AttachmentContent::Text(_) => None,
+    }).collect::<Vec<_>>();
+    let content = if images.is_empty() {
+        json!(text)
+    } else {
+        let mut blocks = vec![];
+        if !text.is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
+        blocks.extend(images);
+        json!(blocks)
+    };
+    json!({ "type": "user", "message": { "role": "user", "content": content } })
 }
 
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
+    pub attachments: Vec<Attachment>,
     pub resume: Option<String>,
     /// Model alias or full name; `None` uses the agent's configured default.
     pub model: Option<String>,
@@ -166,8 +195,8 @@ impl Client {
 
     /// Add guidance to the turn in progress; Claude folds a message sent
     /// mid-turn into the same turn and answers with one result.
-    pub fn steer(&self, text: &str) -> io::Result<()> {
-        self.send(user_message(text))
+    pub(crate) fn steer_with(&self, text: &str, attachments: &[Attachment]) -> io::Result<()> {
+        self.send(user_message(text, attachments))
     }
 
     pub fn stop(&self, process: &Process) {
@@ -266,7 +295,7 @@ fn drive(
     turn: &Turn,
 ) -> io::Result<()> {
     let emit = |event| events.send_blocking(event).map_err(io::Error::other);
-    wire.send(user_message(&turn.prompt))?;
+    wire.send(user_message(&turn.prompt, &turn.attachments))?;
     // Tool calls Claude asked about; it lists them again among its denials.
     let mut asked = HashSet::new();
     for line in output.lines() {
@@ -358,12 +387,34 @@ mod tests {
         Turn {
             dir: ".".into(),
             prompt: "Continue.".into(),
+            attachments: vec![],
             resume: Some("session".into()),
             model: None,
             effort: None,
             permission_mode,
             policy: Policy::default(),
         }
+    }
+
+    #[test]
+    fn attachment_payload_keeps_text_and_image_bytes() {
+        let attachments = [
+            Attachment { name: "notes.txt".into(), content: AttachmentContent::Text("sample".into()) },
+            Attachment {
+                name: "screenshot.png".into(),
+                content: AttachmentContent::Image { mime: "image/png".into(), base64: "AA==".into() },
+            },
+        ];
+        let message = user_message("Look at these", &attachments);
+        let blocks = message["message"]["content"].as_array().unwrap();
+        assert!(blocks[0]["text"].as_str().unwrap().contains("notes.txt"));
+        assert!(blocks[0]["text"].as_str().unwrap().ends_with("sample"));
+        assert_eq!(blocks[1], json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": "AA==" }
+        }));
+        let reply = parse_line(&json!({"type": "assistant", "message": {"content": [blocks[1]]}}).to_string());
+        assert!(matches!(reply.as_slice(), [AgentEvent::Image(_)]));
     }
 
     #[test]
@@ -513,7 +564,7 @@ mod tests {
             turn(PermissionMode::Manual),
         );
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("working".into()));
-        client.steer("use tabs").unwrap();
+        client.steer("use tabs", &[]).unwrap();
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
         assert!(events.recv_blocking().is_err());
     }
@@ -598,6 +649,7 @@ mod live {
         Turn {
             dir: dir.to_path_buf(),
             prompt: prompt.into(),
+            attachments: vec![],
             resume,
             model: None,
             effort: None,

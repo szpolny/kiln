@@ -28,10 +28,19 @@ pub fn save(path: &Path, store: &Store) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let json = serde_json::to_vec_pretty(&File { version: VERSION, store: store.clone() })
-        .map_err(io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&tmp)?;
+    let mut writer = io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &File { version: VERSION, store: store.clone() })
+        .map_err(io::Error::other)?;
+    io::Write::flush(&mut writer)?;
     std::fs::rename(&tmp, path)
 }
 

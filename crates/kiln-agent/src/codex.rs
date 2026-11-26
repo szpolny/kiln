@@ -5,6 +5,7 @@ use crate::{
     project, AgentEvent, ApprovalId, ApprovalRequest, Reply,
 };
 use kiln_core::policy::{Capability, Decision, PermissionMode, Place, Policy};
+use kiln_core::{Attachment, AttachmentContent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
@@ -18,11 +19,27 @@ const STEER_ID: u64 = 5;
 pub struct Turn {
     pub dir: PathBuf,
     pub prompt: String,
+    pub attachments: Vec<Attachment>,
     pub resume: Option<String>,
     pub model: Option<String>,
     pub effort: String,
     pub permission_mode: PermissionMode,
     pub policy: Policy,
+}
+
+fn turn_input(text: &str, attachments: &[Attachment]) -> Vec<Value> {
+    let text = crate::prompt_text(text, attachments);
+    let mut input = vec![];
+    if !text.is_empty() {
+        input.push(json!({ "type": "text", "text": text, "text_elements": [] }));
+    }
+    input.extend(attachments.iter().filter_map(|attachment| match &attachment.content {
+        AttachmentContent::Image { mime, base64 } => Some(json!({
+            "type": "image", "url": format!("data:{mime};base64,{base64}")
+        })),
+        AttachmentContent::Text(_) => None,
+    }));
+    input
 }
 
 fn response(request: &ApprovalRequest, allow: bool) -> Value {
@@ -52,7 +69,7 @@ impl Client {
     }
 
     /// Add guidance to the turn in progress.
-    pub fn steer(&self, text: &str) -> io::Result<()> {
+    pub(crate) fn steer_with(&self, text: &str, attachments: &[Attachment]) -> io::Result<()> {
         let mut connection = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (thread, turn) = connection
             .turn
@@ -60,7 +77,7 @@ impl Client {
             .ok_or_else(|| io::Error::other("Codex turn has not started"))?;
         connection.send(json!({ "id": STEER_ID, "method": "turn/steer", "params": {
             "threadId": thread,
-            "input": [{ "type": "text", "text": text, "text_elements": [] }],
+            "input": turn_input(text, attachments),
             "expectedTurnId": turn,
         }}))
     }
@@ -311,7 +328,7 @@ fn drive(
                 }
                 wire.send(json!({ "id": 3, "method": "turn/start", "params": {
                     "threadId": id,
-                    "input": [{ "type": "text", "text": turn.prompt, "text_elements": [] }],
+                    "input": turn_input(&turn.prompt, &turn.attachments),
                     "effort": turn.effort,
                 }}))?;
             }
@@ -349,6 +366,19 @@ fn notification(method: &str, params: &Value) -> Option<AgentEvent> {
         }
         ("item/completed", Some("agentMessage")) => {
             return Some(AgentEvent::Text(item["text"].as_str()?.to_string()));
+        }
+        ("item/completed", Some("imageGeneration")) => {
+            if let Some(data) = item["result"].as_str().filter(|s| !s.is_empty()) {
+                // Older versions send the bytes inline.
+                let (mime, data) = data.strip_prefix("data:")
+                    .and_then(|url| url.split_once(";base64,"))
+                    .unwrap_or(("image/png", data));
+                return Some(crate::reply_image(mime, data));
+            }
+            return Some(match item["savedPath"].as_str() {
+                Some(path) => AgentEvent::ImageFile(path.into()),
+                None => AgentEvent::Notice("The generated image is unavailable.".into()),
+            });
         }
         ("item/started", Some("commandExecution")) => {
             let command = item["command"].as_str()?;
@@ -544,12 +574,32 @@ mod tests {
         Turn {
             dir: std::env::current_dir().unwrap().canonicalize().unwrap(),
             prompt: "Continue.".into(),
+            attachments: vec![],
             resume: None,
             model: None,
             effort: "medium".into(),
             permission_mode: PermissionMode::Manual,
             policy: Policy::default(),
         }
+    }
+
+    #[test]
+    fn attachment_payload_keeps_text_and_image_bytes() {
+        let attachments = [
+            Attachment { name: "notes.txt".into(), content: AttachmentContent::Text("sample".into()) },
+            Attachment {
+                name: "screenshot.png".into(),
+                content: AttachmentContent::Image { mime: "image/png".into(), base64: "AA==".into() },
+            },
+        ];
+        let input = turn_input("Look at these", &attachments);
+        assert!(input[0]["text"].as_str().unwrap().contains("notes.txt"));
+        assert!(input[0]["text"].as_str().unwrap().ends_with("sample"));
+        assert_eq!(input[1], json!({"type": "image", "url": "data:image/png;base64,AA=="}));
+        let inline = json!({"item": {"type": "imageGeneration", "result": "AA=="}});
+        assert!(matches!(notification("item/completed", &inline), Some(AgentEvent::Image(_))));
+        let saved = json!({"item": {"type": "imageGeneration", "savedPath": "/example.png"}});
+        assert_eq!(notification("item/completed", &saved), Some(AgentEvent::ImageFile("/example.png".into())));
     }
 
     #[test]
@@ -775,7 +825,7 @@ mod tests {
         "#,
         );
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Text("working".into()));
-        client.steer("use tabs").unwrap();
+        client.steer_with("use tabs", &[]).unwrap();
         assert_eq!(
             events.recv_blocking().unwrap(),
             AgentEvent::Notice("Could not steer: turn is not steerable".into())
@@ -827,6 +877,7 @@ mod tests {
             let (_, client, events) = run(Turn {
                 dir: scratch.0.clone(),
                 prompt: prompt.into(),
+            attachments: vec![],
                 resume: resume.clone(),
                 ..turn()
             })

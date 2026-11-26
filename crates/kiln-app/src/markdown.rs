@@ -1,11 +1,12 @@
 //! Markdown for agent replies: parsing into a small block tree, and drawing it.
 //!
-//! Nothing here touches the network. Images are shown as text, and a link only
-//! opens when clicked, with its address always visible next to it.
+//! Images load locally from the thread checkout. Links open only on click.
 
+use crate::{file_reference::{self, ChipColors}, media};
+use std::{ops::Range, path::{Path, PathBuf}};
 use crate::theme::{Theme, MONO};
 use gpui::{
-    div, font, prelude::*, px, relative, AnyElement, ClipboardItem, FontStyle, FontWeight,
+    canvas, div, font, prelude::*, px, relative, AnyElement, ClipboardItem, FontStyle, FontWeight,
     InteractiveText, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -37,11 +38,22 @@ impl Inline {
             _ => self.runs.push((text.len(), style)),
         }
     }
+
+    fn truncate(&mut self, end: usize) {
+        self.text.truncate(end);
+        let mut left = end;
+        self.runs.retain_mut(|(len, _)| {
+            *len = (*len).min(left);
+            left -= *len;
+            *len > 0
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Paragraph(Inline),
+    Image { path: PathBuf, label: String },
     Heading(u8, Inline),
     Code { language: String, text: String },
     /// `start` is the first number of an ordered list.
@@ -78,7 +90,8 @@ struct Builder {
     /// Where the open link's text starts.
     link_start: usize,
     /// Address of the open image. Kept apart so a linked image keeps its link.
-    image: Option<String>,
+    image: Option<(String, Option<Inline>)>,
+    in_heading: bool,
 }
 
 impl Builder {
@@ -129,7 +142,11 @@ impl Builder {
 
     fn start(&mut self, tag: Tag) {
         match tag {
-            Tag::Paragraph | Tag::Heading { .. } | Tag::HtmlBlock => self.flush(),
+            Tag::Paragraph | Tag::HtmlBlock => self.flush(),
+            Tag::Heading { .. } => {
+                self.flush();
+                self.in_heading = true;
+            }
             Tag::BlockQuote(_) => self.open(Frame::Quote),
             Tag::CodeBlock(kind) => {
                 self.flush();
@@ -156,8 +173,13 @@ impl Builder {
                 self.style.link = Some(dest_url.into_string());
             }
             Tag::Image { dest_url, .. } => {
-                self.text("[image: ");
-                self.image = Some(dest_url.into_string());
+                let local = self.table.is_empty() && !self.in_heading
+                    && self.style.link.is_none() && media::link_path(&dest_url).is_some();
+                let preceding = local.then(|| std::mem::take(&mut self.inline));
+                if !local {
+                    self.text("[image: ");
+                }
+                self.image = Some((dest_url.into_string(), preceding));
             }
             _ => {}
         }
@@ -167,6 +189,7 @@ impl Builder {
         match tag {
             TagEnd::Paragraph | TagEnd::HtmlBlock => self.flush(),
             TagEnd::Heading(level) => {
+                self.in_heading = false;
                 let inline = std::mem::take(&mut self.inline);
                 self.add(Block::Heading(heading_depth(level), inline));
             }
@@ -194,6 +217,11 @@ impl Builder {
             TagEnd::Strikethrough => self.style.strike = false,
             TagEnd::Link => {
                 if let Some(url) = self.style.link.take() {
+                    if media::link_path(&url).is_some() {
+                        self.inline.truncate(self.link_start);
+                        self.inline.push(&url, Style { link: Some(url.clone()), ..self.style.clone() });
+                        return;
+                    }
                     let shown = &self.inline.text[self.link_start..];
                     // Never hide where a link goes behind other words.
                     if shown != url && format!("mailto:{shown}") != url {
@@ -205,8 +233,17 @@ impl Builder {
                 }
             }
             TagEnd::Image => {
-                if let Some(url) = self.image.take() {
-                    self.text(&format!("] ({url})"));
+                if let Some((url, preceding)) = self.image.take() {
+                    if let Some(preceding) = preceding {
+                        let alt = std::mem::replace(&mut self.inline, preceding).text;
+                        self.flush();
+                        if let Some(path) = media::link_path(&url) {
+                            let label = if alt.is_empty() { url } else { alt };
+                            self.add(Block::Image { path, label });
+                        }
+                    } else {
+                        self.text(&format!("] ({url})"));
+                    }
                 }
             }
             _ => {}
@@ -219,6 +256,10 @@ fn heading_depth(level: HeadingLevel) -> u8 {
 }
 
 pub fn parse(source: &str) -> Vec<Block> {
+    parse_at(source, None)
+}
+
+pub fn parse_at(source: &str, root: Option<&Path>) -> Vec<Block> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut b = Builder { stack: vec![(Frame::Root, vec![])], ..Builder::default() };
@@ -228,9 +269,17 @@ pub fn parse(source: &str) -> Vec<Block> {
             Event::End(tag) => b.end(tag),
             // HTML is never interpreted; it is shown as written.
             Event::Text(t) | Event::Html(t) | Event::InlineHtml(t) => b.text(&t),
-            Event::Code(t) => {
+            Event::Code(text) => {
+                if b.style.link.is_none() && b.image.is_none() {
+                    if let Some(path) = file_reference::existing_path(root, &text) {
+                        let path = path.to_string_lossy();
+                        let url = file_reference::link_destination(path.as_ref());
+                        b.inline.push(&path, Style { link: Some(url), ..b.style.clone() });
+                        continue;
+                    }
+                }
                 let style = Style { code: true, ..b.style.clone() };
-                b.inline.push(&t, style);
+                b.inline.push(&text, style);
             }
             Event::SoftBreak | Event::HardBreak => b.text("\n"),
             Event::Rule => {
@@ -255,17 +304,18 @@ fn opens(url: &str) -> bool {
 }
 
 /// Draw parsed blocks. `key` must be unique among messages on screen.
-pub fn render(blocks: &[Block], theme: Theme, key: usize) -> impl IntoElement {
-    Painter { theme, key, next_id: 0 }.column(blocks)
+pub fn render(blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>) -> impl IntoElement {
+    Painter { theme, key, next_id: 0, root }.column(blocks)
 }
 
-struct Painter {
+struct Painter<'a> {
+    root: Option<&'a Path>,
     theme: Theme,
     key: usize,
     next_id: usize,
 }
 
-impl Painter {
+impl Painter<'_> {
     fn id(&mut self, kind: &str) -> SharedString {
         self.next_id += 1;
         format!("md-{kind}-{}-{}", self.key, self.next_id).into()
@@ -284,6 +334,13 @@ impl Painter {
         match block {
             Block::Paragraph(inline) => {
                 div().w_full().min_w_0().child(self.inline(inline, false)).into_any_element()
+            }
+            Block::Image { path, label } => {
+                let Some(root) = self.root else {
+                    return div().child(format!("Image unavailable · {label}")).into_any_element();
+                };
+                let picture = media::Picture::Local { root: root.to_path_buf(), path: path.clone() };
+                media::inline(picture, label.clone(), self.id("image"), theme).into_any_element()
             }
             Block::Heading(depth, inline) => {
                 let heading = div().w_full().min_w_0().pt_1();
@@ -373,10 +430,14 @@ impl Painter {
 
     fn inline(&mut self, inline: &Inline, heading: bool) -> AnyElement {
         let theme = self.theme;
+        let mut text = String::new();
         let mut runs = Vec::with_capacity(inline.runs.len());
-        let (mut ranges, mut urls) = (vec![], vec![]);
+        let mut links = vec![];
         let mut at = 0;
+        let colors = ChipColors { text: theme.text.into(), border: theme.accent.opacity(0.55).into() };
         for (len, style) in &inline.runs {
+            let source = &inline.text[at..at + len];
+            at += len;
             let mut face = font(if style.code { MONO } else { theme.font });
             if style.bold || heading {
                 face.weight = FontWeight::SEMIBOLD;
@@ -384,32 +445,102 @@ impl Painter {
             if style.italic {
                 face.style = FontStyle::Italic;
             }
-            let link = style.link.as_ref().filter(|url| opens(url));
-            let color = if link.is_some() { theme.accent } else { theme.text };
-            if let Some(url) = link {
-                ranges.push(at..at + len);
-                urls.push(url.clone());
-            }
-            runs.push(TextRun {
+            let url = style.link.as_ref().filter(|url| opens(url));
+            let run = TextRun {
                 len: *len,
                 font: face,
-                color: color.into(),
+                color: if url.is_some() { theme.accent.into() } else { theme.text.into() },
                 background_color: style.code.then(|| theme.selected.into()),
-                underline: link.map(|_| UnderlineStyle { thickness: px(1.), ..Default::default() }),
-                strikethrough: style
-                    .strike
-                    .then(|| StrikethroughStyle { thickness: px(1.), ..Default::default() }),
-            });
-            at += len;
+                underline: url.map(|_| UnderlineStyle { thickness: px(1.), ..Default::default() }),
+                strikethrough: style.strike.then(|| StrikethroughStyle { thickness: px(1.), ..Default::default() }),
+            };
+            if let Some(path) = self.root.and(style.link.as_deref()).and_then(media::link_path) {
+                let range = file_reference::append_chip(&path, &mut text, &mut runs, &run, colors);
+                links.push((range, Link::File(path)));
+            } else {
+                if let Some(url) = url {
+                    links.push((text.len()..text.len() + len, Link::Web(url.clone())));
+                }
+                text.push_str(source);
+                runs.push(run);
+            }
         }
-        let text = StyledText::new(inline.text.clone()).with_runs(runs);
-        if urls.is_empty() {
-            return text.into_any_element();
-        }
-        InteractiveText::new(self.id("link"), text)
-            .on_click(ranges, move |i, _, cx| cx.open_url(&urls[i]))
-            .into_any_element()
+        linked_text(text, runs, links, self.id("link"), self.root, colors)
     }
+}
+
+
+enum Link {
+    Web(String),
+    File(PathBuf),
+}
+
+fn linked_text(
+    text: String, runs: Vec<TextRun>, links: Vec<(Range<usize>, Link)>,
+    id: SharedString, root: Option<&Path>, colors: ChipColors,
+) -> AnyElement {
+    let text = StyledText::new(text).with_runs(runs);
+    if links.is_empty() {
+        return text.into_any_element();
+    }
+    let layout = text.layout().clone();
+    let borders = links.iter().filter_map(|(range, link)| {
+        matches!(link, Link::File(_)).then_some(range.clone())
+    }).collect::<Vec<_>>();
+    let root = root.map(Path::to_path_buf);
+    let (ranges, links): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let interactive = InteractiveText::new(id, text).on_click(ranges, move |i, _, cx| {
+        match &links[i] {
+            Link::Web(url) => cx.open_url(url),
+            Link::File(path) => {
+                if let Some(root) = &root {
+                    file_reference::reveal(root, path, cx);
+                }
+            }
+        }
+    });
+    div().relative().child(interactive)
+        .when(!borders.is_empty(), |d| {
+            d.child(canvas(|_, _, _| (), move |_, (), window, _| {
+                for range in borders {
+                    let bounds = file_reference::chip_bounds(&range, layout.line_height(), |offset| {
+                        layout.position_for_index(offset).unwrap_or(layout.bounds().origin)
+                    });
+                    window.paint_quad(file_reference::chip_border(bounds, colors));
+                }
+            }).absolute().inset_0())
+        })
+        .into_any_element()
+}
+
+pub fn render_user(text: &str, theme: Theme, key: usize, root: Option<&Path>) -> AnyElement {
+    let references = file_reference::references(text, root);
+    if references.is_empty() {
+        return SharedString::from(text.to_owned()).into_any_element();
+    }
+    let colors = ChipColors { text: theme.on_accent.into(), border: theme.on_accent.opacity(0.5).into() };
+    let run = TextRun {
+        len: 0, font: font(theme.font), color: theme.on_accent.into(),
+        background_color: None, underline: None, strikethrough: None,
+    };
+    let mut display = String::new();
+    let mut runs = vec![];
+    let mut links = vec![];
+    let mut at = 0;
+    for reference in references {
+        if at < reference.source.start {
+            display.push_str(&text[at..reference.source.start]);
+            runs.push(TextRun { len: reference.source.start - at, ..run.clone() });
+        }
+        let range = file_reference::append_chip(&reference.path, &mut display, &mut runs, &run, colors);
+        links.push((range, Link::File(reference.path)));
+        at = reference.source.end;
+    }
+    if at < text.len() {
+        display.push_str(&text[at..]);
+        runs.push(TextRun { len: text.len() - at, ..run });
+    }
+    linked_text(display, runs, links, format!("user-links-{key}").into(), root, colors)
 }
 
 #[cfg(test)]
@@ -508,6 +639,26 @@ mod tests {
         let bare = parse("<https://example.com>");
         let [Block::Paragraph(p)] = bare.as_slice() else { panic!("{bare:?}") };
         assert_eq!(p.text, "https://example.com");
+    }
+
+    #[test]
+    fn local_link_labels_are_replaced_by_the_file_reference() {
+        let blocks = parse("Changed [the panel](<src/Panel.tsx>).");
+        let [Block::Paragraph(p)] = blocks.as_slice() else { panic!("{blocks:?}") };
+        assert_eq!(p.text, "Changed src/Panel.tsx.");
+        assert_eq!(p.runs[1].1.link.as_deref(), Some("src/Panel.tsx"));
+    }
+
+    #[test]
+    fn local_images_keep_their_position_and_decode_file_paths() {
+        assert_eq!(
+            parse("Before ![Chart](plots/my%20chart.png) after"),
+            [
+                Block::Paragraph(plain("Before ")),
+                Block::Image { path: "plots/my chart.png".into(), label: "Chart".into() },
+                Block::Paragraph(plain(" after")),
+            ]
+        );
     }
 
     #[test]
