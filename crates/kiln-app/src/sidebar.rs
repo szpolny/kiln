@@ -27,7 +27,7 @@ impl Workspace {
     pub(crate) fn sync_rows(&mut self) {
         let mut rows = Vec::new();
         for settled in [false, true] {
-            if settled && self.settled_collapsed {
+            if settled && self.store.settled_collapsed {
                 continue;
             }
             let ids = self.store.thread_ids(settled);
@@ -75,7 +75,7 @@ impl Workspace {
         let settings = footer_button("open-settings")
             .child(assets::icon(Icon::Settings, 14.)).child("Settings")
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
-        let show_settled_disclosure = self.settled_collapsed
+        let show_settled_disclosure = self.store.settled_collapsed
             && self.store.projects.iter().any(|p| p.threads.iter().any(|t| t.settled));
         div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
             .bg(theme.sidebar).border_r_1().border_color(theme.border)
@@ -89,7 +89,7 @@ impl Workspace {
 
     fn settled_disclosure(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme;
-        let (chevron, hint) = if self.settled_collapsed {
+        let (chevron, hint) = if self.store.settled_collapsed {
             (Icon::ChevronRight, "Expand settled threads")
         } else {
             (Icon::ChevronDown, "Collapse settled threads")
@@ -103,9 +103,9 @@ impl Workspace {
             .child(assets::icon(chevron, 12.))
             .on_click(cx.listener(|this, _, _, cx| {
                 let settled_start = this.rows.len();
-                this.settled_collapsed = !this.settled_collapsed;
-                this.sync_rows();
-                if !this.settled_collapsed && settled_start < this.rows.len() {
+                this.store.settled_collapsed = !this.store.settled_collapsed;
+                this.save();
+                if !this.store.settled_collapsed && settled_start < this.rows.len() {
                     this.thread_list.scroll_to(ListOffset {
                         item_ix: settled_start,
                         offset_in_item: px(0.),

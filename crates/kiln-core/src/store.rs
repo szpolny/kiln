@@ -462,6 +462,9 @@ pub struct Store {
     next_id: u64,
     #[serde(default)]
     pub settings: Settings,
+    /// Whether the sidebar hides settled threads.
+    #[serde(default)]
+    pub settled_collapsed: bool,
     /// The last choices made in the composer, independent of thread history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_agent: Option<Agent>,

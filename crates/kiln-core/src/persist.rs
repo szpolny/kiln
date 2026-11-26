@@ -92,6 +92,7 @@ mod tests {
         t.policy.network = crate::policy::Decision::Allow;
         t.updated_at = 42;
         t.settled = true;
+        store.settled_collapsed = true;
         store.projects[0].icon = Some("/pictures/mark.png".into());
         store.settings = Settings {
             appearance: Appearance::Dark,
@@ -114,6 +115,7 @@ mod tests {
         assert_eq!(t.permission_mode, PermissionMode::Manual);
         assert_eq!(t.policy.network, crate::policy::Decision::Allow);
         assert_eq!((t.updated_at, t.settled), (42, true));
+        assert!(back.settled_collapsed);
         assert_eq!(back.projects[0].icon.as_deref(), Some(Path::new("/pictures/mark.png")));
         assert_eq!(back.settings, store.settings);
         assert_eq!(back.thread(second).unwrap().permission_mode, PermissionMode::Auto);
