@@ -550,9 +550,24 @@ impl Workspace {
         }
     }
 
-    /// Escape closes an open menu, or else stops the shown thread's turn. Text
-    /// editing is the composer's.
-    fn on_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "tab"
+            && ev.keystroke.modifiers == Default::default()
+            && self.suggestions_visible(window, cx)
+        {
+            if let (Some(id), Some(query), Some(path)) = (
+                self.selected,
+                self.input.read(cx).reference_query(),
+                self.file_suggestions.first().cloned(),
+            ) {
+                cx.stop_propagation();
+                if !ev.is_held {
+                    self.choose_reference(id, query, &path, window, cx);
+                }
+                return;
+            }
+        }
+
         // A held key must not close a menu and then go on to stop the turn.
         if ev.keystroke.key != "escape" || ev.is_held {
             return;
@@ -671,6 +686,11 @@ impl Workspace {
                         assets::icon(icon, 14.).text_color(tint.map_or(theme.muted, rgb))
                     })
                     .child(div().min_w_0().truncate().child(path.clone()))
+                    .when(i == 0, |row| {
+                        row.bg(theme.hover).child(
+                            div().ml_auto().flex_shrink_0().text_xs().text_color(theme.muted).child("Tab"),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| this.choose_reference(id, query.clone(), &path, window, cx)))
             }),
         );

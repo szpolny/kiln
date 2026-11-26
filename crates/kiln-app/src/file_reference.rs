@@ -17,17 +17,15 @@ pub struct Query {
 
 pub fn query(text: &str, cursor: usize, code: &[Range<usize>]) -> Option<Query> {
     let path_char = |c: char| c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_');
-    let start = text[..cursor]
-        .rfind(|c| !path_char(c))
-        .map_or(0, |i| i + text[i..].chars().next().unwrap().len_utf8());
+    let start = text[..cursor].rfind(|c| !path_char(c))?;
+    if text.as_bytes()[start] != b'@' || text[..start].ends_with(|c| path_char(c) || c == '@') {
+        return None;
+    }
     let suffix = &text[cursor..];
     let rest = &suffix[..suffix.find(|c| !path_char(c)).unwrap_or(suffix.len())];
     let end = cursor + rest.trim_end_matches('.').len();
-    let prefix = text[start..cursor].trim_start_matches("./");
-    if prefix.chars().count() < 2
-        || prefix.starts_with('/')
-        || code.iter().any(|r| r.start < end && start < r.end)
-    {
+    let prefix = text[start + 1..cursor].trim_start_matches("./");
+    if prefix.starts_with('/') || code.iter().any(|r| r.start < end && start < r.end) {
         return None;
     }
     Some(Query {
@@ -343,15 +341,31 @@ mod tests {
 
     #[test]
     fn finds_a_filename_at_the_caret_without_touching_a_completed_reference() {
-        let text = "Open `docs/guide.md`, then src/ma.rs.";
+        let text = "Open `@guide.md`, then @src/ma.rs.";
         let caret = text.find(".rs").unwrap();
-        let code = 5..20;
+        let code = 5..16;
         let codes = std::slice::from_ref(&code);
         let candidate = query(text, caret, codes).unwrap();
         assert_eq!(candidate.prefix, "src/ma");
-        assert_eq!(&text[candidate.range], "src/ma.rs");
+        assert_eq!(&text[candidate.range], "@src/ma.rs");
         assert!(query(text, text.find("guide").unwrap() + 3, codes).is_none());
-        assert!(query("Read /home/no", 13, &[]).is_none());
+    }
+
+    #[test]
+    fn only_a_standalone_at_prefix_starts_a_mention() {
+        for text in [
+            "Read main.rs",
+            "user@example.org",
+            "@@main",
+            "Read @/home/no",
+        ] {
+            assert!(query(text, text.len(), &[]).is_none(), "{text}");
+        }
+        for (text, prefix) in [("@", ""), ("See @m", "m"), ("See (@./É", "é")] {
+            let candidate = query(text, text.len(), &[]).unwrap();
+            assert_eq!(candidate.prefix, prefix);
+            assert_eq!(candidate.range, text.find('@').unwrap()..text.len());
+        }
     }
 
     #[test]
@@ -366,9 +380,9 @@ mod tests {
             path: path.into(),
             folded: path.into(),
         });
-        let q = query("See MaIn.rs", 11, &[]).unwrap();
+        let q = query("See @MaIn.rs", 12, &[]).unwrap();
         assert_eq!(matches(&files, &q), ["src/main.rs", "examples/main.rs"]);
-        let q = query("See src/ma", 10, &[]).unwrap();
+        let q = query("See @src/ma", 11, &[]).unwrap();
         assert_eq!(matches(&files, &q), ["src/main.rs", "src/main_test.rs"]);
     }
 
