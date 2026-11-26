@@ -1,5 +1,6 @@
 mod assets;
 mod checkout_menu;
+mod commands;
 mod markdown;
 mod project_icon;
 mod project_menu;
@@ -22,6 +23,8 @@ fn main() {
         assets::load_icon_font(cx).expect("failed to load the icon font");
         text_input::bind_keys(cx);
         settings::bind_keys(cx);
+        commands::bind_keys(cx);
+        commands::set_menus(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(
             WindowOptions {

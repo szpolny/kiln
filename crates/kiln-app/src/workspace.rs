@@ -1,7 +1,8 @@
 use crate::assets;
+use crate::commands::Palette;
 use crate::markdown;
 use crate::project_icon;
-use crate::settings::{OpenSettings, SettingsModal};
+use crate::settings::SettingsModal;
 use crate::shell;
 use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
@@ -78,6 +79,9 @@ pub struct Workspace {
     /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
     pub(crate) settings_modal: Option<SettingsModal>,
+    pub(crate) palette: Option<Palette>,
+    /// The command palette's search field.
+    pub(crate) palette_input: Entity<TextInput>,
     /// The sidebar's entries, in the order shown.
     pub(crate) rows: Vec<Row>,
     /// Virtualized sidebar list over `rows`.
@@ -122,9 +126,7 @@ pub struct Workspace {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        for turn in self.turns.values() {
-            turn.stop();
-        }
+        self.stop_all();
         // Keep a draft typed in the last second.
         self.save();
     }
@@ -187,6 +189,13 @@ impl Workspace {
             }
         })
         .detach();
+        let palette_input =
+            cx.new(|cx| TextInput::new("Type a command or a thread", window, cx));
+        cx.subscribe_in(&palette_input, window, |this, _, ev, window, cx| match ev {
+            InputEvent::Submit => this.pick_selected(window, cx),
+            InputEvent::Changed => this.palette_changed(cx),
+        })
+        .detach();
         let mut this = Self {
             store,
             state_path,
@@ -198,6 +207,8 @@ impl Workspace {
             focus: cx.focus_handle(),
             theme,
             settings_modal: None,
+            palette: None,
+            palette_input,
             rows: Vec::new(),
             thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
             branches: HashMap::new(),
@@ -490,10 +501,17 @@ impl Workspace {
     }
 
     /// Stop the thread's turn. It stays running until the process has exited.
-    fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(turn) = self.turns.get(&id) {
             turn.stop();
             cx.notify();
+        }
+    }
+
+    /// Ask every running turn to stop.
+    pub(crate) fn stop_all(&self) {
+        for turn in self.turns.values() {
+            turn.stop();
         }
     }
 
@@ -1788,7 +1806,7 @@ impl Render for Workspace {
         self.theme = Theme::new(window.appearance(), self.store.settings.appearance, self.theme.font);
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
-        for input in [&self.input, &self.prefix_input] {
+        for input in [&self.input, &self.prefix_input, &self.palette_input] {
             input.update(cx, |input, _| {
                 input.colors = text_input::Colors {
                     text: theme.text.into(),
@@ -1800,18 +1818,17 @@ impl Render for Workspace {
         }
         self.sync_transcript();
         // No root background: the macOS sidebar lets the blur through.
-        div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
+        let root = div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.open_settings(window, cx);
-            }))
+            .on_key_down(cx.listener(|this, ev, _, cx| this.on_key(ev, cx)));
+        self.command_handlers(root, cx)
             .child(self.sidebar(window, cx))
             .child(match self.selected {
                 Some(id) => self.thread(id, window, cx),
                 None => self.empty_state(cx).into_any_element(),
             })
             .children(self.render_settings(cx))
+            .children(self.render_palette(cx))
     }
 }
 

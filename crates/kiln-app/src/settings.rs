@@ -40,6 +40,7 @@ impl Workspace {
         if self.settings_modal.is_some() {
             return;
         }
+        self.palette = None;
         self.menu = None;
         let custom = match &self.store.settings.branch_prefix {
             BranchPrefix::Custom(text) => text.clone(),
