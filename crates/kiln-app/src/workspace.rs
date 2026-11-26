@@ -100,6 +100,7 @@ pub struct Workspace {
     pub(crate) rows: Vec<Row>,
     /// Virtualized sidebar list over `rows`.
     pub(crate) thread_list: ListState,
+    pub(crate) settled_collapsed: bool,
     /// Checked-out branch of each project folder that is in a repository.
     pub(crate) branches: HashMap<PathBuf, String>,
     /// Icon of each project folder that ships one.
@@ -227,6 +228,7 @@ impl Workspace {
             palette_input,
             rows: Vec::new(),
             thread_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            settled_collapsed: false,
             branches: HashMap::new(),
             icons: HashMap::new(),
             icon_load: Task::ready(()),

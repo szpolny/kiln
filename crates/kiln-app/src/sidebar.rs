@@ -5,7 +5,7 @@ use crate::tooltip::tip;
 use crate::workspace::{agent_icon, Menu, Workspace, TOOLBAR};
 use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
-    Focusable, FontWeight, IntoElement, SharedString, Stateful, Window,
+    Focusable, FontWeight, IntoElement, ListOffset, SharedString, Stateful, Window,
 };
 use kiln_core::{Checkout, Project, Status, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,10 +23,13 @@ pub enum Row {
 }
 
 impl Workspace {
-    /// Rebuild the list after threads were added, removed, or reordered.
+    /// Rebuild the list after threads or their visibility change.
     pub(crate) fn sync_rows(&mut self) {
         let mut rows = Vec::new();
         for settled in [false, true] {
+            if settled && self.settled_collapsed {
+                continue;
+            }
             let ids = self.store.thread_ids(settled);
             if !ids.is_empty() {
                 rows.push(Row::Header { settled });
@@ -72,11 +75,44 @@ impl Workspace {
         let settings = footer_button("open-settings")
             .child(assets::icon(Icon::Settings, 14.)).child("Settings")
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
+        let show_settled_disclosure = self.settled_collapsed
+            && self.store.projects.iter().any(|p| p.threads.iter().any(|t| t.settled));
         div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
             .bg(theme.sidebar).border_r_1().border_color(theme.border)
             .child(brand)
             .child(threads)
+            .when(show_settled_disclosure, |d| {
+                d.child(div().flex_shrink_0().mx_2p5().child(self.settled_disclosure(cx)))
+            })
             .child(div().flex().flex_col().gap_0p5().mx_2p5().mb_2p5().child(add).child(settings))
+    }
+
+    fn settled_disclosure(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme;
+        let (chevron, hint) = if self.settled_collapsed {
+            (Icon::ChevronRight, "Expand settled threads")
+        } else {
+            (Icon::ChevronDown, "Collapse settled threads")
+        };
+        div().id("toggle-settled").flex().items_center().justify_between()
+            .px_2().h(px(26.)).text_xs().font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.muted).cursor_pointer()
+            .hover(|h| h.text_color(theme.text))
+            .tooltip(tip(hint, theme))
+            .child("Settled")
+            .child(assets::icon(chevron, 12.))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let settled_start = this.rows.len();
+                this.settled_collapsed = !this.settled_collapsed;
+                this.sync_rows();
+                if !this.settled_collapsed && settled_start < this.rows.len() {
+                    this.thread_list.scroll_to(ListOffset {
+                        item_ix: settled_start,
+                        offset_in_item: px(0.),
+                    });
+                }
+                cx.notify();
+            }))
     }
 
     /// The button that starts a thread. Its menu lists the projects, where one
@@ -131,10 +167,14 @@ impl Workspace {
     fn thread_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let row = match self.rows.get(ix) {
             Some(&Row::Header { settled }) => {
-                let label = if settled { "Settled" } else { "Active" };
+                let heading = if settled {
+                    self.settled_disclosure(cx).into_any_element()
+                } else {
+                    div().px_2().text_xs().font_weight(FontWeight::SEMIBOLD)
+                        .text_color(self.theme.muted).child("Active").into_any_element()
+                };
                 return div().px_2p5().when(ix > 0, |d| d.pt_3()).pb_1()
-                    .child(div().px_2().text_xs().font_weight(FontWeight::SEMIBOLD)
-                        .text_color(self.theme.muted).child(label))
+                    .child(heading)
                     .into_any_element();
             }
             Some(&Row::Thread { id, .. }) => self
