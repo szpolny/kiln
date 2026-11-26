@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// What resuming a stopped thread says to its agent, and shows in the thread.
+pub const CONTINUE_PROMPT: &str = "Continue working on my last request.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Running,
@@ -368,15 +371,16 @@ impl Thread {
         self.messages.push(Message::notice("Stopped"));
     }
 
-    /// Continue the latest request in the provider session, or send it again
+    /// Ask the provider session to carry on, or send the latest request again
     /// if the turn stopped before there was a session to resume.
     pub fn resume_prompt(&self) -> Option<String> {
         if self.status != Status::Stopped {
             return None;
         }
-        let request = self.messages.iter().rev().find(|m| m.role == Role::User)?;
+        let request = self.messages.iter().rev()
+            .find(|m| m.role == Role::User && m.body != CONTINUE_PROMPT)?;
         Some(if self.session_id.is_some() {
-            format!("Continue working on my last request:\n\n{}", request.body)
+            CONTINUE_PROMPT.to_string()
         } else {
             request.body.clone()
         })
@@ -649,8 +653,10 @@ mod tests {
         assert_eq!(t.messages[1].role, Role::Notice);
         assert_eq!(
             t.resume_prompt().as_deref(),
-            Some("Continue working on my last request:\n\ngo"),
+            Some(CONTINUE_PROMPT),
         );
+        t.messages.push(Message::user(CONTINUE_PROMPT));
+        assert_eq!(t.resume_prompt().as_deref(), Some(CONTINUE_PROMPT));
         t.session_id = None;
         assert_eq!(t.resume_prompt().as_deref(), Some("go"));
         assert!(t.settle());

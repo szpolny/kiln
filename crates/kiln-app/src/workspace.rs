@@ -656,10 +656,16 @@ impl Workspace {
     }
 
     fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(prompt) = self.store.thread(id).and_then(Thread::resume_prompt) {
-            self.transcript_thread = None;
-            self.start_turn(id, prompt, cx);
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        let Some(prompt) = thread.resume_prompt() else { return };
+        // A resent request is already in the thread; a nudge is a new message.
+        if thread.session_id.is_some() {
+            thread.messages.push(Message::user(prompt.clone()).at(now()));
+            thread.touch(now());
+            self.save();
         }
+        self.transcript_thread = None;
+        self.start_turn(id, prompt, cx);
     }
 
     /// Run one agent turn and fold its events into the thread. A turn in the
@@ -1785,6 +1791,7 @@ impl Workspace {
         let ready = !self.input.read(cx).text().trim().is_empty();
         self.round_button("send", ready)
             .child("↑")
+            .tooltip(tip("Send", self.theme))
             .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx)))
     }
 
@@ -1793,6 +1800,7 @@ impl Workspace {
         let mark = if enabled { self.theme.on_accent } else { self.theme.muted };
         self.round_button("stop", enabled)
             .child(div().size(px(10.)).rounded(px(2.)).bg(mark))
+            .tooltip(tip("Stop", self.theme))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.stop(id, cx);
                 // The click took focus; hand it back for the next message.
@@ -1847,9 +1855,8 @@ impl Workspace {
 
     fn resume_button(&self, id: u64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         self.round_button("resume", true)
-            .w_auto().px_2p5().gap_1().text_xs().font_weight(FontWeight::SEMIBOLD)
             .child(assets::icon(assets::Icon::Play, 12.))
-            .child("Resume")
+            .tooltip(tip("Resume", self.theme))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.resume(id, cx);
                 window.focus(&this.input.focus_handle(cx), cx);
@@ -1905,7 +1912,6 @@ impl Workspace {
         let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
         let stopped = thread.status == Status::Stopped;
         let typed = !self.input.read(cx).text().trim().is_empty();
-        let has_draft = stopped && typed;
         let mode = self.store.settings.follow_up;
         let button = if running && typed && !stopping {
             let mark = match mode {
@@ -1925,7 +1931,7 @@ impl Workspace {
                 .into_any_element()
         } else if running {
             self.stop_button(thread.id, !stopping, cx).into_any_element()
-        } else if stopped {
+        } else if stopped && !typed {
             self.resume_button(thread.id, cx).into_any_element()
         } else {
             self.send_button(cx).into_any_element()
@@ -1948,7 +1954,6 @@ impl Workspace {
                         .child(div().flex_1().min_w_0().truncate().text_xs()
                             .text_color(theme.muted).text_right()
                             .when(running && !stopping, |d| d.child("Esc to stop")))
-                        .when(has_draft, |d| d.child(self.send_button(cx)))
                         .child(button),
                 ),
         )

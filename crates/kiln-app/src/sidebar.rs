@@ -1,6 +1,7 @@
 //! The sidebar: the threads of every project in one list, active ones as cards
 //! above the settled ones.
 use crate::assets::{self, Icon};
+use crate::tooltip::tip;
 use crate::workspace::{agent_icon, Menu, Workspace, TOOLBAR};
 use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
@@ -83,7 +84,7 @@ impl Workspace {
     fn new_thread_picker(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let open = self.menu == Some(Menu::NewThread);
-        let button = self.icon_button("new-thread", Icon::SquarePen, 26.)
+        let button = self.icon_button("new-thread", Icon::SquarePen, "New thread", 26.)
             .when(open, |d| d.bg(theme.selected).text_color(theme.text))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::NewThread, cx)));
         let picker = div().relative().child(button);
@@ -107,7 +108,7 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().truncate().child(project.name.clone()))
                     .when(!busy, |d| {
                         d.child(
-                            self.icon_button(("remove-project", p), Icon::X, 20.)
+                            self.icon_button(("remove-project", p), Icon::X, "Remove project", 20.)
                                 .invisible().group_hover(ROW, |s| s.visible())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -217,9 +218,13 @@ impl Workspace {
         let mut actions = div().absolute().top_0().bottom_0().right_0().flex().items_center()
             .invisible().group_hover(ROW, |s| s.visible());
         if can_settle {
-            let icon = if settled { Icon::Undo2 } else { Icon::Check };
+            let (icon, label) = if settled {
+                (Icon::Undo2, "Unsettle")
+            } else {
+                (Icon::Check, "Settle")
+            };
             actions = actions.child(
-                self.icon_button(("settle", id), icon, 20.)
+                self.icon_button(("settle", id), icon, label, 20.)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.set_settled(id, !settled, cx);
@@ -228,7 +233,7 @@ impl Workspace {
         }
         if can_delete {
             actions = actions.child(
-                self.icon_button(("delete", id), Icon::Trash2, 20.)
+                self.icon_button(("delete", id), Icon::Trash2, "Delete thread", 20.)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.delete_thread(id, cx);
@@ -255,11 +260,18 @@ impl Workspace {
     }
 
     /// A borderless square button holding one icon.
-    fn icon_button(&self, id: impl Into<ElementId>, icon: Icon, size: f32) -> Stateful<Div> {
+    fn icon_button(
+        &self,
+        id: impl Into<ElementId>,
+        icon: Icon,
+        label: &'static str,
+        size: f32,
+    ) -> Stateful<Div> {
         let theme = self.theme;
         div().id(id).flex().flex_shrink_0().items_center().justify_center().size(px(size))
             .rounded_md().text_color(theme.muted).cursor_pointer()
             .hover(|h| h.bg(theme.hover).text_color(theme.text))
+            .tooltip(tip(label, theme))
             .child(assets::icon(icon, 14.))
     }
 }
