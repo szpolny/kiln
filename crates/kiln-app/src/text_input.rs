@@ -201,6 +201,14 @@ impl TextInput {
         self.edited(cx);
     }
 
+    /// Show `text` with the caret at its end. This is not an edit, so it emits
+    /// no [`InputEvent::Changed`].
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.clear();
+        self.buffer.replace(None, text);
+        self.moved(cx);
+    }
+
     /// Show the caret solidly now, then resume blinking.
     fn show_caret(&mut self, cx: &mut Context<Self>) {
         self.caret_visible = true;

@@ -37,6 +37,8 @@ pub(crate) const TOOLBAR: f32 = 52.;
 /// How often the sidebar's ages, branches, and icons are brought up to date.
 const REFRESH: Duration = Duration::from_secs(30);
 const MENU_ROW_HEIGHT: f32 = 28.;
+/// How long typing pauses before the composer's draft is written to disk.
+const DRAFT_SAVE: Duration = Duration::from_secs(1);
 const SCROLLBAR_GUTTER: f32 = 10.;
 
 /// A turn in progress.
@@ -102,6 +104,8 @@ pub struct Workspace {
     model_scroll_grab: Rc<Cell<Option<Pixels>>>,
     /// The open project menu reports that the picked file is no icon.
     pub(crate) icon_rejected: bool,
+    /// The pending write of a changed draft; replacing it restarts the wait.
+    draft_save: Task<()>,
 }
 
 impl Drop for Workspace {
@@ -109,6 +113,8 @@ impl Drop for Workspace {
         for turn in self.turns.values() {
             turn.stop();
         }
+        // Keep a draft typed in the last second.
+        self.save();
     }
 }
 
@@ -157,7 +163,7 @@ impl Workspace {
         let input = cx.new(|cx| TextInput::new("Ask the agent to do something", window, cx));
         cx.subscribe(&input, |this, _, ev, cx| match ev {
             InputEvent::Submit => this.submit(cx),
-            InputEvent::Changed => cx.notify(),
+            InputEvent::Changed => this.keep_draft(cx),
         })
         .detach();
         let mut this = Self {
@@ -187,7 +193,9 @@ impl Workspace {
             model_scroll: ScrollHandle::new(),
             model_scroll_grab: Rc::default(),
             icon_rejected: false,
+            draft_save: Task::ready(()),
         };
+        this.show_draft(cx);
         this.sync_rows();
         this.refresh(cx);
         this
@@ -327,7 +335,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let p = this.store.add_project(&dir);
                 if this.store.projects[p].threads.is_empty() {
-                    this.new_thread(p, Agent::default(), cx);
+                    this.new_thread(p, cx);
                 } else {
                     this.save();
                 }
@@ -337,12 +345,56 @@ impl Workspace {
         .detach();
     }
 
-    pub(crate) fn new_thread(&mut self, p: usize, agent: Agent, cx: &mut Context<Self>) {
+    /// Start a thread in project `p` with the last provider chosen; the
+    /// composer can change it until the first message is sent.
+    pub(crate) fn new_thread(&mut self, p: usize, cx: &mut Context<Self>) {
+        let agent = self.store.last_agent();
         if let Some(id) = self.store.add_thread(p, agent, now()) {
-            self.selected = Some(id);
-            self.save();
-            cx.notify();
+            self.select(Some(id), cx);
         }
+    }
+
+    /// Show thread `id` with its draft in the composer. The thread left behind
+    /// is discarded if nothing was sent or typed in it.
+    pub(crate) fn select(&mut self, id: Option<u64>, cx: &mut Context<Self>) {
+        let left = self.selected.filter(|&old| {
+            Some(old) != id && self.store.thread(old).is_some_and(Thread::is_untouched)
+        });
+        let switched = self.selected != id;
+        self.selected = id;
+        if let Some(old) = left {
+            self.discard(old);
+        }
+        if switched {
+            self.show_draft(cx);
+        }
+        self.save();
+        cx.notify();
+    }
+
+    /// Put the shown thread's draft in the composer.
+    fn show_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self.selected.and_then(|id| self.store.thread(id)).map_or("", |t| &t.draft);
+        let draft = draft.to_owned();
+        self.input.update(cx, |input, cx| input.set_text(&draft, cx));
+    }
+
+    /// Store the composer's text with the shown thread, and write it once
+    /// typing pauses.
+    fn keep_draft(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let Some(thread) = self.selected.and_then(|id| self.store.thread_mut(id)) else {
+            return;
+        };
+        let text = self.input.read(cx).text();
+        if thread.draft == text {
+            return;
+        }
+        thread.draft = text.to_owned();
+        self.draft_save = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DRAFT_SAVE).await;
+            let _ = this.update(cx, |this, _| this.save());
+        });
     }
 
     pub(crate) fn set_settled(&mut self, id: u64, settled: bool, cx: &mut Context<Self>) {
@@ -361,15 +413,26 @@ impl Workspace {
     }
 
     pub(crate) fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
-        if self.store.delete_thread(id) {
-            self.open_tools.retain(|&(thread, _)| thread != id);
-            self.open_tool_groups.retain(|&(thread, _)| thread != id);
-            if self.selected == Some(id) {
-                self.selected = self.store.first_thread_id();
-            }
+        if !self.discard(id) {
+            return;
+        }
+        if self.selected == Some(id) {
+            self.select(self.store.first_thread_id(), cx);
+        } else {
             self.save();
             cx.notify();
         }
+    }
+
+    /// Remove an idle thread and what was expanded in it, without saving.
+    fn discard(&mut self, id: u64) -> bool {
+        if !self.store.delete_thread(id) {
+            return false;
+        }
+        self.open_work.retain(|&(thread, _)| thread != id);
+        self.open_tools.retain(|&(thread, _)| thread != id);
+        self.open_tool_groups.retain(|&(thread, _)| thread != id);
+        true
     }
 
     pub(crate) fn remove_project(&mut self, p: usize, cx: &mut Context<Self>) {
@@ -377,7 +440,7 @@ impl Workspace {
             self.open_tools.retain(|&(id, _)| self.store.locate(id).is_some());
             self.open_tool_groups.retain(|&(id, _)| self.store.locate(id).is_some());
             if self.selected.is_some_and(|id| self.store.locate(id).is_none()) {
-                self.selected = self.store.first_thread_id();
+                self.select(self.store.first_thread_id(), cx);
             }
             self.save();
             cx.notify();
@@ -425,6 +488,7 @@ impl Workspace {
             thread.title = body.chars().take(40).collect();
         }
         thread.messages.push(Message::user(body.clone()));
+        thread.draft.clear();
         thread.touch(now());
         self.input.update(cx, |input, cx| input.clear(cx));
         self.transcript_thread = None; // show what was just sent
@@ -633,8 +697,14 @@ impl Workspace {
 
     fn set_model(&mut self, id: u64, agent: Agent, model: &str, cx: &mut Context<Self>) {
         if let Some(target) = self.store.choose_model(id, agent, model, now()) {
-            self.selected = Some(target);
-            self.save();
+            if target != id {
+                // The new thread is where the typed prompt will be sent.
+                let draft = self.store.thread_mut(id).map(|t| std::mem::take(&mut t.draft));
+                if let (Some(draft), Some(thread)) = (draft, self.store.thread_mut(target)) {
+                    thread.draft = draft;
+                }
+            }
+            self.select(Some(target), cx);
         }
         cx.notify();
     }

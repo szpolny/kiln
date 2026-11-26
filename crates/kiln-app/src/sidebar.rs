@@ -6,7 +6,7 @@ use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Context, Div, ElementId,
     Focusable, FontWeight, IntoElement, SharedString, Stateful, Window,
 };
-use kiln_core::{Agent, Project, Status, Thread};
+use kiln_core::{Project, Status, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
@@ -79,7 +79,7 @@ impl Workspace {
     }
 
     /// The button that starts a thread. Its menu lists the projects, where one
-    /// can also be removed.
+    /// can also be removed; the provider is picked in the new thread's composer.
     fn new_thread_picker(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let open = self.menu == Some(Menu::NewThread);
@@ -97,7 +97,12 @@ impl Workspace {
             menu = menu.child(
                 div().id(("project-for-new-thread", p)).group(ROW).flex().flex_shrink_0().items_center()
                     .gap_2().h(px(28.)).pl_2().pr_1().rounded_md().text_sm()
-                    .text_color(theme.text)
+                    .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.menu = None;
+                        this.new_thread(p, cx);
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    }))
                     .child(self.project_mark(project))
                     .child(div().flex_1().min_w_0().truncate().child(project.name.clone()))
                     .when(!busy, |d| {
@@ -112,18 +117,6 @@ impl Workspace {
                         )
                     }),
             );
-            for agent in Agent::ALL {
-                let key = SharedString::from(format!("new-thread-{p}-{}", agent.label()));
-                menu = menu.child(
-                    self.menu_item(key, Some(agent), agent.name(), None, false)
-                        .ml_4().flex_shrink_0()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.menu = None;
-                            this.new_thread(p, agent, cx);
-                            window.focus(&this.input.focus_handle(cx), cx);
-                        })),
-                );
-            }
         }
         // Anchored at the button's bottom-right corner, so the menu opens below it.
         picker
@@ -159,9 +152,8 @@ impl Workspace {
             .when(active, |d| d.bg(theme.selected))
             .when(!active, |d| d.hover(|h| h.bg(theme.hover)))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.selected = Some(id);
+                this.select(Some(id), cx);
                 window.focus(&this.input.focus_handle(cx), cx);
-                cx.notify();
             }));
         let age = age(thread.updated_at, now());
         let row = if thread.settled {

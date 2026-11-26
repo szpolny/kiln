@@ -238,6 +238,9 @@ pub struct Thread {
     /// The user set the thread aside as done with.
     #[serde(default)]
     pub settled: bool,
+    /// What the user typed in the composer and has not sent yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft: String,
 }
 
 impl Thread {
@@ -256,6 +259,7 @@ impl Thread {
             session_id: None,
             updated_at: now,
             settled: false,
+            draft: String::new(),
         }
     }
 
@@ -273,6 +277,11 @@ impl Thread {
     pub fn can_change_agent(&self) -> bool {
         self.status == Status::Idle && self.messages.is_empty()
             && self.session_id.is_none()
+    }
+
+    /// Nothing was sent or typed, so leaving the thread loses nothing.
+    pub fn is_untouched(&self) -> bool {
+        self.can_change_agent() && self.draft.trim().is_empty()
     }
 
     /// Record activity at `now`, which makes a settled thread active again.
@@ -346,6 +355,8 @@ pub struct Store {
     pub settings: Settings,
     /// The last choices made in the composer, independent of thread history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_agent: Option<Agent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_effort: Option<Effort>,
@@ -414,6 +425,11 @@ impl Store {
         Some(id)
     }
 
+    /// Provider for a new thread: the last one chosen in the composer.
+    pub fn last_agent(&self) -> Agent {
+        self.last_agent.unwrap_or_default()
+    }
+
     /// Delete an idle thread. Running threads are refused.
     pub fn delete_thread(&mut self, id: u64) -> bool {
         let Some((p, t)) = self.locate(id) else { return false };
@@ -477,6 +493,7 @@ impl Store {
         } else {
             self.add_thread(p, agent, now)?
         };
+        self.last_agent = Some(agent);
         self.select_model(target, model).then_some(target)
     }
 
@@ -682,6 +699,39 @@ mod tests {
         assert_eq!(store.projects[0].threads.len(), 2);
         assert!(store.choose_model(id, Agent::Claude, "gpt-6.2-sol", 2).is_none());
         assert_eq!(store.thread(id).unwrap().agent, Agent::Codex);
+    }
+
+    #[test]
+    fn new_threads_use_the_last_chosen_provider() {
+        let mut store = Store::sample();
+        assert_eq!(store.last_agent(), Agent::Claude);
+        let id = store.projects[0].threads[0].id;
+        assert!(store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 1).is_some());
+        assert_eq!(store.last_agent(), Agent::Codex);
+        let id = store.add_thread(0, store.last_agent(), 2).unwrap();
+        assert_eq!(store.thread(id).unwrap().model(), "gpt-6.2-astra");
+    }
+
+    #[test]
+    fn a_thread_with_a_draft_or_history_is_not_untouched() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        assert!(t.is_untouched());
+        t.draft = "  ".into();
+        assert!(t.is_untouched());
+        t.draft = "fix the build".into();
+        assert!(!t.is_untouched());
+        t.draft.clear();
+        t.messages.push(Message::user("hi"));
+        assert!(!t.is_untouched());
+    }
+
+    #[test]
+    fn drafts_are_saved_only_when_present() {
+        let mut t = Thread::new(1, Agent::Claude, 0);
+        assert!(serde_json::to_value(&t).unwrap().get("draft").is_none());
+        t.draft = "half a thought".into();
+        let back: Thread = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(back.draft, "half a thought");
     }
 
     #[test]
