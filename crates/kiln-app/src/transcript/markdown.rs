@@ -419,12 +419,14 @@ impl Painter<'_> {
         let copied = self.document.code_copied(&copy_id);
         let icon = if copied { assets::Icon::Check } else { assets::Icon::Copy };
         let tooltip = if copied { "Copied" } else { "Copy code" };
+        let scroll_id = self.id("code-scroll");
+        let styled = super::code::render(language, code.clone(), theme);
+        self.document.track(code.clone(), &styled, Vec::new());
         let language = if language.is_empty() { "code" } else { language };
-        div().flex().flex_col().w_full().min_w_0().rounded(px(10.)).bg(theme.fill)
-            .border_1().border_color(theme.border)
+        div().flex().flex_col().w_full().min_w_0().my_1().rounded(px(8.)).bg(theme.fill)
+            .overflow_hidden()
             .child(
-                div().flex().items_center().px_3().py_1().text_xs().text_color(theme.muted)
-                    .border_b_1().border_color(theme.border)
+                div().flex().items_center().px_4().py_1p5().text_xs().text_color(theme.muted)
                     .child(div().flex_1().child(language.to_string()))
                     .child(
                         div().id(copy_id.clone()).flex().items_center().justify_center()
@@ -437,8 +439,10 @@ impl Painter<'_> {
                     ),
             )
             .child(
-                div().px_3().py_2().font_family(MONO).text_xs().line_height(relative(1.6))
-                    .text_color(theme.text).child(self.document.plain(code)),
+                div().id(scroll_id).w_full().overflow_x_scroll()
+                    .child(div().px_4().pt_1().pb_4().font_family(MONO).text_size(px(13.))
+                        .line_height(relative(1.65)).whitespace_nowrap()
+                        .text_color(theme.text).child(styled)),
             )
     }
 
@@ -601,9 +605,9 @@ pub fn render_user(
     if references.is_empty() {
         return document.plain(text.to_owned()).into_any_element();
     }
-    let colors = ChipColors { text: theme.on_accent.into(), border: theme.on_accent.opacity(0.5).into() };
+    let colors = ChipColors { text: theme.text.into(), border: theme.accent.opacity(0.4).into() };
     let run = TextRun {
-        len: 0, font: font(theme.font), color: theme.on_accent.into(),
+        len: 0, font: font(theme.font), color: theme.text.into(),
         background_color: None, underline: None, strikethrough: None,
     };
     let mut display = String::new();

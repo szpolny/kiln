@@ -1,6 +1,7 @@
 //! Which rows the conversation shows. Once the agent has replied, what it sent
 //! on the way there is folded under one "Worked" row.
 
+pub(crate) mod code;
 pub(crate) mod markdown;
 pub(crate) mod selection;
 pub(crate) mod shell;
@@ -21,8 +22,10 @@ pub enum Entry {
     /// A contiguous run of tool calls. Its children remain virtualized.
     ToolGroup { start: usize, count: usize },
     GroupedTool(usize),
-    /// Live turn status after the latest message.
+    /// Live turn status at the beginning of the current response.
     Activity,
+    /// Streamed text after the current turn's recorded messages.
+    LiveReply,
 }
 
 /// The title of a work row: how long the agent ran, in its two largest units.
@@ -105,7 +108,14 @@ pub fn entries(
         start = end;
     }
     if running {
-        out.push(Entry::Activity);
+        let first = messages.iter().rposition(|m| m.role == Role::User).map_or(0, |i| i + 1);
+        let at = out.iter().position(|entry| match *entry {
+            Entry::Message(i) | Entry::GroupedTool(i) => i >= first,
+            Entry::ToolGroup { start, .. } | Entry::Work { start, .. } => start >= first,
+            _ => false,
+        }).unwrap_or(out.len());
+        out.insert(at, Entry::Activity);
+        out.push(Entry::LiveReply);
     }
     out
 }
@@ -234,15 +244,15 @@ mod tests {
         messages.extend(turn());
         assert_eq!(
             entries(&messages[..5], true, |_| false, |_| false),
-            [M(0), work(1, 3), M(3), M(4), Activity]
+            [M(0), work(1, 3), M(3), M(4), Activity, Entry::LiveReply]
         );
         assert_eq!(
             entries(&messages[..5], true, |at| at == 1, |_| false),
-            [M(0), work(1, 3), M(1), M(2), M(3), M(4), Activity]
+            [M(0), work(1, 3), M(1), M(2), M(3), M(4), Activity, Entry::LiveReply]
         );
         assert_eq!(
             entries(&messages, true, |_| false, |_| false),
-            [M(0), work(1, 3), M(3), M(4), M(5), M(6), M(7), Activity]
+            [M(0), work(1, 3), M(3), M(4), Activity, M(5), M(6), M(7), Entry::LiveReply]
         );
         assert_eq!(
             entries(&messages, false, |_| false, |_| false),
@@ -251,13 +261,13 @@ mod tests {
     }
 
     #[test]
-    fn activity_follows_the_latest_message_until_the_turn_ends() {
+    fn activity_stays_above_the_live_turn_until_it_ends() {
         let mut messages = vec![Message::user("go")];
-        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), Activity]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), Activity, Entry::LiveReply]);
         messages.push(Message::agent("Looking."));
-        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), M(1), Activity]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), Activity, M(1), Entry::LiveReply]);
         messages.push(Message::agent("Done."));
-        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), M(1), M(2), Activity]);
+        assert_eq!(entries(&messages, true, |_| false, |_| false), [M(0), Activity, M(1), M(2), Entry::LiveReply]);
         assert_eq!(entries(&messages, false, |_| false, |_| false), [M(0), M(1), M(2)]);
     }
 
@@ -279,13 +289,13 @@ mod tests {
         );
         assert_eq!(
             entries(&messages, true, |_| false, |start| start == 1),
-            [M(0), group, Entry::GroupedTool(1), Entry::GroupedTool(2), M(3), M(4), M(5), Activity],
+            [M(0), Activity, group, Entry::GroupedTool(1), Entry::GroupedTool(2), M(3), M(4), M(5), Entry::LiveReply],
         );
         assert_eq!(
             entries(&messages[..3], true, |_| false, |_| false),
-            [M(0), group, Activity],
+            [M(0), Activity, group, Entry::LiveReply],
         );
-        assert_eq!(entries(&messages[..2], true, |_| false, |_| false), [M(0), M(1), Activity]);
+        assert_eq!(entries(&messages[..2], true, |_| false, |_| false), [M(0), Activity, M(1), Entry::LiveReply]);
     }
 
     #[test]

@@ -4,12 +4,11 @@ use crate::transcript::{self, markdown, selection, shell, Entry};
 use crate::{assets, media, visualization};
 use chrono::{Local, TimeZone};
 use gpui::{
-    div, prelude::*, px, relative, Animation, AnimationExt, Context, FontWeight, IntoElement,
+    div, prelude::*, px, relative, Context, IntoElement,
     Window,
 };
 use kiln_core::checkout::{self, Checkout};
 use kiln_core::{title, AttachmentContent, Role, Status};
-use std::time::Duration;
 
 impl Workspace {
     pub(super) fn sync_transcript(&mut self) {
@@ -78,8 +77,9 @@ impl Workspace {
             Some(&Entry::Message(ix)) => self.message(id, ix, false, window, cx),
             Some(&Entry::GroupedTool(ix)) => self.message(id, ix, true, window, cx),
             Some(&Entry::ToolGroup { start, count }) => self.tool_group_row(id, start, count, cx),
-            Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
-            Some(&Entry::Activity) => self.turn_activity(id, window, cx).into_any_element(),
+            Some(&Entry::Work { start, .. }) => self.work_row(id, start, cx),
+            Some(&Entry::Activity) => self.turn_activity(id).into_any_element(),
+            Some(&Entry::LiveReply) => self.live_reply(id, window, cx).into_any_element(),
             None => div().into_any_element(),
         }
     }
@@ -90,13 +90,11 @@ impl Workspace {
         let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
         centered(
             div().id(("tool-group", start)).flex().items_center().gap_2().px_3().py_1p5()
-                .rounded(px(8.)).bg(theme.fill).border_1().border_color(theme.border)
+                .rounded(px(6.))
                 .text_xs().text_color(theme.muted).cursor_pointer()
                 .hover(|h| h.bg(theme.hover))
-                .child(assets::icon(assets::Icon::Layers, 13.))
-                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text).child(format!("{count} tool calls")))
-                .child(assets::icon(chevron, 13.))
+                .child(assets::icon(chevron, 12.))
+                .child(div().child(format!("{count} tool calls")))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if !this.open_tool_groups.remove(&(id, start)) {
                         this.open_tool_groups.insert((id, start));
@@ -106,20 +104,16 @@ impl Workspace {
                     cx.notify();
                 })),
         )
-        .px_6().py_1p5().into_any_element()
+        .px_6().py_0p5().into_any_element()
     }
 
     /// Stands for what the agent did before it replied; a click shows or hides
-    /// it. Shows how long that took and when the reply arrived.
-    fn work_row(&self, id: u64, start: usize, reply: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// it. Shows how long that took.
+    fn work_row(&self, id: u64, start: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
         let messages = self.store.thread(id).map_or(&[][..], |t| &t.messages);
         // The user message the work answers is the one just before it.
         let ran = start.checked_sub(1).and_then(|i| messages.get(i)).map_or(0, |m| m.worked_ms);
-        let replied = messages.get(reply)
-            .filter(|m| m.at > 0)
-            .and_then(|m| Local.timestamp_opt(i64::try_from(m.at).ok()?, 0).single())
-            .map(|at| transcript::clock(at, Local::now()));
         let chevron = if self.open_work.contains(&(id, start)) {
             assets::Icon::ChevronDown
         } else {
@@ -134,12 +128,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_work(id, start, cx)));
         centered(
             div().flex().flex_col().w_full().gap_1p5().text_xs().text_color(theme.muted)
-                .child(
-                    div().flex().items_center().justify_between()
-                        .child(button)
-                        .when_some(replied, |d, time| d.child(time)),
-                )
-                .child(div().w_full().h(px(1.)).bg(theme.border)),
+                .child(div().flex().child(button)),
         )
         .px_6()
         .py_1p5()
@@ -166,7 +155,7 @@ impl Workspace {
             }
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
-                    .bg(theme.accent).text_color(theme.on_accent)
+                    .bg(theme.fill).text_color(theme.text)
                     .when(!m.body.is_empty(), |d| {
                         d.child(markdown::render_user(&m.body, theme, root.as_deref(), &scratch_dir, &mut document, window, cx))
                     })
@@ -206,13 +195,21 @@ impl Workspace {
                 .child(document.plain(m.body.clone()))
                 .into_any_element(),
         };
-        let body = centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6().py_1p5();
-        let highlight = if m.role == Role::User && m.tool.is_none() {
-            theme.on_accent
-        } else {
-            theme.accent
-        };
-        document.render(body, highlight.opacity(0.3).into()).into_any_element()
+        let user = m.role == Role::User && m.tool.is_none();
+        let timestamp = (m.tool.is_none() && matches!(m.role, Role::User | Role::Agent) && m.at > 0)
+            .then(|| i64::try_from(m.at).ok().and_then(|at| Local.timestamp_opt(at, 0).single()))
+            .flatten().map(|at| transcript::clock(at, Local::now()));
+        let content = div().flex().flex_col().min_w_0().gap_1p5().child(content)
+            .when_some(timestamp, |d, time| {
+                d.child(div().text_size(px(11.)).line_height(relative(1.3)).text_color(theme.muted)
+                    .when(user, |d| d.self_end().pr_2())
+                    .child(time))
+            });
+        let body = centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6()
+            .when(user, |d| d.pt(px(if ix == 0 { 8. } else { 28. })).pb(px(20.)))
+            .when(!user && m.tool.is_some(), |d| d.py_0p5())
+            .when(!user && m.tool.is_none(), |d| d.py_2());
+        document.render(body, theme.accent.opacity(0.3).into()).into_any_element()
     }
 
     fn tool_call(
@@ -228,10 +225,9 @@ impl Workspace {
         let open = self.open_tools.contains(&(id, ix));
         let preview = input.lines().next().unwrap_or_default().trim();
         let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
-        let header = div().flex().items_center().gap_2().min_w_0().px_3().py_1p5().text_xs()
+        let header = div().flex().items_center().gap_2().min_w_0().px_2().py_1p5().rounded(px(6.)).text_xs()
             .child(assets::icon(tool_icon(name), 13.))
-            .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text).child(name.to_string()))
+            .child(div().flex_shrink_0().child(name.to_string()))
             .child(div().flex_1().min_w_0().truncate().font_family(MONO)
                 .when(!open && !preview.is_empty(), |d| {
                     let mut chars = preview.chars();
@@ -261,12 +257,11 @@ impl Workspace {
                 }))
                 .into_any_element()
         };
-        div().flex().flex_col().w_full().min_w_0().rounded(px(8.)).overflow_hidden().bg(theme.fill)
-            .border_1().border_color(theme.border)
+        div().flex().flex_col().w_full().min_w_0()
             .text_color(theme.muted)
             .child(header)
             .when(open, |d| {
-                let details = div().px_3().py_2().border_t_1().border_color(theme.border)
+                let details = div().ml(px(14.)).pl_4().pr_2().py_2().mb_2().border_l_1().border_color(theme.border)
                     .font_family(MONO).text_xs().line_height(relative(1.6))
                     .text_color(theme.text);
                 let details = match self.shell_highlights.get(&ix).and_then(Option::as_deref) {
@@ -281,7 +276,19 @@ impl Workspace {
             })
     }
 
-    fn turn_activity(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn turn_activity(&self, id: u64) -> impl IntoElement {
+        let theme = self.theme;
+        let label = if self.is_stopping(id) {
+            div().child("Stopping…")
+        } else if self.has_live_approval(id) {
+            div().text_color(theme.warn).child("Waiting for approval")
+        } else {
+            div().child(super::sidebar::working_label(id, theme))
+        };
+        centered(div().text_xs().text_color(theme.muted).child(label)).px_6().py_1p5()
+    }
+
+    fn live_reply(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         // The streamed reply takes the index its whole message will have.
         let (key, checkout) = self.store.thread(id)
@@ -294,37 +301,13 @@ impl Workspace {
                 markdown::parse_at(&shown_reply(&stream.text[..stream.shown], &checkout, projectless), root.as_deref()).into()
             }).clone()
         });
-        let stopping = self.is_stopping(id);
-        let waiting = self.has_live_approval(id);
-        let (label, color) = if stopping {
-            ("Stopping…", theme.muted)
-        } else if waiting {
-            ("Waiting for approval", theme.warn)
-        } else {
-            ("Working…", theme.muted)
-        };
-        let dot = div().size(px(7.)).rounded_full().bg(color);
-        let dot = if stopping || waiting {
-            dot.into_any_element()
-        } else {
-            dot.with_animation(
-                ("agent-activity", id),
-                Animation::new(Duration::from_millis(1200)).repeat().with_max_fps(20.),
-                |dot, phase| dot.opacity(1. - 1.2 * phase.min(1. - phase)),
-            ).into_any_element()
-        };
-        let status = centered(div().flex().items_center().gap_2().text_xs().text_color(theme.muted)
-            .child(dot)
-            .child(label))
-            .px_6().py_1p5();
         let mut document = selection::Document::new(self.output_selection.clone(), key);
         let content = div().flex().flex_col().w_full()
             .when_some(streamed, |d, blocks| {
                 d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
                     .child(markdown::render(&blocks, theme, root.as_deref(), &self.scratch_dir(id), &mut document, window, cx)))
                     .px_6().py_1p5())
-            })
-            .child(status);
+            });
         document.render(content, theme.accent.opacity(0.3).into())
     }
 }

@@ -6,8 +6,8 @@ use crate::tooltip::tip;
 use crate::workspace::{agent_icon, Menu, Workspace, TOOLBAR};
 use gpui::{
     anchored, deferred, div, img, list, prelude::*, px, rgb, Anchor, Animation, AnimationExt,
-    Context, Div, ElementId, Focusable, FontWeight, HighlightStyle, IntoElement, ListOffset,
-    SharedString, Stateful, StyledText, Window,
+    Context, Div, ElementId, Focusable, FontWeight, IntoElement, ListOffset,
+    SharedString, Stateful, Window,
 };
 use kiln_core::{Checkout, Project, Status, Thread};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -334,20 +334,14 @@ impl Workspace {
     }
 }
 
-fn working_label(id: u64, theme: Theme) -> impl IntoElement {
-    const LABEL: &str = "Working";
-    const RADIUS: f32 = 3.0;
-    StyledText::new(LABEL).with_animation(
-        ("sidebar-activity", id),
+pub(super) fn working_label(id: u64, theme: Theme) -> impl IntoElement {
+    // Animate one text run: changing per-letter runs can change kerning while shaping.
+    div().flex_shrink_0().whitespace_nowrap().child("Working").with_animation(
+        ("working-label", id),
         Animation::new(Duration::from_millis(2400)).repeat().with_max_fps(20.),
-        move |text, phase| {
-            // Move the highlight fully past both ends so the loop joins at the base color.
-            let center = phase * (LABEL.len() as f32 - 1. + 2. * RADIUS) - RADIUS;
-            text.with_highlights((0..LABEL.len()).map(|index| {
-                let weight = (1. - (index as f32 - center).abs() / RADIUS).max(0.);
-                let color = theme.accent.blend(theme.text.opacity(0.5 * weight * weight));
-                (index..index + 1, HighlightStyle { color: Some(color.into()), ..Default::default() })
-            }))
+        move |label, phase| {
+            let glow = (1. - (phase * std::f32::consts::TAU).cos()) * 0.5;
+            label.text_color(theme.muted.blend(theme.accent.opacity(0.35 + 0.65 * glow)))
         },
     )
 }

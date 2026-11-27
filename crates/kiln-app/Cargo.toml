@@ -33,6 +33,7 @@ unicode-segmentation = "1"
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 kiln-core = { path = "../kiln-core" }
 kiln-agent = { path = "../kiln-agent" }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 
 [build-dependencies]
 cc = "1"

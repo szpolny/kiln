@@ -612,7 +612,7 @@ impl Workspace {
             };
             thread.title = label.chars().take(40).collect();
         }
-        let mut message = Message::user(prompt.body.clone());
+        let mut message = Message::user(prompt.body.clone()).at(now());
         message.attachments = prompt.attachments.clone();
         message.checkout_dir = checkout;
         thread.messages.push(message);
@@ -1288,7 +1288,7 @@ impl Workspace {
 
     /// Have the list measure the live row of thread `id` again, as its height changed.
     fn remeasure_activity(&mut self, id: u64) {
-        if self.transcript_thread == Some(id) && self.entries.last() == Some(&Entry::Activity) {
+        if self.transcript_thread == Some(id) && self.entries.last() == Some(&Entry::LiveReply) {
             let row = self.entries.len() - 1;
             self.transcript.remeasure_items(row..row + 1);
         }
