@@ -52,8 +52,9 @@ Run `cargo clippy --all-targets` and `cargo test` before committing. Set `KILN_S
 
 Kiln is heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code).
 
-The composer uses the SCOWL US English dictionary. See its
+All spelling dictionaries come from
+[LibreOffice Dictionaries](https://github.com/LibreOffice/dictionaries). The
+composer bundles US English; see its
 [copyright and license notices](crates/kiln-app/assets/dictionaries/README_en_US.txt).
-Additional dictionaries are downloaded directly from
-[LibreOffice Dictionaries](https://github.com/LibreOffice/dictionaries) and
-verified before use.
+Additional dictionaries are downloaded directly from that project and verified
+before use.
