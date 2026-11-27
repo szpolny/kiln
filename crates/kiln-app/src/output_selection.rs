@@ -167,6 +167,10 @@ impl Document {
         }
     }
 
+    pub fn message_index(&self) -> usize {
+        self.message
+    }
+
     pub fn drag_guard(&self) -> impl Fn() -> bool + use<> {
         let selection = self.selection.clone();
         let message = self.message;

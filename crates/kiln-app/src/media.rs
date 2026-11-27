@@ -20,6 +20,7 @@ const IMAGE_LIMIT: usize = 5 * 1024 * 1024;
 pub const TOTAL_LIMIT: usize = 20 * 1024 * 1024;
 pub const COUNT_LIMIT: usize = 8;
 const PREVIEW_LIMIT: usize = 10 * 1024 * 1024;
+const THUMBNAIL_SIDE: u32 = 64;
 
 fn read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let metadata = path.metadata().map_err(|err| err.to_string())?;
@@ -222,6 +223,16 @@ impl Hash for Picture {
 }
 
 pub(crate) struct DecodePicture;
+pub(crate) struct DecodeThumbnail;
+
+impl Asset for DecodeThumbnail {
+    type Source = Picture;
+    type Output = Result<Arc<RenderImage>, String>;
+
+    fn load(source: Picture, cx: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        cx.background_executor().spawn(async move { decode_picture(source, Some(THUMBNAIL_SIDE)) })
+    }
+}
 
 impl Asset for DecodePicture {
     type Source = Picture;
@@ -231,28 +242,45 @@ impl Asset for DecodePicture {
         source: Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
-        cx.background_executor().spawn(async move {
-            let bytes = match source {
-                Picture::Local { checkout, scratch, path } => {
-                    let path = reply_image_path(checkout.as_deref(), &scratch, &path)
-                        .ok_or("Image is missing or outside the checkout and thread scratch directory.")?;
-                    read(&path, PREVIEW_LIMIT)?
-                }
-                Picture::Embedded { data, .. } => {
-                    if data.len() > PREVIEW_LIMIT.div_ceil(3) * 4 {
-                        return Err("Image exceeds the preview limit.".into());
-                    }
-                    STANDARD.decode(&*data).map_err(|_| "Invalid image data.")?
-                }
-            };
-            let (format, _) = image_info(&bytes)?;
-            let mut pixels = decode(&bytes, format)?.into_rgba8();
-            for pixel in pixels.as_chunks_mut::<4>().0 {
-                pixel.swap(0, 2);
-            }
-            Ok(Arc::new(RenderImage::new([image::Frame::new(pixels)])))
-        })
+        cx.background_executor().spawn(async move { decode_picture(source, None) })
     }
+}
+
+fn decode_picture(source: Picture, thumbnail_side: Option<u32>) -> Result<Arc<RenderImage>, String> {
+    let (bytes, local_extension) = match source {
+        Picture::Local { checkout, scratch, path } => {
+            let resolved = reply_image_path(checkout.as_deref(), &scratch, &path)
+                .ok_or("Image is missing or outside the checkout and thread scratch directory.")?;
+            let extension = path.extension().and_then(|ext| ext.to_str()).map(str::to_ascii_lowercase);
+            (read(&resolved, PREVIEW_LIMIT)?, extension)
+        }
+        Picture::Embedded { data, .. } => {
+            if data.len() > PREVIEW_LIMIT.div_ceil(3) * 4 {
+                return Err("Image exceeds the preview limit.".into());
+            }
+            (STANDARD.decode(&*data).map_err(|_| "Invalid image data.")?, None)
+        }
+    };
+    let mut pixels = match local_extension.as_deref() {
+        Some("svg") => crate::project_icon::svg(&bytes, thumbnail_side.unwrap_or(2048))
+            .ok_or("Could not decode SVG image.")?,
+        extension => {
+            let format = if extension == Some("ico") && matches!(image::guess_format(&bytes), Ok(ImageFormat::Ico)) {
+                ImageFormat::Ico
+            } else {
+                image_info(&bytes)?.0
+            };
+            let image = decode(&bytes, format)?;
+            match thumbnail_side {
+                Some(side) if image.width().max(image.height()) > side => image.thumbnail(side, side).into_rgba8(),
+                _ => image.into_rgba8(),
+            }
+        }
+    };
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Ok(Arc::new(RenderImage::new([image::Frame::new(pixels)])))
 }
 
 #[derive(IntoElement)]

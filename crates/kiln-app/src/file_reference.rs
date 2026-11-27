@@ -1,13 +1,15 @@
 //! Checkout paths offered by the composer and the Markdown it inserts.
 
 use crate::{assets, media};
-use gpui::{font, point, px, quad, size, App, Bounds, Hsla, PaintQuad, Pixels, Point, TextRun};
+use gpui::{font, point, px, quad, size, App, Bounds, Hsla, PaintQuad, Pixels, Point, RenderImage, TextRun, Window};
 use pulldown_cmark::{Event, Parser, Tag};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 const MAX_SUGGESTIONS: usize = 6;
+const CHIP_PADDING: &str = "\u{a0}\u{a0}";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Query {
@@ -110,10 +112,33 @@ pub fn link_destination(path: &str) -> String {
     utf8_percent_encode(path, MARKDOWN_PATH).to_string()
 }
 
-pub fn reveal(root: &Path, path: &Path, cx: &App) {
-    if let Some(path) = media::scoped_path(root, path).filter(|path| path.is_file()) {
+pub fn picture(root: Option<&Path>, scratch: &Path, path: &Path) -> Option<media::Picture> {
+    (matches!(file_icon(path).0, assets::Icon::Image) && (root.is_some() || path.is_absolute()))
+        .then(|| media::Picture::Local {
+            checkout: root.map(Path::to_path_buf),
+            scratch: scratch.to_path_buf(),
+            path: path.to_path_buf(),
+        })
+}
+
+pub fn thumbnail(
+    picture: Option<&media::Picture>, window: &mut Window, cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    window.use_asset::<media::DecodeThumbnail>(picture?, cx)?.ok()
+}
+
+pub fn open(
+    root: Option<&Path>, path: &Path, picture: Option<&media::Picture>, window: &mut Window, cx: &mut App,
+) {
+    if let Some(picture) = picture {
+        crate::image_lightbox::open(filename(path).into_owned(), picture.clone(), window, cx);
+    } else if let Some(path) = root.and_then(|root| media::scoped_path(root, path)).filter(|path| path.is_file()) {
         cx.reveal_path(&path);
     }
+}
+
+fn filename(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -133,7 +158,7 @@ pub fn file_icon(path: &Path) -> (assets::Icon, Option<u32>) {
         Some("ts" | "mts" | "cts") => (Icon::FileCode, Some(0x3178c6)),
         Some("js" | "mjs" | "cjs") => (Icon::FileCode, Some(0x9c7417)),
         Some("json" | "jsonc") => (Icon::FileJson, None),
-        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "svg" | "ico") => {
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "svg" | "ico") => {
             (Icon::Image, None)
         }
         Some("md" | "txt" | "rst" | "pdf") => (Icon::FileText, None),
@@ -147,27 +172,38 @@ pub fn file_icon(path: &Path) -> (assets::Icon, Option<u32>) {
     }
 }
 
+pub struct Chip {
+    pub range: Range<usize>,
+    icon_run: usize,
+}
+
+impl Chip {
+    pub fn hide_icon(&self, runs: &mut [TextRun]) {
+        runs[self.icon_run].color = gpui::transparent_black();
+    }
+}
+
 pub fn append_chip(
     path: &Path,
     text: &mut String,
     runs: &mut Vec<TextRun>,
     run: &TextRun,
     colors: ChipColors,
-) -> Range<usize> {
+) -> Chip {
     let start = text.len();
-    let padding = "\u{a0}\u{a0}";
     let chip = TextRun {
-        len: padding.len(),
+        len: CHIP_PADDING.len(),
         color: colors.text,
         background_color: None,
         underline: None,
         strikethrough: None,
         ..run.clone()
     };
-    text.push_str(padding);
+    text.push_str(CHIP_PADDING);
     runs.push(chip.clone());
     let (icon, tint) = file_icon(path);
     let icon = char::from(icon);
+    let icon_run = runs.len();
     text.push(icon);
     runs.push(TextRun {
         len: icon.len_utf8(),
@@ -175,12 +211,9 @@ pub fn append_chip(
         color: tint.map_or(chip.color, |tint| gpui::rgb(tint).into()),
         ..chip.clone()
     });
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
+    let name = filename(path);
     let length = text.len();
-    text.push_str(padding);
+    text.push_str(CHIP_PADDING);
     for (i, c) in name.chars().enumerate() {
         if i == 32 {
             text.push('…');
@@ -192,12 +225,36 @@ pub fn append_chip(
             c
         });
     }
-    text.push_str(padding);
+    text.push_str(CHIP_PADDING);
     runs.push(TextRun {
         len: text.len() - length,
         ..chip
     });
-    start..text.len()
+    Chip { range: start..text.len(), icon_run }
+}
+
+pub fn paint_thumbnail(
+    image: Arc<RenderImage>,
+    range: &Range<usize>,
+    line_height: Pixels,
+    position: impl Fn(usize) -> Point<Pixels>,
+    window: &mut Window,
+) {
+    // A transparent icon glyph reserves the same width before and after loading.
+    let icon_start = range.start + CHIP_PADDING.len();
+    let start = position(icon_start);
+    let end = position(icon_start + char::from(assets::Icon::Image).len_utf8());
+    let width = end.x - start.x;
+    if width <= px(0.) || start.y != end.y {
+        return;
+    }
+    let dimensions = image.size(0).map(|pixels| px(u32::from(pixels) as f32));
+    let height = line_height - px(4.);
+    let scale = (width / dimensions.width).min(height / dimensions.height);
+    let fitted = dimensions.map(|side| side * scale);
+    let origin = start + point((width - fitted.width) / 2., (line_height - fitted.height) / 2.);
+    let bounds = Bounds::new(origin, fitted);
+    let _ = window.paint_image(bounds, bounds, px(2.).into(), image, 0, false);
 }
 
 pub fn chip_bounds(

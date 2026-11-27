@@ -477,8 +477,9 @@ impl Workspace {
         let draft = self.selected.and_then(|id| self.store.thread(id)).map_or("", |t| &t.draft);
         let draft = draft.to_owned();
         let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
+        let scratch = self.selected.map(|id| self.scratch_dir(id));
         self.input.update(cx, |input, cx| {
-            input.set_checkout(checkout.as_deref());
+            input.set_reference_paths(checkout, scratch);
             input.set_text(&draft, cx);
         });
     }
@@ -1956,13 +1957,13 @@ impl Workspace {
             })
     }
 
-    fn entry(&mut self, id: u64, row: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn entry(&mut self, id: u64, row: usize, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         match self.entries.get(row) {
-            Some(&Entry::Message(ix)) => self.message(id, ix, false, cx),
-            Some(&Entry::GroupedTool(ix)) => self.message(id, ix, true, cx),
+            Some(&Entry::Message(ix)) => self.message(id, ix, false, window, cx),
+            Some(&Entry::GroupedTool(ix)) => self.message(id, ix, true, window, cx),
             Some(&Entry::ToolGroup { start, count }) => self.tool_group_row(id, start, count, cx),
             Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
-            Some(&Entry::Activity) => self.turn_activity(id).into_any_element(),
+            Some(&Entry::Activity) => self.turn_activity(id, window, cx).into_any_element(),
             None => div().into_any_element(),
         }
     }
@@ -2029,13 +2030,14 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn message(&mut self, id: u64, ix: usize, grouped: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn message(&mut self, id: u64, ix: usize, grouped: bool, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
         let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
             return div().into_any_element();
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
         let root = m.checkout_dir.as_deref().or_else(|| self.checkout_dir(id)).map(Path::to_path_buf);
+        let scratch_dir = self.scratch_dir(id);
         let mut document = output_selection::Document::new(self.output_selection.clone(), ix);
         let content = match (&m.tool, m.role) {
             (Some(name), _) => {
@@ -2049,7 +2051,9 @@ impl Workspace {
             (None, Role::User) => div().flex().justify_end()
                 .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
                     .bg(theme.accent).text_color(theme.on_accent)
-                    .when(!m.body.is_empty(), |d| d.child(markdown::render_user(&m.body, theme, ix, root.as_deref(), &mut document)))
+                    .when(!m.body.is_empty(), |d| {
+                        d.child(markdown::render_user(&m.body, theme, root.as_deref(), &scratch_dir, &mut document, window, cx))
+                    })
                     .when(!m.attachments.is_empty(), |d| {
                         d.child(div().flex().flex_wrap().gap_1()
                             .children(m.attachments.iter().enumerate().map(|(i, attachment)| {
@@ -2058,7 +2062,6 @@ impl Workspace {
                     }))
                 .into_any_element(),
             (None, Role::Agent) => {
-                let scratch_dir = self.scratch_dir(id);
                 let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse_at(&m.body, root.as_deref()).into());
                 let images = self.reply_images.entry(ix).or_insert_with(|| {
                     m.attachments.iter().filter_map(|attachment| match &attachment.content {
@@ -2069,7 +2072,7 @@ impl Workspace {
                     }).collect()
                 });
                 body.when(!blocks.is_empty(), |d| {
-                    d.child(markdown::render(blocks, theme, ix, root.as_deref(), &scratch_dir, &mut document))
+                    d.child(markdown::render(blocks, theme, root.as_deref(), &scratch_dir, &mut document, window, cx))
                 })
                     .children(images.iter().enumerate().map(|(i, (name, picture))| {
                         media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
@@ -2251,18 +2254,18 @@ impl Workspace {
             }))
     }
 
-    fn turn_activity(&mut self, id: u64) -> impl IntoElement {
+    fn turn_activity(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         // The streamed reply takes the index its whole message will have.
         let (key, checkout) = self.store.thread(id)
             .map_or((0, Checkout::Project), |t| (t.messages.len(), t.checkout.clone()));
+        let root = self.checkout_dir(id).map(Path::to_path_buf);
         let streamed = self.turns.get_mut(&id).filter(|turn| turn.stream.shown > 0).map(|turn| {
             let stream = &mut turn.stream;
             stream.blocks.get_or_insert_with(|| {
-                markdown::parse(&shown_reply(&stream.text[..stream.shown], &checkout)).into()
+                markdown::parse_at(&shown_reply(&stream.text[..stream.shown], &checkout), root.as_deref()).into()
             }).clone()
         });
-        let root = self.checkout_dir(id).map(Path::to_path_buf);
         let stopping = self.is_stopping(id);
         let waiting = self.has_live_approval(id);
         let (label, color) = if stopping {
@@ -2290,7 +2293,7 @@ impl Workspace {
         let content = div().flex().flex_col().w_full()
             .when_some(streamed, |d, blocks| {
                 d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
-                    .child(markdown::render(&blocks, theme, key, root.as_deref(), &self.scratch_dir(id), &mut document)))
+                    .child(markdown::render(&blocks, theme, root.as_deref(), &self.scratch_dir(id), &mut document, window, cx)))
                     .px_6().py_1p5())
             })
             .child(status);
@@ -2416,8 +2419,8 @@ impl Workspace {
             return self.empty_state(cx).into_any_element();
         };
         let this = cx.entity();
-        let messages = list(self.transcript.clone(), move |row, _, cx| {
-            this.update(cx, |this, cx| this.entry(id, row, cx))
+        let messages = list(self.transcript.clone(), move |row, window, cx| {
+            this.update(cx, |this, cx| this.entry(id, row, window, cx))
         })
         .flex_1()
         .min_h_0()
@@ -2523,7 +2526,8 @@ impl Render for Workspace {
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
         let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
-        self.input.update(cx, |input, _| input.set_checkout(checkout.as_deref()));
+        let scratch = self.selected.map(|id| self.scratch_dir(id));
+        self.input.update(cx, |input, _| input.set_reference_paths(checkout, scratch));
         for input in [&self.input, &self.prefix_input, &self.palette_input] {
             input.update(cx, |input, _| {
                 input.colors = text_input::Colors {

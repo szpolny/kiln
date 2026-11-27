@@ -7,10 +7,11 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollHandle, SharedString, Style, Subscription, Task, TextAlign, TextRun, UTF16Selection,
+    RenderImage, ScrollHandle, SharedString, Style, Subscription, Task, TextAlign, TextRun, UTF16Selection,
     UnderlineStyle, Window, WrappedLine,
 };
 use std::{ops::Range, path::{Path, PathBuf}};
+use std::sync::Arc;
 use std::time::Duration;
 
 actions!(
@@ -159,6 +160,7 @@ pub struct TextInput {
     pub file_references: bool,
     references: Vec<Reference>,
     checkout: Option<PathBuf>,
+    scratch: Option<PathBuf>,
     placeholder: SharedString,
     pub colors: Colors,
     /// Geometry from the last paint, for hit testing and vertical movement.
@@ -195,6 +197,7 @@ impl TextInput {
             file_references: false,
             references: vec![],
             checkout: None,
+            scratch: None,
             placeholder: placeholder.into(),
             colors: Colors::default(),
             layout: None,
@@ -269,11 +272,16 @@ impl TextInput {
         }
     }
 
-    pub fn set_checkout(&mut self, checkout: Option<&Path>) {
-        if self.checkout.as_deref() != checkout {
-            self.checkout = checkout.map(Path::to_path_buf);
+    pub fn set_reference_paths(&mut self, checkout: Option<PathBuf>, scratch: Option<PathBuf>) {
+        if self.checkout != checkout {
+            self.checkout = checkout;
             self.update_references();
         }
+        self.scratch = scratch;
+    }
+
+    fn reference_picture(&self, path: &Path) -> Option<crate::media::Picture> {
+        file_reference::picture(self.checkout.as_deref(), self.scratch.as_deref()?, path)
     }
 
     fn update_references(&mut self) {
@@ -400,13 +408,16 @@ impl TextInput {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         if ev.click_count == 1 && !ev.modifiers.shift {
-            if let Some((root, layout)) = self.checkout.as_deref().zip(self.layout.as_ref()) {
+            if let Some(layout) = &self.layout {
                 if let Some((i, _)) = layout.chips.iter().enumerate().find(|(_, chip)| chip.bounds.contains(&ev.position)) {
                     if let Some(reference) = layout.spans.get(i).and_then(|span| {
                         self.references.iter().find(|reference| reference.source == span.source)
                     }) {
-                        file_reference::reveal(root, &reference.path, cx);
-                        return;
+                        let picture = self.reference_picture(&reference.path);
+                        if self.checkout.is_some() || picture.is_some() {
+                            file_reference::open(self.checkout.as_deref(), &reference.path, picture.as_ref(), window, cx);
+                            return;
+                        }
                     }
                 }
             }
@@ -794,6 +805,7 @@ struct Shaping {
     runs: Vec<TextRun>,
     font_size: Pixels,
     spans: Vec<ChipSpan>,
+    thumbnails: Vec<(Range<usize>, Arc<RenderImage>)>,
 }
 
 struct Prepaint {
@@ -837,6 +849,7 @@ impl Element for TextElement {
             strikethrough: None,
         };
         let mut spans = vec![];
+        let mut pictures = vec![];
         let mut runs = vec![];
         let mut visible = String::new();
         let marked = input.buffer.marked();
@@ -872,9 +885,17 @@ impl Element for TextElement {
                 &reference.path, &mut visible, &mut runs, &run, input.colors.reference,
             );
             at = source.end;
-            spans.push(ChipSpan { source, visible: chip });
+            spans.push(ChipSpan { source, visible: chip.range.clone() });
+            if let Some(picture) = input.reference_picture(&reference.path) {
+                pictures.push((chip, picture));
+            }
         }
         plain(at..text.len(), &mut visible, &mut runs);
+        let thumbnails = pictures.into_iter().filter_map(|(chip, picture)| {
+            let image = file_reference::thumbnail(Some(&picture), window, cx)?;
+            chip.hide_icon(&mut runs);
+            Some((chip.range, image))
+        }).collect();
         text = visible.into();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -894,7 +915,7 @@ impl Element for TextElement {
             let height = lines.iter().fold(px(0.), |h, l| h + l.size(line_height).height);
             size(width.unwrap_or_default(), height.max(line_height))
         });
-        (id, Shaping { text, runs, font_size, spans })
+        (id, Shaping { text, runs, font_size, spans, thumbnails })
     }
 
     fn prepaint(
@@ -953,7 +974,7 @@ impl Element for TextElement {
         _: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Shaping,
+        shaping: &mut Shaping,
         prepaint: &mut Prepaint,
         window: &mut Window,
         cx: &mut App,
@@ -977,6 +998,11 @@ impl Element for TextElement {
         for (line, top) in layout.lines.iter().zip(&layout.tops) {
             let origin = point(layout.origin.x, layout.origin.y + *top);
             let _ = line.paint(origin, layout.line_height, TextAlign::Left, None, window, cx);
+        }
+        for (range, thumbnail) in shaping.thumbnails.drain(..) {
+            file_reference::paint_thumbnail(thumbnail, &range, layout.line_height, |offset| {
+                layout.visible_position(offset)
+            }, window);
         }
         let caret = prepaint.caret.take();
         if let Some(caret) = caret.clone().filter(|_| focused && show_caret) {

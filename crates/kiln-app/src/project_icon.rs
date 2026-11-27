@@ -28,7 +28,7 @@ pub fn from_file(file: &Path) -> Option<Arc<RenderImage>> {
 fn picture(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let mut pixels = match image::guess_format(bytes) {
         Ok(_) => raster(bytes)?,
-        Err(_) => svg(bytes)?,
+        Err(_) => svg(bytes, SIDE)?,
     };
     // An invisible icon, such as an SVG that is only text, is no icon.
     if pixels.pixels().all(|p| p[3] == 0) {
@@ -68,7 +68,7 @@ fn raster(bytes: &[u8]) -> Option<RgbaImage> {
     Some(small)
 }
 
-fn svg(bytes: &[u8]) -> Option<RgbaImage> {
+pub(crate) fn svg(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
     let options = usvg::Options {
         // An SVG may name other files. Only what it embeds is drawn.
         image_href_resolver: usvg::ImageHrefResolver {
@@ -79,8 +79,8 @@ fn svg(bytes: &[u8]) -> Option<RgbaImage> {
     };
     let tree = usvg::Tree::from_data(bytes, &options).ok()?;
     let size = tree.size();
-    let scale = SIDE as f32 / size.width().max(size.height());
-    let fit = |side: f32| ((side * scale).round() as u32).clamp(1, SIDE);
+    let scale = max_side as f32 / size.width().max(size.height());
+    let fit = |side: f32| ((side * scale).round() as u32).clamp(1, max_side);
     let mut canvas = tiny_skia::Pixmap::new(fit(size.width()), fit(size.height()))?;
     let transform = tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut canvas.as_mut());

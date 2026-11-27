@@ -3,11 +3,12 @@
 //! Images load locally from the thread checkout. Links open only on click.
 
 use crate::{assets, file_reference::{self, ChipColors}, media, output_selection::Document, tooltip::tip};
-use std::{ops::Range, path::{Path, PathBuf}};
+use std::{ops::Range, path::{Path, PathBuf}, sync::Arc};
 use crate::theme::{Theme, MONO};
 use gpui::{
     canvas, div, font, prelude::*, px, relative, AnyElement, FontStyle, FontWeight,
-    InteractiveText, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle,
+    App, ClickEvent, CursorStyle, HitboxBehavior, InteractiveText, RenderImage, SharedString,
+    StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -255,7 +256,8 @@ fn heading_depth(level: HeadingLevel) -> u8 {
     level as u8
 }
 
-pub fn parse(source: &str) -> Vec<Block> {
+#[cfg(test)]
+fn parse(source: &str) -> Vec<Block> {
     parse_at(source, None)
 }
 
@@ -303,26 +305,28 @@ fn opens(url: &str) -> bool {
     ["http://", "https://", "mailto:"].iter().any(|scheme| url.starts_with(scheme))
 }
 
-/// Draw parsed blocks. `key` must be unique among messages on screen.
+/// Draw parsed blocks using the document's message index to identify elements.
 pub fn render(
-    blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>, scratch: &Path, document: &mut Document,
+    blocks: &[Block], theme: Theme, root: Option<&Path>, scratch: &Path, document: &mut Document,
+    window: &mut Window, cx: &mut App,
 ) -> gpui::Div {
-    Painter { theme, key, next_id: 0, root, scratch, document }.column(blocks)
+    Painter { theme, next_id: 0, root, scratch, document, window, cx }.column(blocks)
 }
 
 struct Painter<'a> {
     root: Option<&'a Path>,
     scratch: &'a Path,
     document: &'a mut Document,
+    window: &'a mut Window,
+    cx: &'a mut App,
     theme: Theme,
-    key: usize,
     next_id: usize,
 }
 
 impl Painter<'_> {
     fn id(&mut self, kind: &str) -> SharedString {
         self.next_id += 1;
-        format!("md-{kind}-{}-{}", self.key, self.next_id).into()
+        format!("md-{kind}-{}-{}", self.document.message_index(), self.next_id).into()
     }
 
     fn column(&mut self, blocks: &[Block]) -> gpui::Div {
@@ -463,9 +467,15 @@ impl Painter<'_> {
                 underline: url.map(|_| UnderlineStyle { thickness: px(1.), ..Default::default() }),
                 strikethrough: style.strike.then(|| StrikethroughStyle { thickness: px(1.), ..Default::default() }),
             };
-            if let Some(path) = self.root.and(style.link.as_deref()).and_then(media::link_path) {
-                let range = file_reference::append_chip(&path, &mut text, &mut runs, &run, colors);
-                links.push((range, Link::File(path)));
+            let file = style.link.as_deref().and_then(media::link_path).map(|path| {
+                FileLink::new(path, self.root, self.scratch, self.window, self.cx)
+            }).filter(|file| self.root.is_some() || file.picture.is_some());
+            if let Some(file) = file {
+                let chip = file_reference::append_chip(&file.path, &mut text, &mut runs, &run, colors);
+                if file.thumbnail.is_some() {
+                    chip.hide_icon(&mut runs);
+                }
+                links.push((chip.range, Link::File(file)));
             } else {
                 if let Some(url) = url {
                     links.push((text.len()..text.len() + len, Link::Web(url.clone())));
@@ -481,7 +491,21 @@ impl Painter<'_> {
 
 enum Link {
     Web(String),
-    File(PathBuf),
+    File(FileLink),
+}
+
+struct FileLink {
+    path: PathBuf,
+    picture: Option<media::Picture>,
+    thumbnail: Option<Arc<RenderImage>>,
+}
+
+impl FileLink {
+    fn new(path: PathBuf, root: Option<&Path>, scratch: &Path, window: &mut Window, cx: &mut App) -> Self {
+        let picture = file_reference::picture(root, scratch, &path);
+        let thumbnail = file_reference::thumbnail(picture.as_ref(), window, cx);
+        Self { path, picture, thumbnail }
+    }
 }
 
 fn linked_text(
@@ -491,49 +515,86 @@ fn linked_text(
     let display = SharedString::from(text);
     let text = StyledText::new(display.clone()).with_runs(runs);
     let chips = links.iter().filter_map(|(range, link)| match link {
-        Link::File(path) => Some((range.clone(), path.to_string_lossy().into_owned())),
+        Link::File(file) => Some((range.clone(), file.path.to_string_lossy().into_owned())),
         Link::Web(_) => None,
     }).collect();
     document.track(display, &text, chips);
     if links.is_empty() {
         return text.into_any_element();
     }
-    let layout = text.layout().clone();
-    let borders = links.iter().filter_map(|(range, link)| {
-        matches!(link, Link::File(_)).then_some(range.clone())
-    }).collect::<Vec<_>>();
-    let root = root.map(Path::to_path_buf);
-    let (ranges, links): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-    let dragged = document.drag_guard();
-    let interactive = InteractiveText::new(id, text).on_click(ranges, move |i, _, cx| {
-        if dragged() {
-            return;
-        }
-        match &links[i] {
-            Link::Web(url) => cx.open_url(url),
-            Link::File(path) => {
-                if let Some(root) = &root {
-                    file_reference::reveal(root, path, cx);
-                }
+    let mut files = vec![];
+    let mut chips = vec![];
+    let mut web_ranges = vec![];
+    let mut urls = vec![];
+    for (range, link) in links {
+        match link {
+            Link::Web(url) => {
+                web_ranges.push(range);
+                urls.push(url);
+            }
+            Link::File(mut file) => {
+                chips.push((range.clone(), file.thumbnail.take()));
+                files.push((range, file));
             }
         }
-    });
-    div().relative().child(interactive)
-        .when(!borders.is_empty(), |d| {
-            d.child(canvas(|_, _, _| (), move |_, (), window, _| {
-                for range in borders {
-                    let bounds = file_reference::chip_bounds(&range, layout.line_height(), |offset| {
-                        layout.position_for_index(offset).unwrap_or(layout.bounds().origin)
-                    });
-                    window.paint_quad(file_reference::chip_border(bounds, colors));
-                }
-            }).absolute().inset_0())
+    }
+    let layout = text.layout().clone();
+    let interactive = if urls.is_empty() {
+        text.into_any_element()
+    } else {
+        let dragged = document.drag_guard();
+        InteractiveText::new(id.clone(), text).on_click(web_ranges, move |i, _, cx| {
+            if !dragged() {
+                cx.open_url(&urls[i]);
+            }
+        }).into_any_element()
+    };
+    if files.is_empty() {
+        return interactive;
+    }
+    let root = root.map(Path::to_path_buf);
+    let dragged = document.drag_guard();
+    let click_layout = layout.clone();
+    let paint_layout = layout.clone();
+    div().id(id).relative().child(interactive)
+        .on_click(move |event, window, cx| {
+            if dragged() {
+                return;
+            }
+            let ClickEvent::Mouse(event) = event else { return };
+            let (Ok(down), Ok(up)) = (
+                click_layout.index_for_position(event.down.position),
+                click_layout.index_for_position(event.up.position),
+            ) else { return };
+            if let Some((_, file)) = files.iter().find(|(range, _)| range.contains(&down) && range.contains(&up)) {
+                file_reference::open(root.as_deref(), &file.path, file.picture.as_ref(), window, cx);
+            }
         })
+        .child(canvas(move |_, window, _| {
+            chips.into_iter().map(|(range, thumbnail)| {
+                let bounds = file_reference::chip_bounds(&range, layout.line_height(), |offset| {
+                    layout.position_for_index(offset).unwrap_or(layout.bounds().origin)
+                });
+                let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                (hitbox, range, thumbnail)
+            }).collect::<Vec<_>>()
+        }, move |_, chips, window, _| {
+            for (hitbox, range, thumbnail) in chips {
+                window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                window.paint_quad(file_reference::chip_border(hitbox.bounds, colors));
+                if let Some(thumbnail) = thumbnail {
+                    file_reference::paint_thumbnail(thumbnail, &range, paint_layout.line_height(), |offset| {
+                        paint_layout.position_for_index(offset).unwrap_or(paint_layout.bounds().origin)
+                    }, window);
+                }
+            }
+        }).absolute().inset_0())
         .into_any_element()
 }
 
 pub fn render_user(
-    text: &str, theme: Theme, key: usize, root: Option<&Path>, document: &mut Document,
+    text: &str, theme: Theme, root: Option<&Path>, scratch: &Path, document: &mut Document,
+    window: &mut Window, cx: &mut App,
 ) -> AnyElement {
     let references = file_reference::references(text, root);
     if references.is_empty() {
@@ -549,19 +610,24 @@ pub fn render_user(
     let mut links = vec![];
     let mut at = 0;
     for reference in references {
+        let file = FileLink::new(reference.path, root, scratch, window, cx);
         if at < reference.source.start {
             display.push_str(&text[at..reference.source.start]);
             runs.push(TextRun { len: reference.source.start - at, ..run.clone() });
         }
-        let range = file_reference::append_chip(&reference.path, &mut display, &mut runs, &run, colors);
-        links.push((range, Link::File(reference.path)));
+        let chip = file_reference::append_chip(&file.path, &mut display, &mut runs, &run, colors);
+        if file.thumbnail.is_some() {
+            chip.hide_icon(&mut runs);
+        }
+        links.push((chip.range, Link::File(file)));
         at = reference.source.end;
     }
     if at < text.len() {
         display.push_str(&text[at..]);
         runs.push(TextRun { len: text.len() - at, ..run });
     }
-    linked_text(display, runs, links, format!("user-links-{key}").into(), root, colors, document)
+    let id = format!("user-links-{}", document.message_index());
+    linked_text(display, runs, links, id.into(), root, colors, document)
 }
 
 #[cfg(test)]
