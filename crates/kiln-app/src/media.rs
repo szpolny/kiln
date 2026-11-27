@@ -122,13 +122,13 @@ fn snapshot_image(name: String, bytes: &[u8], limit: usize) -> Result<Attachment
     })
 }
 
-pub fn generated_image(path: &Path, checkout: &Path) -> Result<Attachment, String> {
+pub fn generated_image(path: &Path, checkout: &Path, scratch: &Path) -> Result<Attachment, String> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")));
-    let path = scoped_path(checkout, path)
+    let path = reply_image_path(Some(checkout), scratch, path)
         .or_else(|| scoped_path(&codex_home?.join("generated_images"), path))
-        .ok_or("The generated image is missing or outside the checkout and Codex image folder.")?;
+        .ok_or("The generated image is missing or outside the checkout, thread scratch directory, and Codex image folder.")?;
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
@@ -141,6 +141,29 @@ pub fn scoped_path(root: &Path, path: &Path) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let path = root.join(path).canonicalize().ok()?;
     path.starts_with(&root).then_some(path)
+}
+
+pub fn scratch_root(dir: &Path) -> Option<PathBuf> {
+    if dir.symlink_metadata().ok()?.is_dir() {
+        dir.canonicalize().ok()
+    } else {
+        None
+    }
+}
+
+fn reply_image_path(checkout: Option<&Path>, scratch: &Path, path: &Path) -> Option<PathBuf> {
+    let checkout = checkout.and_then(|root| root.canonicalize().ok());
+    let target = if path.is_absolute() {
+        path.canonicalize().ok()?
+    } else {
+        checkout.as_ref()?.join(path).canonicalize().ok()?
+    };
+    let scratch_parent = scratch.parent().and_then(|dir| dir.canonicalize().ok());
+    // Even an enclosing checkout cannot expose another thread's scratch files.
+    if scratch_parent.is_some_and(|parent| target.starts_with(parent)) {
+        return (path.is_absolute() && target.starts_with(scratch_root(scratch)?)).then_some(target);
+    }
+    checkout.is_some_and(|root| target.starts_with(root)).then_some(target)
 }
 
 pub fn link_path(target: &str) -> Option<PathBuf> {
@@ -169,7 +192,7 @@ pub fn link_path(target: &str) -> Option<PathBuf> {
 
 #[derive(Clone)]
 pub enum Picture {
-    Local { root: PathBuf, path: PathBuf },
+    Local { checkout: Option<PathBuf>, scratch: PathBuf, path: PathBuf },
     Embedded { data: Arc<str>, hash: u64 },
 }
 
@@ -188,8 +211,9 @@ impl Hash for Picture {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Local { root, path } => {
-                root.hash(state);
+            Self::Local { checkout, scratch, path } => {
+                checkout.hash(state);
+                scratch.hash(state);
                 path.hash(state);
             }
             Self::Embedded { hash, .. } => hash.hash(state),
@@ -209,9 +233,9 @@ impl Asset for DecodePicture {
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         cx.background_executor().spawn(async move {
             let bytes = match source {
-                Picture::Local { root, path } => {
-                    let path = scoped_path(&root, &path)
-                        .ok_or("Missing image or outside the checkout.")?;
+                Picture::Local { checkout, scratch, path } => {
+                    let path = reply_image_path(checkout.as_deref(), &scratch, &path)
+                        .ok_or("Image is missing or outside the checkout and thread scratch directory.")?;
                     read(&path, PREVIEW_LIMIT)?
                 }
                 Picture::Embedded { data, .. } => {
@@ -426,19 +450,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinks_cannot_resolve_a_reply_preview_outside_the_checkout() {
+    fn reply_previews_are_scoped_to_the_checkout_and_scratch_directory() {
         let dir = std::env::temp_dir().join(format!("kiln-scoped-preview-{}", std::process::id()));
         let root = dir.join("checkout");
+        let scratch = dir.join("tmp/1");
+        let sibling = dir.join("tmp/2");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
         std::fs::write(root.join("local.png"), "").unwrap();
+        let preview = scratch.join("preview.png");
+        let sibling_preview = sibling.join("preview.png");
+        std::fs::write(&preview, "").unwrap();
+        std::fs::write(&sibling_preview, "").unwrap();
         std::fs::write(dir.join("outside.png"), "").unwrap();
         std::os::unix::fs::symlink("../outside.png", root.join("link.png")).unwrap();
+        std::os::unix::fs::symlink("../../outside.png", scratch.join("link.png")).unwrap();
+        std::os::unix::fs::symlink("../2/preview.png", scratch.join("sibling.png")).unwrap();
+        let aliased_scratch = dir.join("tmp/3");
+        std::os::unix::fs::symlink("2", &aliased_scratch).unwrap();
         assert_eq!(
-            scoped_path(&root, Path::new("local.png")),
+            reply_image_path(Some(&root), &scratch, Path::new("local.png")),
             Some(root.canonicalize().unwrap().join("local.png"))
         );
-        assert!(scoped_path(&root, Path::new("../outside.png")).is_none());
-        assert!(scoped_path(&root, Path::new("link.png")).is_none());
+        assert_eq!(
+            reply_image_path(Some(&root), &scratch, &preview),
+            Some(preview.canonicalize().unwrap())
+        );
+        assert_eq!(
+            reply_image_path(None, &scratch, &preview),
+            Some(preview.canonicalize().unwrap())
+        );
+        assert_eq!(reply_image_path(Some(&dir), &scratch, &sibling_preview), None);
+        assert_eq!(reply_image_path(None, &aliased_scratch, &sibling_preview), None);
+        for path in [
+            PathBuf::from("preview.png"),
+            PathBuf::from("../outside.png"),
+            PathBuf::from("link.png"),
+            scratch.join("link.png"),
+            scratch.join("sibling.png"),
+            sibling_preview,
+            dir.join("outside.png"),
+        ] {
+            assert_eq!(reply_image_path(Some(&root), &scratch, &path), None);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

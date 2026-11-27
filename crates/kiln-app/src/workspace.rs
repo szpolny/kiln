@@ -608,6 +608,10 @@ impl Workspace {
         Some(project.threads[t].checkout.dir(&project.dir))
     }
 
+    fn scratch_dir(&self, id: u64) -> PathBuf {
+        self.data_dir.join("tmp").join(id.to_string())
+    }
+
     fn suggest_files(&mut self, cx: &mut Context<Self>) {
         let query = self.input.read(cx).reference_query();
         if self.dismissed_file_query == query && self.dismissed_file_query.is_some() {
@@ -952,6 +956,7 @@ impl Workspace {
         let running = if shared { self.store.running_beside(id) } else { vec![] };
         let prefix = self.store.settings.branch_prefix.clone();
         let fetches = self.store.settings.fetch == Fetch::Always;
+        let scratch_dir = self.scratch_dir(id);
         if matches!(self.menu, Some(Menu::Permissions | Menu::Checkout)) {
             self.menu = None;
         }
@@ -980,6 +985,18 @@ impl Workspace {
             let prompt = match note {
                 Some(note) => format!("{note}\n\n{prompt}"),
                 None => prompt,
+            };
+            let scratch = std::fs::create_dir_all(&scratch_dir)
+                .ok().and_then(|()| media::scratch_root(&scratch_dir));
+            let prompt = if let Some(scratch_dir) = scratch {
+                let path = scratch_dir.display();
+                format!(
+                    "This thread's scratch directory for temporary files, scripts, and previews is {path}. \
+                     To display a local preview in the conversation, use Markdown image syntax \
+                     with its absolute path, for example ![Preview](<{path}/preview.png>).\n\n{prompt}"
+                )
+            } else {
+                prompt
             };
             Ok((dir, Prompt { body: prompt, attachments }))
         });
@@ -1040,12 +1057,14 @@ impl Workspace {
             stream: Stream::default(),
         });
 
+        let scratch_dir = self.scratch_dir(id);
         cx.spawn(async move |this, cx| {
             while let Ok(mut ev) = rx.recv().await {
                 if let AgentEvent::ImageFile(path) = ev {
                     let root = dir.clone();
+                    let scratch = scratch_dir.clone();
                     ev = cx.background_executor().spawn(async move {
-                        match media::generated_image(&path, &root) {
+                        match media::generated_image(&path, &root, &scratch) {
                             Ok(image) => AgentEvent::Image(image),
                             Err(error) => AgentEvent::Notice(error),
                         }
@@ -2011,6 +2030,7 @@ impl Workspace {
                     }))
                 .into_any_element(),
             (None, Role::Agent) => {
+                let scratch_dir = self.scratch_dir(id);
                 let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse_at(&m.body, root.as_deref()).into());
                 let images = self.reply_images.entry(ix).or_insert_with(|| {
                     m.attachments.iter().filter_map(|attachment| match &attachment.content {
@@ -2020,7 +2040,9 @@ impl Workspace {
                         AttachmentContent::Text(_) => None,
                     }).collect()
                 });
-                body.when(!blocks.is_empty(), |d| d.child(markdown::render(blocks, theme, ix, root.as_deref(), &mut document)))
+                body.when(!blocks.is_empty(), |d| {
+                    d.child(markdown::render(blocks, theme, ix, root.as_deref(), &scratch_dir, &mut document))
+                })
                     .children(images.iter().enumerate().map(|(i, (name, picture))| {
                         media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
                     }))
@@ -2233,7 +2255,7 @@ impl Workspace {
         let content = div().flex().flex_col().w_full()
             .when_some(streamed, |d, blocks| {
                 d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
-                    .child(markdown::render(&blocks, theme, key, root.as_deref(), &mut document)))
+                    .child(markdown::render(&blocks, theme, key, root.as_deref(), &self.scratch_dir(id), &mut document)))
                     .px_6().py_1p5())
             })
             .child(status);

@@ -305,13 +305,14 @@ fn opens(url: &str) -> bool {
 
 /// Draw parsed blocks. `key` must be unique among messages on screen.
 pub fn render(
-    blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>, document: &mut Document,
+    blocks: &[Block], theme: Theme, key: usize, root: Option<&Path>, scratch: &Path, document: &mut Document,
 ) -> gpui::Div {
-    Painter { theme, key, next_id: 0, root, document }.column(blocks)
+    Painter { theme, key, next_id: 0, root, scratch, document }.column(blocks)
 }
 
 struct Painter<'a> {
     root: Option<&'a Path>,
+    scratch: &'a Path,
     document: &'a mut Document,
     theme: Theme,
     key: usize,
@@ -339,10 +340,11 @@ impl Painter<'_> {
                 div().w_full().min_w_0().child(self.inline(inline, false)).into_any_element()
             }
             Block::Image { path, label } => {
-                let Some(root) = self.root else {
-                    return div().child(format!("Image unavailable · {label}")).into_any_element();
+                let picture = media::Picture::Local {
+                    checkout: self.root.map(Path::to_path_buf),
+                    scratch: self.scratch.to_path_buf(),
+                    path: path.clone(),
                 };
-                let picture = media::Picture::Local { root: root.to_path_buf(), path: path.clone() };
                 media::inline(picture, label.clone(), self.id("image"), theme).into_any_element()
             }
             Block::Heading(depth, inline) => {
