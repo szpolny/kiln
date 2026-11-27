@@ -100,6 +100,7 @@ pub struct Workspace {
     /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
     pub(crate) settings_modal: Option<SettingsModal>,
+    pub(crate) image_lightbox: Option<crate::image_lightbox::ImageLightbox>,
     pub(crate) palette: Option<Palette>,
     /// The command palette's search field.
     pub(crate) palette_input: Entity<TextInput>,
@@ -254,6 +255,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             theme,
             settings_modal: None,
+            image_lightbox: None,
             palette: None,
             palette_input,
             rows: Vec::new(),
@@ -2425,7 +2427,7 @@ fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui:
         .child(assets::icon(icon, 12.))
         .child(div().min_w_0().truncate().child(attachment.name.clone()))
         .tooltip(tip("Open attachment preview", theme))
-        .on_click(move |_, _, cx| media::preview_attachment(&preview, theme, cx))
+        .on_click(move |_, window, cx| media::preview_attachment(&preview, theme, window, cx))
 }
 
 fn tool_icon(name: &str) -> assets::Icon {
@@ -2527,6 +2529,7 @@ impl Render for Workspace {
             })
             .children(self.render_settings(cx))
             .children(self.render_palette(cx))
+            .children(self.render_image_lightbox(window, cx))
     }
 }
 

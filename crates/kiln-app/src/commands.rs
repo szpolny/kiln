@@ -166,7 +166,7 @@ pub(crate) struct Palette {
 
 impl Workspace {
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() || self.settings_modal.is_some() {
+        if self.palette.is_some() || self.settings_modal.is_some() || self.image_lightbox.is_some() {
             return;
         }
         self.menu = None;
@@ -195,7 +195,7 @@ impl Workspace {
             Command::Hide => return cx.hide(),
             _ => {}
         }
-        if self.settings_modal.is_some() {
+        if self.settings_modal.is_some() || self.image_lightbox.is_some() {
             return;
         }
         self.close_palette(window, cx);

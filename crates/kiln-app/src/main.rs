@@ -1,6 +1,7 @@
 mod assets;
 mod checkout_menu;
 mod file_reference;
+mod image_lightbox;
 mod commands;
 mod markdown;
 mod media;

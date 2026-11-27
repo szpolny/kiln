@@ -221,7 +221,7 @@ impl Hash for Picture {
     }
 }
 
-struct DecodePicture;
+pub(crate) struct DecodePicture;
 
 impl Asset for DecodePicture {
     type Source = Picture;
@@ -260,7 +260,7 @@ struct PreviewPicture {
     picture: Picture,
     label: String,
     theme: Theme,
-    inline_id: Option<SharedString>,
+    id: SharedString,
 }
 
 impl RenderOnce for PreviewPicture {
@@ -278,48 +278,28 @@ impl RenderOnce for PreviewPicture {
             None => return status(format!("Loading {}…", self.label)),
         };
         let dimensions = image.size(0).map(|pixels| px(u32::from(pixels) as f32));
-        let viewport = window.viewport_size();
-        let (width, height) = if self.inline_id.is_some() {
-            // Leave room for the sidebar, transcript padding, and nested Markdown.
-            (
-                (viewport.width - px(344.)).clamp(px(60.), px(660.)),
-                px(260.),
-            )
-        } else {
-            (viewport.width - px(32.), viewport.height - px(32.))
-        };
+        // Leave room for the sidebar, transcript padding, and nested Markdown.
+        let width = (window.viewport_size().width - px(344.)).clamp(px(60.), px(660.));
+        let height = px(260.);
         let scale = (width / dimensions.width).min(height / dimensions.height);
         let image = img(image)
             .object_fit(gpui::ObjectFit::Fill)
             .w(dimensions.width * scale)
             .h(dimensions.height * scale)
             .max_w_full();
-        if let Some(id) = self.inline_id {
-            let Self {
-                picture,
-                label,
-                theme,
-                ..
-            } = self;
-            div()
-                .id(id)
-                .cursor_pointer()
-                .rounded_md()
-                .overflow_hidden()
-                .tooltip(crate::tooltip::tip("Open image preview", theme))
-                .child(image)
-                .on_click(move |_, _, cx| {
-                    open_preview(
-                        label.clone(),
-                        PreviewContent::Image(picture.clone()),
-                        theme,
-                        cx,
-                    )
-                })
-                .into_any_element()
-        } else {
-            image.into_any_element()
-        }
+        let Self { picture, label, theme, id } = self;
+        div()
+            .id(id)
+            .self_start()
+            .cursor_pointer()
+            .rounded_md()
+            .overflow_hidden()
+            .tooltip(crate::tooltip::tip("Open image viewer", theme))
+            .child(image)
+            .on_click(move |_, window, cx| {
+                crate::image_lightbox::open(label.clone(), picture.clone(), window, cx)
+            })
+            .into_any_element()
     }
 }
 
@@ -328,26 +308,20 @@ pub fn inline(picture: Picture, label: String, id: SharedString, theme: Theme) -
         picture,
         label,
         theme,
-        inline_id: Some(id),
+        id,
     }
 }
 
-enum PreviewContent {
-    Image(Picture),
-    Text(Arc<str>),
-}
-
-pub fn preview_attachment(attachment: &Attachment, theme: Theme, cx: &mut App) {
-    let content = match &attachment.content {
-        AttachmentContent::Text(text) => PreviewContent::Text(text.clone()),
+pub fn preview_attachment(attachment: &Attachment, theme: Theme, window: &mut Window, cx: &mut App) {
+    match &attachment.content {
+        AttachmentContent::Text(text) => open_text_preview(attachment.name.clone(), text.clone(), theme, cx),
         AttachmentContent::Image { base64, .. } => {
-            PreviewContent::Image(Picture::embedded(base64.clone()))
+            crate::image_lightbox::open(attachment.name.clone(), Picture::embedded(base64.clone()), window, cx)
         }
-    };
-    open_preview(attachment.name.clone(), content, theme, cx);
+    }
 }
 
-fn open_preview(title: String, content: PreviewContent, theme: Theme, cx: &mut App) {
+fn open_text_preview(title: String, text: Arc<str>, theme: Theme, cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(920.), px(660.)), cx);
     let _ = cx.open_window(
         WindowOptions {
@@ -359,52 +333,29 @@ fn open_preview(title: String, content: PreviewContent, theme: Theme, cx: &mut A
             ..Default::default()
         },
         |_, cx| {
-            cx.new(|_| Preview {
-                title,
-                content,
-                theme,
-            })
+            cx.new(|_| TextPreview { text, theme })
         },
     );
 }
 
-struct Preview {
-    title: String,
-    content: PreviewContent,
+struct TextPreview {
+    text: Arc<str>,
     theme: Theme,
 }
 
-impl Render for Preview {
+impl Render for TextPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let content = match &self.content {
-            PreviewContent::Image(picture) => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(PreviewPicture {
-                    picture: picture.clone(),
-                    label: self.title.clone(),
-                    theme,
-                    inline_id: None,
-                })
-                .into_any_element(),
-            PreviewContent::Text(text) => div()
-                .id("attachment-text")
-                .size_full()
-                .overflow_scroll()
-                .p_4()
-                .text_sm()
-                .font_family(crate::theme::MONO)
-                .child(SharedString::from(text.clone()))
-                .into_any_element(),
-        };
         div()
+            .id("attachment-text")
             .size_full()
+            .overflow_scroll()
+            .p_4()
+            .text_sm()
+            .font_family(crate::theme::MONO)
             .bg(theme.card)
             .text_color(theme.text)
-            .child(content)
+            .child(SharedString::from(self.text.clone()))
     }
 }
 
