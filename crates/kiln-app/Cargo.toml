@@ -11,17 +11,24 @@ path = "src/main.rs"
 [dependencies]
 async-channel = "2"
 base64 = "0.23"
+blocking = "1"
 percent-encoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+encoding_rs = "0.8"
 gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.30.2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.30.2", features = ["font-kit", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 lucide-icons = "=1.80.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 resvg = { version = "0.49", default-features = false }
+sha2 = "0.10"
+spellbook = "0.4.2"
+tempfile = "3"
 tree-sitter-bash = "0.25"
 tree-sitter-highlight = "0.26"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-segmentation = "1"
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 kiln-core = { path = "../kiln-core" }
 kiln-agent = { path = "../kiln-agent" }
 

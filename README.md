@@ -29,6 +29,11 @@ Then build and launch:
 cargo run -p kiln-app
 ```
 
+The message composer underlines misspelled words. Right-click an underlined word
+to choose a replacement. US English is built in. Open **Settings → Spell check
+languages** to download additional dictionaries. You can enable several
+languages at once, and checking runs offline.
+
 ## Development
 
 | Crate | Contents |
@@ -46,3 +51,9 @@ Run `cargo clippy --all-targets` and `cargo test` before committing. Set `KILN_S
 ## Acknowledgments
 
 Kiln is heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code).
+
+The composer uses the SCOWL US English dictionary. See its
+[copyright and license notices](crates/kiln-app/assets/dictionaries/README_en_US.txt).
+Additional dictionaries are downloaded directly from
+[LibreOffice Dictionaries](https://github.com/LibreOffice/dictionaries) and
+verified before use.

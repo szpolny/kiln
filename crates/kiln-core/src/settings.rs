@@ -58,6 +58,20 @@ impl FollowUp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct SpellingSettings {
+    pub english: bool,
+    /// Locale codes for enabled downloaded dictionaries.
+    pub languages: Vec<String>,
+}
+
+impl Default for SpellingSettings {
+    fn default() -> Self {
+        Self { english: true, languages: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
     /// Permission mode new threads start with when supported by their provider.
@@ -72,6 +86,7 @@ pub struct Settings {
     pub follow_up: FollowUp,
     /// Preferred parent folder for new projects. When unset, ask where to put each project.
     pub new_project_root: Option<PathBuf>,
+    pub spelling: SpellingSettings,
 }
 
 impl Default for Settings {
@@ -84,6 +99,7 @@ impl Default for Settings {
             fetch: Fetch::default(),
             follow_up: FollowUp::default(),
             new_project_root: None,
+            spelling: SpellingSettings::default(),
         }
     }
 }

@@ -105,6 +105,7 @@ pub struct Workspace {
     /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
     pub(crate) settings_modal: Option<SettingsModal>,
+    pub(crate) spelling: crate::spelling_settings::SpellingState,
     pub(crate) image_lightbox: Option<crate::image_lightbox::ImageLightbox>,
     pub(crate) palette: Option<Palette>,
     /// The command palette's search field.
@@ -215,6 +216,7 @@ impl Workspace {
             let mut input = TextInput::new("Ask the agent to do something", window, cx);
             input.paste_images = true;
             input.file_references = true;
+            input.spelling_theme = Some(theme);
             input
         });
         cx.subscribe(&input, |this, _, ev, cx| match ev {
@@ -260,6 +262,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             theme,
             settings_modal: None,
+            spelling: Default::default(),
             image_lightbox: None,
             palette: None,
             palette_input,
@@ -292,6 +295,7 @@ impl Workspace {
             reply_images: HashMap::new(),
             prefix_save: Task::ready(()),
         };
+        this.restore_spelling(cx);
         this.show_draft(cx);
         this.sync_rows();
         this.refresh(cx);
@@ -357,6 +361,10 @@ impl Workspace {
                 eprintln!("kiln: could not save state: {e}");
             }
         }
+    }
+
+    pub(crate) fn dictionary_cache(&self) -> PathBuf {
+        self.data_dir.join("dictionaries")
     }
 
     /// Bring the rows up to date with the shown thread, telling the list only
@@ -2629,7 +2637,10 @@ impl Render for Workspace {
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
         let checkout = self.selected.and_then(|id| self.checkout_dir(id));
         let scratch = self.selected.map(|id| self.scratch_dir(id));
-        self.input.update(cx, |input, _| input.set_reference_paths(checkout, scratch));
+        self.input.update(cx, |input, _| {
+            input.set_reference_paths(checkout, scratch);
+            input.spelling_theme = Some(theme);
+        });
         for input in [&self.input, &self.prefix_input, &self.palette_input] {
             input.update(cx, |input, _| {
                 input.colors = text_input::Colors {

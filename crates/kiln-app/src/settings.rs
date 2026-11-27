@@ -317,6 +317,7 @@ impl Workspace {
                                 .gap_4()
                                 .p_5()
                                 .child(appearance)
+                                .child(self.spelling_settings(cx))
                                 .child(
                                     div()
                                         .flex()
@@ -383,7 +384,7 @@ impl Workspace {
     }
 }
 
-fn settings_button(id: &'static str, theme: Theme, selected: bool) -> gpui::Stateful<Div> {
+pub(crate) fn settings_button(id: &'static str, theme: Theme, selected: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .tab_index(0)

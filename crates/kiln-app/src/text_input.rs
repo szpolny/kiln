@@ -1,9 +1,12 @@
 //! A multi-line text field with a blinking caret, keyboard and mouse
 //! selection, the clipboard, and input method composition.
 use crate::file_reference::{self, ChipColors, Reference};
+use crate::spelling::Dictionaries;
 use crate::text_edit::Buffer;
+use crate::theme::Theme;
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, AvailableSpace, Bounds,
+    actions, anchored, deferred, div, fill, point, prelude::*, px, relative, rgb, size, Anchor,
+    App, AvailableSpace, Bounds, Div,
     ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
@@ -158,6 +161,11 @@ pub struct TextInput {
     buffer: Buffer,
     pub paste_images: bool,
     pub file_references: bool,
+    pub spelling_theme: Option<Theme>,
+    dictionaries: Dictionaries,
+    misspellings: Vec<Range<usize>>,
+    spelling_check: Option<Task<()>>,
+    spelling_menu: Option<SpellingMenu>,
     references: Vec<Reference>,
     checkout: Option<PathBuf>,
     scratch: Option<PathBuf>,
@@ -177,6 +185,13 @@ pub struct TextInput {
     _focus_subs: [Subscription; 2],
 }
 
+struct SpellingMenu {
+    range: Range<usize>,
+    position: Point<Pixels>,
+    suggestions: Option<Vec<String>>,
+    _task: Task<()>,
+}
+
 impl EventEmitter<InputEvent> for TextInput {}
 
 impl TextInput {
@@ -187,6 +202,7 @@ impl TextInput {
             cx.on_blur(&focus, window, |this, _, cx| {
                 this.blink = None;
                 this.selecting = false;
+                this.spelling_menu = None;
                 cx.notify();
             }),
         ];
@@ -195,6 +211,11 @@ impl TextInput {
             buffer: Buffer::default(),
             paste_images: false,
             file_references: false,
+            spelling_theme: None,
+            dictionaries: Dictionaries::default(),
+            misspellings: vec![],
+            spelling_check: None,
+            spelling_menu: None,
             references: vec![],
             checkout: None,
             scratch: None,
@@ -244,6 +265,7 @@ impl TextInput {
         self.buffer.clear();
         self.buffer.replace(None, text);
         self.update_references();
+        self.check_spelling(cx);
         self.moved(cx);
     }
 
@@ -292,8 +314,108 @@ impl TextInput {
 
     fn edited(&mut self, cx: &mut Context<Self>) {
         self.update_references();
+        self.check_spelling(cx);
         self.moved(cx);
         cx.emit(InputEvent::Changed);
+    }
+
+    pub fn set_dictionaries(&mut self, dictionaries: Dictionaries, cx: &mut Context<Self>) {
+        self.dictionaries = dictionaries;
+        self.check_spelling(cx);
+        cx.notify();
+    }
+
+    fn check_spelling(&mut self, cx: &mut Context<Self>) {
+        self.spelling_menu = None;
+        self.misspellings.clear();
+        self.spelling_check = None;
+        if self.dictionaries.is_empty() || self.buffer.is_empty() {
+            return;
+        }
+
+        let text = self.text().to_owned();
+        let dictionaries = self.dictionaries.clone();
+        self.spelling_check = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor();
+            executor.timer(Duration::from_millis(120)).await;
+            let misspellings = executor.spawn(async move { dictionaries.misspellings(&text) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.misspellings = misspellings;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn open_spelling_menu(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.buffer.marked().is_some() {
+            return;
+        }
+        let Some(at) = self.layout.as_ref().and_then(|layout| layout.character_at(ev.position)) else {
+            return;
+        };
+        let Some(range) = self.misspellings.iter().find(|range| range.contains(&at)).cloned() else {
+            return;
+        };
+        let word = self.text()[range.clone()].to_owned();
+        let dictionaries = self.dictionaries.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let suggestions = cx.background_executor().spawn(async move { dictionaries.suggestions(&word) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(menu) = &mut this.spelling_menu {
+                    menu.suggestions = Some(suggestions);
+                    cx.notify();
+                }
+            });
+        });
+        window.focus(&self.focus, cx);
+        self.spelling_menu = Some(SpellingMenu {
+            range,
+            position: ev.position,
+            suggestions: None,
+            _task: task,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn close_spelling_menu(&mut self, cx: &mut Context<Self>) {
+        if self.spelling_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn spelling_menu(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let theme = self.spelling_theme?;
+        let menu = self.spelling_menu.as_ref()?;
+        let mut panel = div().id("spelling-menu").flex().flex_col().w(px(180.)).p_1()
+            .rounded(px(10.)).bg(theme.card).border_1().border_color(theme.border).shadow_lg()
+            .occlude().cursor(CursorStyle::Arrow)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_spelling_menu(cx)));
+        match menu.suggestions.as_deref() {
+            Some(suggestions) if !suggestions.is_empty() => {
+                panel = panel.children(suggestions.iter().enumerate().map(|(index, word)| {
+                    div().id(("spelling-suggestion", index)).px_2().py_1().rounded_md().text_sm()
+                        .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
+                        .child(word.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(menu) = this.spelling_menu.take() else { return };
+                            if let Some(word) = menu.suggestions.as_ref().and_then(|words| words.get(index)) {
+                                this.buffer.replace(Some(menu.range), word);
+                                this.edited(cx);
+                            }
+                        }))
+                }));
+            }
+            suggestions => {
+                let label = if suggestions.is_some() { "No spelling suggestions" } else { "Checking spelling…" };
+                panel = panel.child(div().px_2().py_1().text_sm().text_color(theme.muted).child(label));
+            }
+        }
+        Some(div().absolute().child(
+            deferred(
+                anchored().anchor(Anchor::TopLeft).position(menu.position).child(panel),
+            ).with_priority(2),
+        ))
     }
 
     fn chip_edge(&self, offset: usize) -> usize {
@@ -406,6 +528,10 @@ impl TextInput {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(target_os = "macos") && ev.modifiers.control && self.spelling_theme.is_some() {
+            self.open_spelling_menu(ev, window, cx);
+            return;
+        }
         window.focus(&self.focus, cx);
         if ev.click_count == 1 && !ev.modifiers.shift {
             if let Some(layout) = &self.layout {
@@ -593,8 +719,9 @@ impl EntityInputHandler for TextInput {
         self.buffer.marked().map(|r| self.buffer.range_to_utf16(&r))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.buffer.unmark();
+        cx.notify();
     }
 
     fn replace_text_in_range(
@@ -670,7 +797,7 @@ impl Focusable for TextInput {
 
 impl Render for TextInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let field = div()
             .id("text-input")
             .key_context(CONTEXT)
             .track_focus(&self.focus)
@@ -712,7 +839,17 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::submit_alternate))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .child(TextElement { input: cx.entity() })
+            .when(self.spelling_theme.is_some(), |d| {
+                d.on_mouse_down(MouseButton::Right, cx.listener(Self::open_spelling_menu))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        if this.spelling_menu.is_some() && event.keystroke.key == "escape" {
+                            this.close_spelling_menu(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            })
+            .child(TextElement { input: cx.entity() });
+        div().w_full().child(field).children(self.spelling_menu(cx))
     }
 }
 
@@ -794,6 +931,18 @@ impl Layout {
         let (Ok(ix) | Err(ix)) = line.closest_index_for_position(local, self.line_height);
         map_offset(self.starts[i] + ix, &self.spans, |s| (&s.visible, &s.source))
     }
+
+    /// The character under the pointer, excluding empty space and file chips.
+    fn character_at(&self, p: Point<Pixels>) -> Option<usize> {
+        let y = p.y - self.origin.y;
+        if y < px(0.) || y >= self.height || self.chips.iter().any(|chip| chip.bounds.contains(&p)) {
+            return None;
+        }
+        let i = self.tops.partition_point(|&top| top <= y).checked_sub(1)?;
+        let local = point(p.x - self.origin.x, y - self.tops[i]);
+        let ix = self.lines[i].index_for_position(local, self.line_height).ok()?;
+        Some(map_offset(self.starts[i] + ix, &self.spans, |s| (&s.visible, &s.source)))
+    }
 }
 
 struct TextElement {
@@ -853,25 +1002,39 @@ impl Element for TextElement {
         let mut runs = vec![];
         let mut visible = String::new();
         let marked = input.buffer.marked();
+        let overlaps = |a: &Range<usize>, b: &Range<usize>| a.start < b.end && b.start < a.end;
+        let mut underlines = Vec::new();
+        if let Some(theme) = input.spelling_theme {
+            let red = rgb(if theme.dark { 0xf87171 } else { 0xdc2626 }).into();
+            underlines.extend(input.misspellings.iter()
+                .filter(|range| !marked.as_ref().is_some_and(|marked| overlaps(range, marked)))
+                .map(|range| (range.clone(), UnderlineStyle { color: Some(red), thickness: px(1.), wavy: true })));
+        }
+        if let Some(marked) = &marked {
+            let index = underlines.partition_point(|(range, _)| range.start < marked.start);
+            underlines.insert(index, (marked.clone(), UnderlineStyle { color: Some(color), thickness: px(1.), wavy: false }));
+        }
         let plain = |range: Range<usize>, visible: &mut String, runs: &mut Vec<TextRun>| {
             if range.is_empty() {
                 return;
             }
             visible.push_str(&text[range.clone()]);
-            if let Some(marked) = marked.as_ref().filter(|m| m.start < range.end && range.start < m.end) {
-                let start = marked.start.max(range.start);
-                let end = marked.end.min(range.end);
-                runs.extend([
-                    TextRun { len: start - range.start, ..run.clone() },
-                    TextRun {
-                        len: end - start,
-                        underline: Some(UnderlineStyle { color: Some(color), thickness: px(1.), wavy: false }),
-                        ..run.clone()
-                    },
-                    TextRun { len: range.end - end, ..run.clone() },
-                ].into_iter().filter(|r| r.len > 0));
-            } else {
-                runs.push(TextRun { len: range.len(), ..run.clone() });
+            let mut at = range.start;
+            let first = underlines.partition_point(|(mark, _)| mark.end <= at);
+            for (mark, style) in &underlines[first..] {
+                if mark.start >= range.end {
+                    break;
+                }
+                let start = mark.start.max(range.start);
+                let end = mark.end.min(range.end);
+                if at < start {
+                    runs.push(TextRun { len: start - at, ..run.clone() });
+                }
+                runs.push(TextRun { len: end - start, underline: Some(*style), ..run.clone() });
+                at = end;
+            }
+            if at < range.end {
+                runs.push(TextRun { len: range.end - at, ..run.clone() });
             }
         };
         let mut at = 0;

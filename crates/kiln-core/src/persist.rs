@@ -102,6 +102,10 @@ mod tests {
             fetch: crate::Fetch::Always,
             follow_up: crate::FollowUp::Steer,
             new_project_root: Some("/projects".into()),
+            spelling: crate::settings::SpellingSettings {
+                english: false,
+                languages: vec!["pl_PL".into()],
+            },
         };
         let second = store.projects[0].threads[1].id;
         store.thread_mut(second).unwrap().permission_mode = PermissionMode::Auto;
