@@ -131,7 +131,7 @@ pub fn open(
     root: Option<&Path>, path: &Path, picture: Option<&media::Picture>, window: &mut Window, cx: &mut App,
 ) {
     if let Some(picture) = picture {
-        crate::image_lightbox::open(filename(path).into_owned(), picture.clone(), window, cx);
+        crate::media::image_lightbox::open(filename(path).into_owned(), picture.clone(), window, cx);
     } else if let Some(path) = root.and_then(|root| media::scoped_path(root, path)).filter(|path| path.is_file()) {
         cx.reveal_path(&path);
     }

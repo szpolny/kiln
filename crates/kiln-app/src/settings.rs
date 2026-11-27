@@ -1,4 +1,7 @@
 //! The workspace's settings dialog.
+
+pub(crate) mod spelling;
+
 use crate::theme::Theme;
 use crate::workspace::{permission_label, Workspace};
 use crate::{

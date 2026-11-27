@@ -1,5 +1,7 @@
 //! Offline spelling checks for prose in the composer.
 
+pub(crate) mod download;
+
 use encoding_rs::{Encoding, UTF_8};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use spellbook::Dictionary;

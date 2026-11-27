@@ -1,7 +1,7 @@
 //! The toolbar's project button and its menu, where the icon can be changed.
 
 use crate::assets::{self, Icon};
-use crate::project_icon;
+use super::project_icon;
 use crate::workspace::{Menu, Workspace};
 use gpui::{
     anchored, deferred, div, prelude::*, px, Anchor, Context, Div, PathPromptOptions, Window,

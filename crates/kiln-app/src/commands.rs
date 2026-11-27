@@ -1,5 +1,5 @@
 //! Keyboard shortcuts, the application menu, and the command palette.
-use crate::sidebar::Row;
+use crate::workspace::sidebar::{Row, NO_PROJECT};
 use crate::workspace::Workspace;
 use gpui::{
     actions, div, prelude::*, px, relative, rgba, App, Context, FocusHandle, Focusable, KeyBinding,
@@ -284,7 +284,7 @@ impl Workspace {
         for settled in [false, true] {
             for id in self.store.thread_ids(settled) {
                 let Some(thread) = self.store.thread(id) else { continue };
-                let project = self.store.project_of(id).map_or(crate::sidebar::NO_PROJECT, |p| &p.name);
+                let project = self.store.project_of(id).map_or(NO_PROJECT, |p| &p.name);
                 let title = &thread.title;
                 if matches(&format!("{title} {project}")) {
                     choices.push((

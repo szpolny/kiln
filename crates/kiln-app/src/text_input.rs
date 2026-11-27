@@ -1,8 +1,11 @@
 //! A multi-line text field with a blinking caret, keyboard and mouse
 //! selection, the clipboard, and input method composition.
+
+mod buffer;
+
+use self::buffer::Buffer;
 use crate::file_reference::{self, ChipColors, Reference};
 use crate::spelling::Dictionaries;
-use crate::text_edit::Buffer;
 use crate::theme::Theme;
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, rgb, size, Anchor,

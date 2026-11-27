@@ -1,6 +1,6 @@
 //! The on-demand dictionary catalog and its verified local cache.
 
-use crate::spelling::parse_dictionary;
+use super::parse_dictionary;
 use sha2::{Digest, Sha256};
 use spellbook::Dictionary;
 use std::{

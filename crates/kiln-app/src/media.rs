@@ -1,13 +1,18 @@
 //! Local attachments and previews. Image loading never uses a URL client.
 
+pub(crate) mod image_lightbox;
+
+use crate::assets;
 use crate::theme::Theme;
+use crate::tooltip::tip;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use gpui::{
     div, img, prelude::*, px, size, App, Asset, Bounds, Context, RenderImage, SharedString,
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
-use image::{ImageFormat, ImageReader, Limits};
+use image::{ImageFormat, ImageReader, Limits, RgbaImage};
 use kiln_core::{Attachment, AttachmentContent};
+use resvg::{tiny_skia, usvg};
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -264,7 +269,7 @@ fn decode_picture(source: Picture, thumbnail_side: Option<u32>) -> Result<Arc<Re
         }
     };
     let mut pixels = match local_extension.as_deref() {
-        Some("svg") => crate::project_icon::svg(&bytes, thumbnail_side.unwrap_or(2048))
+        Some("svg") => svg(&bytes, thumbnail_side.unwrap_or(2048))
             .ok_or("Could not decode SVG image.")?,
         extension => {
             let format = if extension == Some("ico") && matches!(image::guess_format(&bytes), Ok(ImageFormat::Ico)) {
@@ -324,10 +329,10 @@ impl RenderOnce for PreviewPicture {
             .cursor_pointer()
             .rounded_md()
             .overflow_hidden()
-            .tooltip(crate::tooltip::tip("Open image viewer", theme))
+            .tooltip(tip("Open image viewer", theme))
             .child(image)
             .on_click(move |_, window, cx| {
-                crate::image_lightbox::open(label.clone(), picture.clone(), window, cx)
+                image_lightbox::open(label.clone(), picture.clone(), window, cx)
             })
             .into_any_element()
     }
@@ -346,7 +351,7 @@ pub fn preview_attachment(attachment: &Attachment, theme: Theme, window: &mut Wi
     match &attachment.content {
         AttachmentContent::Text(text) => open_text_preview(attachment.name.clone(), text.clone(), theme, cx),
         AttachmentContent::Image { base64, .. } => {
-            crate::image_lightbox::open(attachment.name.clone(), Picture::embedded(base64.clone()), window, cx)
+            image_lightbox::open(attachment.name.clone(), Picture::embedded(base64.clone()), window, cx)
         }
         AttachmentContent::Visualization { .. } => {}
     }
@@ -388,6 +393,52 @@ impl Render for TextPreview {
             .text_color(theme.text)
             .child(SharedString::from(self.text.clone()))
     }
+}
+
+pub(crate) fn svg(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
+    let options = usvg::Options {
+        // An SVG may name other files. Only what it embeds is drawn.
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_string: Box::new(|_, _| None),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
+    let size = tree.size();
+    let scale = max_side as f32 / size.width().max(size.height());
+    let fit = |side: f32| ((side * scale).round() as u32).clamp(1, max_side);
+    let mut canvas = tiny_skia::Pixmap::new(fit(size.width()), fit(size.height()))?;
+    let transform = tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut canvas.as_mut());
+    let mut pixels = RgbaImage::from_raw(canvas.width(), canvas.height(), canvas.take())?;
+    pixels.pixels_mut().for_each(|p| straighten(&mut p.0));
+    Some(pixels)
+}
+
+/// Undo premultiplied alpha.
+pub(crate) fn straighten(pixel: &mut [u8; 4]) {
+    let alpha = u32::from(pixel[3]);
+    if alpha > 0 {
+        pixel[..3].iter_mut().for_each(|c| {
+            *c = ((u32::from(*c) * 255 + alpha / 2) / alpha).min(255) as u8;
+        });
+    }
+}
+
+pub(crate) fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    let preview = attachment.clone();
+    let icon = match attachment.content {
+        AttachmentContent::Text(_) => assets::Icon::FileText,
+        AttachmentContent::Image { .. } | AttachmentContent::Visualization { .. } => assets::Icon::Image,
+    };
+    div().id(SharedString::from(id)).flex().items_center().gap_1()
+        .rounded_md().px_2().py_1().max_w(px(250.)).text_xs()
+        .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
+        .child(assets::icon(icon, 12.))
+        .child(div().min_w_0().truncate().child(attachment.name.clone()))
+        .tooltip(tip("Open attachment preview", theme))
+        .on_click(move |_, window, cx| preview_attachment(&preview, theme, window, cx))
 }
 
 #[cfg(test)]

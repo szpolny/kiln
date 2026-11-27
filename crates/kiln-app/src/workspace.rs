@@ -1,37 +1,37 @@
-use crate::assets;
+mod checkout_menu;
+mod composer;
+mod conversation;
+mod project_icon;
+mod project_menu;
+pub(crate) mod sidebar;
+
+use self::sidebar::{now, Row};
 use crate::commands::Palette;
-use crate::file_reference;
-use crate::{markdown, media, output_selection, visualization};
-use crate::project_icon;
+use crate::persist::{self, Loaded};
 use crate::settings::SettingsModal;
-use crate::shell;
-use crate::sidebar::{now, Row};
 use crate::text_input::{self, InputEvent, TextInput};
 use crate::theme::{ui_font, Theme, MONO};
-use crate::tooltip::tip;
-use crate::transcript::{self, Entry};
-use chrono::{Local, TimeZone};
+use crate::transcript::{self, markdown, selection, shell, Entry};
+use crate::{assets, file_reference, media, visualization};
 use gpui::{
-    anchored, ClickEvent, canvas, deferred, div, fill, img, list, point, prelude::*, px, relative, rgb, size,
-    svg, Anchor, AnchoredPositionMode, Animation, AnimationExt, Bounds, Context, DispatchPhase,
-    Entity, FocusHandle, Focusable, FontWeight, HitboxBehavior, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, Render, RenderImage, ScrollHandle, SharedString, Task, Window,
+    anchored, deferred, div, img, list, point, prelude::*, px, rgb, svg, AnchoredPositionMode,
+    Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ListAlignment,
+    ListState, MouseButton, PathPromptOptions, Pixels, Render, RenderImage, ScrollHandle,
+    SharedString, Task, Window,
 };
 use kiln_agent::{
     claude, codex, process::Process, project, worktree, AgentEvent, ApprovalId, ApprovalRequest,
     Client,
 };
 use kiln_core::checkout::{self, Checkout, MoveRequest, ProjectRequest, Sharing, DEFAULT_COMMIT_TYPE};
-use kiln_core::policy::{Decision, PermissionMode};
-use kiln_core::persist::{self, Loaded};
-use kiln_core::title;
+use kiln_core::policy::PermissionMode;
 use kiln_core::{
-    Attachment, AttachmentContent, Prompt, Fetch, FollowUp, Agent, Effort, Message, Role, Status, Store, Thread, NEW_THREAD_TITLE,
+    title, Agent, Attachment, AttachmentContent, Fetch, FollowUp, Message, Prompt, Role, Status,
+    Store, Thread, NEW_THREAD_TITLE,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,7 +47,6 @@ const REFRESH: Duration = Duration::from_secs(30);
 const MENU_ROW_HEIGHT: f32 = 28.;
 /// How long typing pauses before the composer's draft is written to disk.
 const DRAFT_SAVE: Duration = Duration::from_secs(1);
-const SCROLLBAR_GUTTER: f32 = 10.;
 
 /// A turn in progress.
 struct RunningTurn {
@@ -105,8 +104,8 @@ pub struct Workspace {
     /// Palette for the current appearance preference, refreshed every render.
     pub(crate) theme: Theme,
     pub(crate) settings_modal: Option<SettingsModal>,
-    pub(crate) spelling: crate::spelling_settings::SpellingState,
-    pub(crate) image_lightbox: Option<crate::image_lightbox::ImageLightbox>,
+    pub(crate) spelling: crate::settings::spelling::SpellingState,
+    pub(crate) image_lightbox: Option<crate::media::image_lightbox::ImageLightbox>,
     pub(crate) palette: Option<Palette>,
     /// The command palette's search field.
     pub(crate) palette_input: Entity<TextInput>,
@@ -123,7 +122,7 @@ pub struct Workspace {
     /// Virtualized list over `entries`. It follows new output until the user
     /// scrolls up.
     transcript: ListState,
-    output_selection: Rc<output_selection::Selection>,
+    output_selection: Rc<selection::Selection>,
     /// The conversation's rows, in the order shown.
     entries: Vec<Entry>,
     /// Thread `transcript` was built for; `None` forces a jump to the latest message.
@@ -195,7 +194,7 @@ impl Workspace {
             }
         })
         .detach();
-        let path = state_path();
+        let path = persist::state_path();
         let data_dir = path.parent().map(PathBuf::from).unwrap_or_default();
         let (store, state_path) = match persist::load(&path) {
             Ok(Loaded::Ok(store)) => (store, Some(path)),
@@ -272,7 +271,7 @@ impl Workspace {
             icons: HashMap::new(),
             icon_load: Task::ready(()),
             transcript: ListState::new(0, ListAlignment::Bottom, px(400.)),
-            output_selection: Rc::new(output_selection::Selection::new(cx)),
+            output_selection: Rc::new(selection::Selection::new(cx)),
             entries: Vec::new(),
             transcript_thread: None,
             transcript_built: None,
@@ -369,67 +368,6 @@ impl Workspace {
 
     /// Bring the rows up to date with the shown thread, telling the list only
     /// about those that changed so it keeps its place.
-    fn sync_transcript(&mut self) {
-        let thread = self.selected.and_then(|id| self.store.thread(id));
-        let built = thread.map_or((0, false), |t| (t.messages.len(), t.status == Status::Running));
-        let switched = self.transcript_thread != self.selected;
-        if !switched && self.transcript_built == Some(built) {
-            return;
-        }
-        let entries = thread.map_or_else(Vec::new, |t| {
-            transcript::entries(
-                &t.messages,
-                built.1,
-                |at| self.open_work.contains(&(t.id, at)),
-                |at| self.open_tool_groups.contains(&(t.id, at)),
-            )
-        });
-        if switched {
-            self.output_selection.reset();
-            self.transcript.reset(entries.len());
-            self.parsed.clear();
-            self.reply_images.clear();
-            self.shell_highlights.clear();
-            self.transcript_thread = self.selected;
-        } else {
-            let same = |(a, b): &(&Entry, &Entry)| match (a, b) {
-                // A running group can grow without moving the existing rows.
-                (Entry::ToolGroup { start: a, .. }, Entry::ToolGroup { start: b, .. }) => a == b,
-                _ => a == b,
-            };
-            let head = self.entries.iter().zip(&entries).take_while(same).count();
-            let tail = self.entries[head..].iter().rev()
-                .zip(entries[head..].iter().rev())
-                .take_while(same)
-                .count();
-            let old = head..self.entries.len() - tail;
-            let new = entries.len() - tail - head;
-            if !old.is_empty() || new > 0 {
-                self.transcript.splice(old, new);
-            }
-        }
-        self.entries = entries;
-        self.transcript_built = Some(built);
-    }
-
-    /// Expand or collapse the work starting at message `at`.
-    fn toggle_work(&mut self, id: u64, at: usize, cx: &mut Context<Self>) {
-        if !self.open_work.remove(&(id, at)) {
-            self.open_work.insert((id, at));
-        }
-        self.anchor_transcript();
-        self.transcript_built = None;
-        cx.notify();
-    }
-
-    /// Keep a disclosure header in view when opening it in a bottom-aligned list.
-    fn anchor_transcript(&self) {
-        if self.transcript.logical_scroll_top().item_ix >= self.transcript.item_count() {
-            let view = self.transcript.viewport_bounds().size.height;
-            self.transcript.scroll_by(px(TRANSCRIPT_PADDING * 2.) - view);
-        }
-    }
-
     pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -628,187 +566,6 @@ impl Workspace {
 
     fn scratch_dir(&self, id: u64) -> PathBuf {
         self.data_dir.join("tmp").join(id.to_string())
-    }
-
-    fn suggest_files(&mut self, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).reference_query();
-        if self.dismissed_file_query == query && self.dismissed_file_query.is_some() {
-            return;
-        }
-        self.dismissed_file_query = None;
-        self.file_suggestions.clear();
-        cx.notify();
-        let Some(query) = query else { return };
-        let Some(root) = self.selected.and_then(|id| self.checkout_dir(id)) else { return };
-        if let Some(index) = self.file_index.as_ref().filter(|index| index.root == root) {
-            match &index.files {
-                Some(files) => {
-                    self.file_suggestions = file_reference::matches(files, &query);
-                    if index.loaded_at.elapsed() < REFRESH {
-                        return;
-                    }
-                }
-                None => return,
-            }
-        }
-
-        self.file_index = Some(FileIndex { root: root.clone(), loaded_at: Instant::now(), files: None });
-        let dir = root.clone();
-        let load = cx.background_executor().spawn(async move { file_reference::index(&dir) });
-        self.file_index_load = cx.spawn(async move |this, cx| {
-            let files = load.await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(index) = this.file_index.as_mut().filter(|index| index.root == root) else {
-                    return;
-                };
-                index.files = Some(files);
-                index.loaded_at = Instant::now();
-                this.suggest_files(cx);
-            });
-        });
-    }
-
-    fn suggestions_visible(&self, window: &Window, cx: &Context<Self>) -> bool {
-        !self.file_suggestions.is_empty() && self.menu.is_none()
-            && self.input.focus_handle(cx).is_focused(window)
-            && self.selected.and_then(|id| self.checkout_dir(id)).as_deref()
-                == self.file_index.as_ref().map(|index| index.root.as_path())
-    }
-
-    fn choose_reference(&mut self, id: u64, query: file_reference::Query, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected != Some(id) || self.input.read(cx).reference_query() != Some(query.clone()) {
-            return;
-        }
-        let exists = self.checkout_dir(id).and_then(|root| media::scoped_path(&root, Path::new(path)))
-            .is_some_and(|path| path.is_file());
-        if exists {
-            self.input.update(cx, |input, cx| input.replace_reference(query, path, cx));
-            window.focus(&self.input.focus_handle(cx), cx);
-        } else {
-            self.file_suggestions.retain(|candidate| candidate != path);
-            cx.notify();
-        }
-    }
-
-    fn file_menu(&self, id: u64, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.suggestions_visible(window, cx) {
-            return None;
-        }
-        let query = self.input.read(cx).reference_query()?;
-        let theme = self.theme;
-        let width = (window.viewport_size().width - px(328.)).clamp(px(160.), px(440.));
-        let menu = self.menu_surface("file-suggestions").w(width).children(
-            self.file_suggestions.iter().enumerate().map(|(i, path)| {
-                let path = path.clone();
-                let query = query.clone();
-                div().id(("file-suggestion", i)).flex().items_center().gap_2().h(px(MENU_ROW_HEIGHT))
-                    .px_2().rounded_md().text_sm().cursor_pointer()
-                    .hover(|d| d.bg(theme.hover))
-                    .child({
-                        let (icon, tint) = file_reference::file_icon(Path::new(&path));
-                        assets::icon(icon, 14.).text_color(tint.map_or(theme.muted, rgb))
-                    })
-                    .child(div().min_w_0().truncate().child(path.clone()))
-                    .when(i == 0, |row| {
-                        row.bg(theme.hover).child(
-                            div().ml_auto().flex_shrink_0().text_xs().text_color(theme.muted).child("Tab"),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| this.choose_reference(id, query.clone(), &path, window, cx)))
-            }),
-        );
-        Some(div().absolute().top_0().left_0().child(
-            deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window().child(menu.mb_2()))
-                .with_priority(2),
-        ))
-    }
-
-    fn pick_files(&mut self, id: u64, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else { return };
-            let _ = this.update(cx, |this, cx| this.add_files(id, paths, cx));
-        }).detach();
-    }
-
-    fn add_files(&mut self, id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.load_attachments(id, move || {
-            paths.into_iter().take(media::COUNT_LIMIT + 1)
-                .map(|path| media::attach_file(&path).map_err(|error| {
-                    format!("{} · {error}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
-                })).collect()
-        }, cx);
-    }
-
-    fn set_attachment_error(&mut self, id: u64, error: Option<String>, cx: &mut Context<Self>) {
-        self.attachment_errors.remove(&id);
-        if let Some(error) = error {
-            self.attachment_errors.insert(id, error);
-        }
-        cx.notify();
-    }
-
-    fn load_attachments(
-        &mut self,
-        id: u64,
-        load: impl FnOnce() -> Vec<Result<Attachment, String>> + Send + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        if self.store.thread(id).is_none() {
-            return;
-        }
-        if !self.attachment_jobs.insert(id) {
-            self.set_attachment_error(id, Some("Finish adding the current files before adding more.".into()), cx);
-            return;
-        }
-        self.set_attachment_error(id, None, cx);
-        let task = cx.background_executor().spawn(async move { load() });
-        cx.spawn(async move |this, cx| {
-            let loaded = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.attachment_jobs.remove(&id);
-                let Some(thread) = this.store.thread_mut(id) else { return };
-                let mut errors = vec![];
-                let draft = &mut thread.draft_attachments;
-                let mut size = draft.iter().map(Attachment::stored_bytes).sum::<usize>();
-                for result in loaded {
-                    match result {
-                        Ok(file) => {
-                            size += file.stored_bytes();
-                            if draft.len() >= media::COUNT_LIMIT || size > media::TOTAL_LIMIT {
-                                errors.push("A draft can hold up to 8 attachments and 20 MiB of stored data.".into());
-                                break;
-                            }
-                            draft.push(file);
-                        }
-                        Err(error) => errors.push(error),
-                    }
-                }
-                this.save();
-                this.set_attachment_error(id, (!errors.is_empty()).then(|| errors.join("\n")), cx);
-            });
-        }).detach();
-    }
-
-    fn composer_prompt(&self, thread: &Thread, cx: &Context<Self>) -> Prompt {
-        Prompt {
-            body: self.input.read(cx).text().trim().to_owned(),
-            attachments: thread.draft_attachments.clone(),
-        }
-    }
-
-    fn clear_composer(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(thread) = self.store.thread_mut(id) {
-            thread.draft.clear();
-            thread.draft_attachments.clear();
-        }
-        self.attachment_errors.remove(&id);
-        self.input.update(cx, |input, cx| input.clear(cx));
     }
 
     fn follow_up_mode(&self, alternate: bool) -> FollowUp {
@@ -1142,7 +899,7 @@ impl Workspace {
                         if let (Some(turn), Some(thread)) = (turn, this.store.thread_mut(id)) {
                             thread.record_work(turn.started.elapsed());
                             // A reply cut short by a stop or a failure keeps what was written.
-                            let partial = shown_reply(&turn.stream.text, &thread.checkout, projectless);
+                            let partial = conversation::shown_reply(&turn.stream.text, &thread.checkout, projectless);
                             if !partial.is_empty() {
                                 let mut message = Message::agent(partial).at(now());
                                 message.checkout_dir = Some(dir.clone());
@@ -1618,274 +1375,6 @@ impl Workspace {
         col
     }
 
-    fn set_model(&mut self, id: u64, agent: Agent, model: &str, cx: &mut Context<Self>) {
-        if let Some(target) = self.store.choose_model(id, agent, model, now()) {
-            if target != id {
-                // The new thread is where the typed prompt will be sent.
-                let draft = self.store.thread_mut(id).map(|t| std::mem::take(&mut t.draft));
-                if let (Some(draft), Some(thread)) = (draft, self.store.thread_mut(target)) {
-                    thread.draft = draft;
-                }
-            }
-            self.select(Some(target), cx);
-        }
-        cx.notify();
-    }
-
-    fn set_effort(&mut self, id: u64, effort: Effort, cx: &mut Context<Self>) {
-        if self.store.select_effort(id, effort) {
-            self.save();
-            cx.notify();
-        }
-    }
-
-    /// Compact picker in the composer footer; the choice applies from the next turn.
-    fn model_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        const PREVIEW_LEN: usize = 4;
-        const PROVIDER_CHIP_HEIGHT: f32 = 26.;
-
-        let theme = self.theme;
-        let (agent, expanded, choosing_provider) = match self.menu {
-            Some(Menu::Model { agent, expanded, choosing_provider }) => (agent, expanded, choosing_provider),
-            _ => (thread.agent, false, false),
-        };
-        let state = Menu::Model { agent, expanded, choosing_provider };
-        let button = self.footer_button("model-picker", state, cx)
-            .child(agent_icon(thread.agent, 13., theme.text))
-            .child(div().font_weight(FontWeight::MEDIUM)
-                .child(thread.agent.model_name(thread.model()).to_string()));
-        if self.menu != Some(state) {
-            return self.footer_picker(button, None, window, cx);
-        }
-
-        let provider_chip = div().id("choose-model-provider").flex().items_center().gap_1p5()
-            .h(px(PROVIDER_CHIP_HEIGHT)).px_2().rounded_md().bg(theme.fill).border_1().border_color(theme.border)
-            .text_xs().font_weight(FontWeight::SEMIBOLD).cursor_pointer()
-            .when(choosing_provider, |d| d.bg(theme.selected))
-            .hover(|h| h.bg(theme.selected))
-            .child(agent_icon(agent, 13., theme.text))
-            .child(agent.name())
-            .child(assets::icon(assets::Icon::ChevronDown, 12.).text_color(theme.muted))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.menu = Some(Menu::Model { agent, expanded, choosing_provider: !choosing_provider });
-                cx.notify();
-            }));
-        let header = div().flex().items_center().justify_between().px_1().pb_1()
-            .child(div().pl_1().text_xs().text_color(theme.muted).child("Models"))
-            .child(provider_chip);
-
-        let models = agent.models();
-        let list_height = (window.viewport_size().height - px(164.)).clamp(px(56.), px(196.));
-        let selected = (agent == thread.agent).then(|| thread.model());
-        let preview = &models[..models.len().min(PREVIEW_LEN)];
-        let selected_below_preview = models[preview.len()..].iter().find(|m| Some(m.id) == selected);
-        let shown = if expanded { models } else { preview };
-        let overflows = px(MENU_ROW_HEIGHT * shown.len() as f32) > list_height;
-        let id = thread.id;
-        let results = div().id(SharedString::from(format!("model-options-{}-{expanded}", agent.label())))
-            .flex().flex_col().max_h(list_height).overflow_y_scroll()
-            .track_scroll(&self.model_scroll)
-            .when(overflows, |d| d.pr(px(SCROLLBAR_GUTTER)))
-            .children(shown.iter().enumerate().map(|(index, model)| {
-                let model = if !expanded && index == PREVIEW_LEN - 1 {
-                    selected_below_preview.unwrap_or(model)
-                } else {
-                    model
-                };
-                let model_id = model.id;
-                let active = Some(model_id) == selected;
-                self.menu_item(model_id, None, model.name, None, active)
-                    .flex_shrink_0()
-                    .when(active, |d| d.bg(theme.selected).font_weight(FontWeight::MEDIUM))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.menu = None;
-                        this.set_model(id, agent, model_id, cx);
-                        window.focus(&this.input.focus_handle(cx), cx);
-                    }))
-            }));
-
-        let menu = self.menu_surface("model-menu").relative().w(px(288.)).child(header)
-            .when(agent != thread.agent && !thread.can_change_agent(), |d| {
-                d.child(div().px_2().pb_1().text_xs().text_color(theme.muted)
-                    .child("Selecting a model starts a new thread"))
-            })
-            .child(div().relative().child(results)
-                .when(overflows, |d| d.child(self.model_scrollbar())))
-            .when(models.len() > PREVIEW_LEN, |d| {
-                let action_color = theme.accent.blend(theme.text.alpha(0.3));
-                let (label, icon) = if expanded {
-                    ("Show fewer models".to_string(), assets::Icon::Minus)
-                } else {
-                    (format!("Show all {} models", models.len()), assets::Icon::Plus)
-                };
-                d.child(div().flex().mt_1().child(div().id("toggle-model-list").flex().items_center().gap_1()
-                        .h(px(28.)).px_2().rounded_md().text_xs().text_color(action_color)
-                        .cursor_pointer().hover(|h| h.bg(theme.hover))
-                        .child(assets::icon(icon, 12.))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.reset_model_scroll();
-                            this.menu = Some(Menu::Model { agent, expanded: !expanded, choosing_provider: false });
-                            cx.notify();
-                        }))))
-            })
-            .when(choosing_provider, |d| {
-                // Paint above the model rows without changing the picker's size.
-                d.child(self.menu_surface("model-providers").absolute()
-                    .top(px(PROVIDER_CHIP_HEIGHT + 8.)).right_2().w(px(152.)).bg(theme.fill)
-                    .children(Agent::ALL.map(|provider| {
-                        self.menu_item(provider.label(), Some(provider), provider.name(), None, provider == agent)
-                            .when(provider == agent, |d| d.bg(theme.selected))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if provider != agent {
-                                    this.reset_model_scroll();
-                                }
-                                this.menu = Some(Menu::Model {
-                                    agent: provider,
-                                    expanded: provider == agent && expanded,
-                                    choosing_provider: false,
-                                });
-                                cx.notify();
-                            }))
-                    })))
-            });
-        self.footer_picker(button, Some(menu), window, cx)
-    }
-
-    fn reset_model_scroll(&self) {
-        self.model_scroll.set_offset(point(px(0.), px(0.)));
-        self.model_scroll_grab.set(None);
-    }
-
-    fn model_scrollbar(&self) -> impl IntoElement {
-        let scroll = self.model_scroll.clone();
-        let grab = self.model_scroll_grab.clone();
-        let theme = self.theme;
-        canvas(
-            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
-            move |bounds, hitbox, window, _| {
-                let max_offset = scroll.max_offset().y;
-                if max_offset <= px(0.) {
-                    return;
-                }
-                let track_height = bounds.size.height - px(4.);
-                let thumb_height = (track_height * (bounds.size.height / (bounds.size.height + max_offset)))
-                    .clamp(px(16.), track_height);
-                let travel = track_height - thumb_height;
-                let track_top = bounds.top() + px(2.);
-                let thumb_top = track_top + travel * (-scroll.offset().y / max_offset);
-                let track_left = bounds.left() + px(4.);
-                let paint_bar = |top, height, color, window: &mut Window| {
-                    let mut bar = fill(Bounds::new(point(track_left, top), size(px(3.), height)), color);
-                    bar.corner_radii = px(1.5).into();
-                    window.paint_quad(bar);
-                };
-                paint_bar(track_top, track_height, theme.border.opacity(0.65), window);
-                paint_bar(thumb_top, thumb_height, theme.muted.alpha(0.56), window);
-
-                let scroll_to = move |y: Pixels, anchor: Pixels, window: &mut Window| {
-                    let progress = ((y - track_top - anchor) / travel).clamp(0., 1.);
-                    scroll.set_offset(point(px(0.), -max_offset * progress));
-                    window.refresh();
-                };
-                let drag_scroll = scroll_to.clone();
-                let start_grab = grab.clone();
-                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                    if phase != DispatchPhase::Bubble || event.button != MouseButton::Left
-                        || !hitbox.is_hovered(window)
-                    {
-                        return;
-                    }
-                    let within_thumb = event.position.y - thumb_top;
-                    let anchor = if (px(0.)..=thumb_height).contains(&within_thumb) {
-                        within_thumb
-                    } else {
-                        thumb_height / 2.
-                    };
-                    start_grab.set(Some(anchor));
-                    scroll_to(event.position.y, anchor, window);
-                    cx.stop_propagation();
-                });
-                let moving_grab = grab.clone();
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Bubble && event.dragging() {
-                        if let Some(anchor) = moving_grab.get() {
-                            drag_scroll(event.position.y, anchor, window);
-                            cx.stop_propagation();
-                        }
-                    }
-                });
-                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, _| {
-                    if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
-                        grab.set(None);
-                    }
-                });
-            },
-        )
-        .absolute().top_0().right_0().bottom_0().w(px(SCROLLBAR_GUTTER))
-    }
-
-    /// Reasoning level picker beside the model; applies from the next turn.
-    fn effort_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let button = self.footer_button("effort-picker", Menu::Effort, cx)
-            .child(assets::icon(assets::Icon::Brain, 13.).text_color(self.theme.muted))
-            .child(div().font_weight(FontWeight::MEDIUM).child(thread.effort().name()));
-        if self.menu != Some(Menu::Effort) {
-            return self.footer_picker(button, None, window, cx);
-        }
-        let id = thread.id;
-        let mut menu = self.menu_panel("effort-menu", "Reasoning");
-        for &effort in thread.agent.efforts(thread.model()) {
-            let key = SharedString::from(format!("effort-{}", effort.id()));
-            menu = menu.child(
-                self.menu_item(key, None, effort.name(), None, thread.effort() == effort)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menu = None;
-                        this.set_effort(id, effort, cx);
-                    })),
-            );
-        }
-        self.footer_picker(button, Some(menu), window, cx)
-    }
-
-    /// A dropdown button in the composer footer. The caller adds its label.
-    fn footer_button(
-        &self,
-        id: &'static str,
-        menu: Menu,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let theme = self.theme;
-        let open = self.menu == Some(menu);
-        div().id(id).flex().flex_shrink_0().items_center().gap_1p5().h(px(26.)).px_2()
-            .rounded_md().text_xs().cursor_pointer()
-            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
-            .when(!open, |d| d.text_color(theme.muted).hover(|h| h.bg(theme.hover).text_color(theme.text)))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(menu, cx)))
-    }
-
-    /// Finish a footer dropdown, showing `menu` above its button when open.
-    fn footer_picker(
-        &self,
-        button: gpui::Stateful<gpui::Div>,
-        menu: Option<gpui::Stateful<gpui::Div>>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let button = button.child(div().text_color(self.theme.muted).child("▾"));
-        let picker = div().relative().child(button);
-        let Some(menu) = menu else {
-            return picker;
-        };
-        // Anchored at the button's top-left corner, so the menu opens above it.
-        picker
-            .child(self.backdrop(window, cx))
-            .child(div().absolute().top_0().left_0().child(
-                deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window().child(menu.mb_2()))
-                    .with_priority(2),
-            ))
-    }
-
     pub(crate) fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         if matches!(menu, Menu::Model { .. }) {
             self.reset_model_scroll();
@@ -1943,108 +1432,6 @@ impl Workspace {
                 .child(if active { "✓" } else { "" }))
     }
 
-    fn set_permission_mode(&mut self, id: u64, mode: PermissionMode) {
-        let Some(thread) = self.store.thread_mut(id) else { return };
-        if thread.status == Status::Running
-            || thread.permission_mode == mode
-            || !thread.agent.permission_modes().contains(&mode)
-        {
-            return;
-        }
-        thread.permission_mode = mode;
-        self.save();
-    }
-
-    fn set_web_access(&mut self, id: u64, access: Decision) {
-        let Some(thread) = self.store.thread_mut(id) else { return };
-        if thread.status == Status::Running || thread.permission_mode != PermissionMode::Manual {
-            return;
-        }
-        thread.policy.network = access;
-        self.save();
-    }
-
-    /// Toolbar picker for the next turn's provider mode and Manual web rules.
-    fn permission_picker(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let available = thread.status != Status::Running;
-        let open = available && self.menu == Some(Menu::Permissions);
-        let mode = thread.permission_mode;
-        let color = match mode {
-            PermissionMode::Manual => theme.ok,
-            PermissionMode::Auto => theme.accent,
-            PermissionMode::FullAccess => theme.warn,
-        };
-        let button = div().id("permission-picker").flex().items_center().gap_1p5().px_2p5().py_1()
-            .rounded_full().text_xs().text_color(theme.muted).bg(theme.fill)
-            .when(open, |d| d.bg(theme.selected).text_color(theme.text))
-            .when(available, |d| d.cursor_pointer()
-                .hover(|h| h.bg(theme.hover).text_color(theme.text))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Permissions, cx))))
-            .child(div().size(px(6.)).rounded_full().bg(color))
-            .child(permission_label(mode))
-            .when(available, |d| d.child("▾"));
-        let picker = div().relative().child(button);
-        if !open {
-            return picker;
-        }
-        let id = thread.id;
-        let mut menu = self.menu_panel("permission-menu", "Permissions for this thread").w(px(285.)).mt_2();
-        for &choice in thread.agent.permission_modes() {
-            let (key, detail) = match choice {
-                PermissionMode::Manual => ("permissions-manual", "Review approval requests"),
-                PermissionMode::Auto => ("permissions-auto", "Provider reviews actions"),
-                PermissionMode::FullAccess => ("permissions-full", "Run tools without asking"),
-            };
-            menu = menu.child(
-                self.menu_item(key, None, permission_label(choice), Some(detail), mode == choice)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menu = None;
-                        this.set_permission_mode(id, choice);
-                        cx.notify();
-                    })),
-            );
-        }
-        if mode == PermissionMode::Manual {
-            let codex = thread.agent == Agent::Codex;
-            menu = menu.child(
-                div().mt_1().border_t_1().border_color(theme.border)
-                    .px_2().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted).child(if codex { "Web search" } else { "Web search and fetch" }),
-            );
-            for (key, access, label) in [
-                ("web-ask", Decision::Ask, "Ask first"),
-                ("web-allow", Decision::Allow, "Allow"),
-                ("web-block", Decision::Deny, "Block"),
-            ] {
-                if codex && access == Decision::Ask {
-                    continue;
-                }
-                let selected = thread.policy.network == access
-                    || (codex && access == Decision::Deny && thread.policy.network == Decision::Ask);
-                menu = menu.child(
-                    self.menu_item(key, None, label, None, selected)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.menu = None;
-                            this.set_web_access(id, access);
-                            cx.notify();
-                        })),
-                );
-            }
-        }
-        menu = menu.child(
-            div().px_2().pt_1p5().pb_1().text_xs().text_color(theme.muted)
-                .child("Changes apply to the next turn."),
-        );
-        // Anchored at the button's bottom-right corner, so the menu opens below it.
-        picker
-            .child(self.backdrop(window, cx))
-            .child(div().absolute().bottom_0().right_0().child(
-                deferred(anchored().anchor(Anchor::TopRight).snap_to_window().child(menu))
-                    .with_priority(2),
-            ))
-    }
-
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div().flex().flex_col().flex_1().h_full().items_center().justify_center().gap_3()
@@ -2061,446 +1448,6 @@ impl Workspace {
             )
     }
 
-    fn entry(&mut self, id: u64, row: usize, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match self.entries.get(row) {
-            Some(&Entry::Message(ix)) => self.message(id, ix, false, window, cx),
-            Some(&Entry::GroupedTool(ix)) => self.message(id, ix, true, window, cx),
-            Some(&Entry::ToolGroup { start, count }) => self.tool_group_row(id, start, count, cx),
-            Some(&Entry::Work { start, reply }) => self.work_row(id, start, reply, cx),
-            Some(&Entry::Activity) => self.turn_activity(id, window, cx).into_any_element(),
-            None => div().into_any_element(),
-        }
-    }
-
-    fn tool_group_row(&self, id: u64, start: usize, count: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
-        let open = self.open_tool_groups.contains(&(id, start));
-        let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
-        centered(
-            div().id(("tool-group", start)).flex().items_center().gap_2().px_3().py_1p5()
-                .rounded(px(8.)).bg(theme.fill).border_1().border_color(theme.border)
-                .text_xs().text_color(theme.muted).cursor_pointer()
-                .hover(|h| h.bg(theme.hover))
-                .child(assets::icon(assets::Icon::Layers, 13.))
-                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text).child(format!("{count} tool calls")))
-                .child(assets::icon(chevron, 13.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.open_tool_groups.remove(&(id, start)) {
-                        this.open_tool_groups.insert((id, start));
-                    }
-                    this.anchor_transcript();
-                    this.transcript_built = None;
-                    cx.notify();
-                })),
-        )
-        .px_6().py_1p5().into_any_element()
-    }
-
-    /// Stands for what the agent did before it replied; a click shows or hides
-    /// it. Shows how long that took and when the reply arrived.
-    fn work_row(&self, id: u64, start: usize, reply: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
-        let messages = self.store.thread(id).map_or(&[][..], |t| &t.messages);
-        // The user message the work answers is the one just before it.
-        let ran = start.checked_sub(1).and_then(|i| messages.get(i)).map_or(0, |m| m.worked_ms);
-        let replied = messages.get(reply)
-            .filter(|m| m.at > 0)
-            .and_then(|m| Local.timestamp_opt(i64::try_from(m.at).ok()?, 0).single())
-            .map(|at| transcript::clock(at, Local::now()));
-        let chevron = if self.open_work.contains(&(id, start)) {
-            assets::Icon::ChevronDown
-        } else {
-            assets::Icon::ChevronRight
-        };
-        // Pulled left by its padding, so the title lines up with the reply.
-        let button = div().id(("work", start)).flex().items_center().gap_1().ml(px(-6.))
-            .px_1p5().py_0p5().rounded_md().cursor_pointer()
-            .hover(|h| h.bg(theme.hover).text_color(theme.text))
-            .child(transcript::worked(ran))
-            .child(assets::icon(chevron, 13.))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_work(id, start, cx)));
-        centered(
-            div().flex().flex_col().w_full().gap_1p5().text_xs().text_color(theme.muted)
-                .child(
-                    div().flex().items_center().justify_between()
-                        .child(button)
-                        .when_some(replied, |d, time| d.child(time)),
-                )
-                .child(div().w_full().h(px(1.)).bg(theme.border)),
-        )
-        .px_6()
-        .py_1p5()
-        .into_any_element()
-    }
-
-    fn message(&mut self, id: u64, ix: usize, grouped: bool, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
-        let Some(m) = self.store.thread(id).and_then(|t| t.messages.get(ix)) else {
-            return div().into_any_element();
-        };
-        let body = div().min_w_0().text_sm().line_height(relative(1.55));
-        let root = m.checkout_dir.clone().or_else(|| self.checkout_dir(id));
-        let scratch_dir = self.scratch_dir(id);
-        let mut document = output_selection::Document::new(self.output_selection.clone(), ix);
-        let content = match (&m.tool, m.role) {
-            (Some(name), _) => {
-                if shell::is_shell(name) && self.open_tools.contains(&(id, ix)) {
-                    self.shell_highlights.entry(ix).or_insert_with(|| {
-                        shell::highlights(name, &m.body, m.command_bytes)
-                    });
-                }
-                self.tool_call(id, ix, name, &m.body, &mut document, cx).into_any_element()
-            }
-            (None, Role::User) => div().flex().justify_end()
-                .child(body.max_w(px(560.)).px_3p5().py_2().rounded(px(18.))
-                    .bg(theme.accent).text_color(theme.on_accent)
-                    .when(!m.body.is_empty(), |d| {
-                        d.child(markdown::render_user(&m.body, theme, root.as_deref(), &scratch_dir, &mut document, window, cx))
-                    })
-                    .when(!m.attachments.is_empty(), |d| {
-                        d.child(div().flex().flex_wrap().gap_1()
-                            .children(m.attachments.iter().enumerate().map(|(i, attachment)| {
-                                attachment_button(format!("sent-{ix}-{i}"), attachment, theme)
-                            })))
-                    }))
-                .into_any_element(),
-            (None, Role::Agent) => {
-                let blocks = self.parsed.entry(ix).or_insert_with(|| markdown::parse_at(&m.body, root.as_deref()).into());
-                let images = self.reply_images.entry(ix).or_insert_with(|| {
-                    m.attachments.iter().filter_map(|attachment| match &attachment.content {
-                        AttachmentContent::Image { base64, .. } => {
-                            Some((attachment.name.clone(), media::Picture::embedded(base64.clone())))
-                        }
-                        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
-                    }).collect()
-                });
-                body.when(!blocks.is_empty(), |d| {
-                    d.child(markdown::render(blocks, theme, root.as_deref(), &scratch_dir, &mut document, window, cx))
-                })
-                    .children(images.iter().enumerate().map(|(i, (name, picture))| {
-                        media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
-                    }))
-                    .children(m.attachments.iter().enumerate().filter_map(|(i, attachment)| {
-                        let AttachmentContent::Visualization { html, preview, dark_preview } = &attachment.content else { return None };
-                        Some(visualization::inline(
-                            format!("visualization-{ix}-{i}"), attachment.name.clone(), html.clone(), preview, theme,
-                            dark_preview.as_ref(),
-                        ))
-                    }))
-                    .into_any_element()
-            }
-            (None, Role::Notice) => body.text_xs().text_color(theme.muted)
-                .child(document.plain(m.body.clone()))
-                .into_any_element(),
-        };
-        let body = centered(div().when(grouped, |d| d.pl_5()).child(content)).px_6().py_1p5();
-        let highlight = if m.role == Role::User && m.tool.is_none() {
-            theme.on_accent
-        } else {
-            theme.accent
-        };
-        document.render(body, highlight.opacity(0.3).into()).into_any_element()
-    }
-
-    fn tool_call(
-        &self,
-        id: u64,
-        ix: usize,
-        name: &str,
-        input: &str,
-        document: &mut output_selection::Document,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = self.theme;
-        let open = self.open_tools.contains(&(id, ix));
-        let preview = input.lines().next().unwrap_or_default().trim();
-        let chevron = if open { assets::Icon::ChevronDown } else { assets::Icon::ChevronRight };
-        let header = div().flex().items_center().gap_2().min_w_0().px_3().py_1p5().text_xs()
-            .child(assets::icon(tool_icon(name), 13.))
-            .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text).child(name.to_string()))
-            .child(div().flex_1().min_w_0().truncate().font_family(MONO)
-                .when(!open && !preview.is_empty(), |d| {
-                    let mut chars = preview.chars();
-                    let mut summary: String = chars.by_ref().take(120).collect();
-                    if chars.next().is_some() {
-                        summary.push('…');
-                    }
-                    d.child(summary)
-                }));
-        let header = if input.is_empty() {
-            header.into_any_element()
-        } else {
-            header.id(("tool", ix))
-                .cursor_pointer().hover(|h| h.bg(theme.hover))
-                .child(assets::icon(chevron, 13.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.open_tools.remove(&(id, ix)) {
-                        this.open_tools.insert((id, ix));
-                    }
-                    this.anchor_transcript();
-                    if let Some(row) = this.entries.iter().position(|entry| {
-                        matches!(*entry, Entry::Message(index) | Entry::GroupedTool(index) if index == ix)
-                    }) {
-                        this.transcript.remeasure_items(row..row + 1);
-                    }
-                    cx.notify();
-                }))
-                .into_any_element()
-        };
-        div().flex().flex_col().w_full().min_w_0().rounded(px(8.)).overflow_hidden().bg(theme.fill)
-            .border_1().border_color(theme.border)
-            .text_color(theme.muted)
-            .child(header)
-            .when(open, |d| {
-                let details = div().px_3().py_2().border_t_1().border_color(theme.border)
-                    .font_family(MONO).text_xs().line_height(relative(1.6))
-                    .text_color(theme.text);
-                let details = match self.shell_highlights.get(&ix).and_then(Option::as_deref) {
-                    Some(spans) => {
-                        let styled = shell::render(input, spans, theme);
-                        document.track(input.to_owned().into(), &styled, Vec::new());
-                        details.child(styled)
-                    }
-                    None => details.child(document.plain(input.to_owned())),
-                };
-                d.child(details)
-            })
-    }
-
-    /// The round button at the composer's corner. The caller adds its mark.
-    fn round_button(&self, id: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
-        let theme = self.theme;
-        div().id(id).flex().flex_shrink_0().items_center().justify_center()
-            .size(px(28.)).rounded_full().text_sm().font_weight(FontWeight::BOLD)
-            .when(enabled, |d| {
-                d.bg(theme.accent).text_color(theme.on_accent).cursor_pointer()
-                    .hover(|h| h.opacity(0.85))
-            })
-            .when(!enabled, |d| d.bg(theme.selected).text_color(theme.muted))
-    }
-
-    fn send_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let ready = self.selected.and_then(|id| self.store.thread(id))
-            .is_some_and(|thread| self.composer_ready(thread, cx));
-        self.round_button("send", ready)
-            .child("↑")
-            .tooltip(tip("Send", self.theme))
-            .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx)))
-    }
-
-    /// Takes the send button's place while a turn runs.
-    fn stop_button(&self, id: u64, enabled: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let mark = if enabled { self.theme.on_accent } else { self.theme.muted };
-        self.round_button("stop", enabled)
-            .child(div().size(px(10.)).rounded(px(2.)).bg(mark))
-            .tooltip(tip("Stop", self.theme))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.stop(id, cx);
-                // The click took focus; hand it back for the next message.
-                window.focus(&this.input.focus_handle(cx), cx);
-            }))
-    }
-
-    /// The follow-ups waiting for the thread's turn to end.
-    fn queue_panel(&self, thread: &Thread, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let id = thread.id;
-        let running = thread.status == Status::Running;
-        let mut col = div().flex().flex_col().flex_shrink_0().gap_1().px_6();
-        if thread.queue.is_empty() {
-            return col;
-        }
-        let heading = if running {
-            "Queued — sent when this turn ends"
-        } else {
-            "Queued — not sent because the last turn did not finish"
-        };
-        let mut panel = div().flex().flex_col().gap_1().w_full().p_2().rounded(px(12.))
-            .bg(theme.card).border_1().border_color(theme.border)
-            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
-                .child(heading));
-        for (i, prompt) in thread.queue.iter().enumerate() {
-            let button = |id: (&'static str, usize), mark: assets::Icon, label: &'static str| {
-                div().id(id).flex().flex_shrink_0().items_center().justify_center().size(px(22.))
-                    .rounded_md().text_color(theme.muted).cursor_pointer()
-                    .hover(|h| h.bg(theme.hover).text_color(theme.text))
-                    .tooltip(tip(label, theme))
-                    .child(assets::icon(mark, 14.))
-            };
-            panel = panel.child(
-                div().flex().items_center().gap_1().child(
-                    div().flex_1().min_w_0().truncate().text_sm().text_color(theme.text)
-                        .child(prompt.body.lines().next().filter(|line| !line.is_empty()).unwrap_or("Attachments").to_string()),
-                )
-                .when(!running && i == 0, |d| {
-                    d.child(button(("queued-send", i), assets::Icon::ArrowUp, "Send now")
-                        .on_click(cx.listener(move |this, _, _, cx| this.resume_queue(id, cx))))
-                })
-                .child(button(("queued-edit", i), assets::Icon::Pencil, "Edit")
-                    .on_click(cx.listener(move |this, _, _, cx| this.edit_queued(id, i, cx))))
-                .child(button(("queued-remove", i), assets::Icon::X, "Remove")
-                    .on_click(cx.listener(move |this, _, _, cx| this.remove_queued(id, i, cx)))),
-            );
-        }
-        col = col.child(centered(panel).flex_shrink_0());
-        col
-    }
-
-    fn resume_button(&self, id: u64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        self.round_button("resume", true)
-            .child(assets::icon(assets::Icon::Play, 12.))
-            .tooltip(tip("Resume", self.theme))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.resume(id, cx);
-                window.focus(&this.input.focus_handle(cx), cx);
-            }))
-    }
-
-    fn turn_activity(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        // The streamed reply takes the index its whole message will have.
-        let (key, checkout) = self.store.thread(id)
-            .map_or((0, Checkout::Project), |t| (t.messages.len(), t.checkout.clone()));
-        let root = self.checkout_dir(id);
-        let projectless = self.store.project_of(id).is_none();
-        let streamed = self.turns.get_mut(&id).filter(|turn| turn.stream.shown > 0).map(|turn| {
-            let stream = &mut turn.stream;
-            stream.blocks.get_or_insert_with(|| {
-                markdown::parse_at(&shown_reply(&stream.text[..stream.shown], &checkout, projectless), root.as_deref()).into()
-            }).clone()
-        });
-        let stopping = self.is_stopping(id);
-        let waiting = self.has_live_approval(id);
-        let (label, color) = if stopping {
-            ("Stopping…", theme.muted)
-        } else if waiting {
-            ("Waiting for approval", theme.warn)
-        } else {
-            ("Working…", theme.muted)
-        };
-        let dot = div().size(px(7.)).rounded_full().bg(color);
-        let dot = if stopping || waiting {
-            dot.into_any_element()
-        } else {
-            dot.with_animation(
-                ("agent-activity", id),
-                Animation::new(Duration::from_millis(1200)).repeat().with_max_fps(20.),
-                |dot, phase| dot.opacity(1. - 1.2 * phase.min(1. - phase)),
-            ).into_any_element()
-        };
-        let status = centered(div().flex().items_center().gap_2().text_xs().text_color(theme.muted)
-            .child(dot)
-            .child(label))
-            .px_6().py_1p5();
-        let mut document = output_selection::Document::new(self.output_selection.clone(), key);
-        let content = div().flex().flex_col().w_full()
-            .when_some(streamed, |d, blocks| {
-                d.child(centered(div().min_w_0().text_sm().line_height(relative(1.55))
-                    .child(markdown::render(&blocks, theme, root.as_deref(), &self.scratch_dir(id), &mut document, window, cx)))
-                    .px_6().py_1p5())
-            })
-            .child(status);
-        document.render(content, theme.accent.opacity(0.3).into())
-    }
-
-    fn composer_ready(&self, thread: &Thread, cx: &Context<Self>) -> bool {
-        !self.attachment_jobs.contains(&thread.id)
-            && (!thread.draft_attachments.is_empty() || !self.input.read(cx).text().trim().is_empty())
-    }
-
-    fn remove_attachment(&mut self, id: u64, i: usize, cx: &mut Context<Self>) {
-        if let Some(thread) = self.store.thread_mut(id) {
-            if i < thread.draft_attachments.len() {
-                thread.draft_attachments.remove(i);
-                self.save();
-                self.set_attachment_error(id, None, cx);
-            }
-        }
-    }
-
-    fn composer(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let running = thread.status == Status::Running;
-        let stopping = self.turns.get(&thread.id).is_some_and(|t| t.process.stop_requested());
-        let stopped = thread.status == Status::Stopped;
-        let id = thread.id;
-        let loading = self.attachment_jobs.contains(&id);
-        let typed = self.composer_ready(thread, cx);
-        let button = if running && typed && !stopping {
-            let mark = match self.follow_up_mode(window.modifiers().control) {
-                FollowUp::Steer => assets::Icon::CornerDownRight,
-                FollowUp::Queue => assets::Icon::ListEnd,
-            };
-            let hint = match self.store.settings.follow_up {
-                FollowUp::Steer => "Steer the running turn (Enter) · Ctrl+Enter to queue instead",
-                FollowUp::Queue => "Queue for after this turn (Enter) · Ctrl+Enter to steer instead",
-            };
-            self.round_button("follow-up", true)
-                .child(assets::icon(mark, 14.))
-                .tooltip(tip(hint, theme))
-                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                    this.submit(ev.modifiers().control, cx);
-                }))
-                .into_any_element()
-        } else if running {
-            self.stop_button(thread.id, !stopping, cx).into_any_element()
-        } else if stopped && !typed && !loading {
-            self.resume_button(thread.id, cx).into_any_element()
-        } else {
-            self.send_button(cx).into_any_element()
-        };
-        centered(
-            div().id("composer-card").relative().flex().flex_col().gap_2().w_full().p_2().rounded(px(16.))
-                .bg(theme.card).border_1().border_color(theme.border).shadow_md()
-                .on_drop(cx.listener(move |this, files: &gpui::ExternalPaths, _, cx| {
-                    this.add_files(id, files.paths().to_vec(), cx);
-                }))
-                .when(!thread.draft_attachments.is_empty(), |d| {
-                    d.child(div().flex().flex_wrap().gap_1().px_2()
-                        .children(thread.draft_attachments.iter().enumerate().map(|(i, attachment)| {
-                            div().flex().items_center().rounded_md().bg(theme.fill).text_color(theme.text)
-                                .child(attachment_button(format!("draft-preview-{i}"), attachment, theme))
-                                .child(div().id(("remove-attachment", i)).p_1()
-                                    .cursor_pointer().hover(|h| h.bg(theme.hover))
-                                    .tooltip(tip("Remove attachment", theme))
-                                    .child(assets::icon(assets::Icon::X, 12.))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(id, i, cx))))
-                        })))
-                })
-                .when_some(self.attachment_errors.get(&id), |d, error| {
-                    d.child(div().px_2().text_xs().text_color(theme.warn).child(error.clone()))
-                })
-                .children(self.file_menu(id, window, cx))
-                .child(
-                    div().id("composer")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            window.focus(&this.input.focus_handle(cx), cx)
-                        }))
-                        .px_2().py_1p5().text_sm().child(self.input.clone()),
-                )
-                .child(
-                    div().flex().items_center().gap_3().pl_0p5()
-                        .child(div().flex().items_center().gap_0p5()
-                            .child(composer_tool("attach-file", assets::Icon::Paperclip, theme)
-                                .tooltip(tip("Attach text files or images", theme))
-                                .on_click(cx.listener(move |this, _, _, cx| this.pick_files(id, cx))))
-                            .child(self.model_picker(thread, window, cx))
-                            .child(self.effort_picker(thread, window, cx)))
-                        .child(div().flex_1().min_w_0().truncate().text_xs()
-                            .text_color(theme.muted).text_right()
-                            .when(loading, |d| d.child("Adding attachments…"))
-                            .when(!loading && running && !stopping, |d| d.child("Esc to stop")))
-                        .child(button),
-                ),
-        )
-        .flex_shrink_0()
-        .px_6()
-        .pt_1()
-        .pb_4()
-    }
-
     fn toolbar(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let project = self.store.project_of(thread.id);
@@ -2511,7 +1458,7 @@ impl Workspace {
                     .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text).child(thread.title.clone()))
                     .when(project.is_none(), |d| {
-                        d.child(div().text_xs().text_color(theme.muted).child(crate::sidebar::NO_PROJECT))
+                        d.child(div().text_xs().text_color(theme.muted).child(sidebar::NO_PROJECT))
                     })
                     .when_some(project, |d, project| {
                         d.child(div().flex().min_w_0().items_center().gap_1()
@@ -2547,58 +1494,11 @@ impl Workspace {
     }
 }
 
-fn composer_tool(id: &'static str, icon: assets::Icon, theme: Theme) -> gpui::Stateful<gpui::Div> {
-    div().id(id).flex().flex_shrink_0().items_center().justify_center()
-        .size(px(26.)).rounded_md().text_color(theme.muted).cursor_pointer()
-        .hover(|h| h.bg(theme.hover).text_color(theme.text))
-        .child(assets::icon(icon, 14.))
-}
-
-fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui::Stateful<gpui::Div> {
-    let preview = attachment.clone();
-    let icon = match attachment.content {
-        AttachmentContent::Text(_) => assets::Icon::FileText,
-        AttachmentContent::Image { .. } | AttachmentContent::Visualization { .. } => assets::Icon::Image,
-    };
-    div().id(SharedString::from(id)).flex().items_center().gap_1()
-        .rounded_md().px_2().py_1().max_w(px(250.)).text_xs()
-        .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
-        .child(assets::icon(icon, 12.))
-        .child(div().min_w_0().truncate().child(attachment.name.clone()))
-        .tooltip(tip("Open attachment preview", theme))
-        .on_click(move |_, window, cx| media::preview_attachment(&preview, theme, window, cx))
-}
-
-fn tool_icon(name: &str) -> assets::Icon {
-    use assets::Icon;
-
-    match name {
-        name if shell::is_shell(name) => Icon::Terminal,
-        "File change" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Icon::FilePen,
-        "Read" => Icon::FileText,
-        "Glob" | "Grep" => Icon::FileSearch,
-        "Web search" | "WebSearch" | "WebFetch" => Icon::Globe,
-        _ => Icon::Wrench,
-    }
-}
-
 pub(crate) fn permission_label(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::Manual => "Manual",
         PermissionMode::Auto => "Auto",
         PermissionMode::FullAccess => "Full access",
-    }
-}
-
-/// Agent text with Kiln's control lines removed.
-fn shown_reply(text: &str, place: &Checkout, projectless: bool) -> String {
-    let text = title::take_title(text).0;
-    if projectless {
-        return checkout::take_project_request(&text).0;
-    }
-    match place {
-        Checkout::Project => checkout::take_move_request(&text).0,
-        Checkout::Worktree { .. } => text,
     }
 }
 
@@ -2676,21 +1576,4 @@ impl Render for Workspace {
             .children(self.render_palette(cx))
             .children(self.render_image_lightbox(window, cx))
     }
-}
-
-/// `KILN_STATE_DIR` overrides the location so dev and test runs never touch real data.
-fn state_path() -> std::path::PathBuf {
-    use std::path::PathBuf;
-    if let Some(dir) = std::env::var_os("KILN_STATE_DIR") {
-        return PathBuf::from(dir).join("state.json");
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    let base = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/Kiln")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(|d| PathBuf::from(d).join("kiln"))
-            .unwrap_or_else(|| home.join(".local/share/kiln"))
-    };
-    base.join("state.json")
 }

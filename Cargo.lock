@@ -2586,6 +2586,8 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "resvg",
+ "serde",
+ "serde_json",
  "sha2",
  "spellbook",
  "tempfile",

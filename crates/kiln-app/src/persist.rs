@@ -1,10 +1,10 @@
-//! Local-only state file. The caller picks the path; nothing here knows about
-//! the user's real data directory, so tests always use a temp dir.
+//! Kiln's local state file. Loads and saves take an explicit path so tests
+//! can use a temporary directory.
 
-use crate::store::{Status, Store};
+use kiln_core::Store;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const VERSION: u32 = 1;
 
@@ -54,12 +54,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
         Ok(f) if f.version == VERSION => {
             let mut store = f.store;
             store.normalize();
-            // Child processes do not survive a restart.
-            for t in store.threads_mut() {
-                if t.status == Status::Running {
-                    t.status = Status::Idle;
-                }
-            }
+            store.recover_interrupted_turns();
             Ok(Loaded::Ok(store))
         }
         _ => {
@@ -70,10 +65,35 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
     }
 }
 
+/// `KILN_STATE_DIR` overrides the location so dev and test runs never touch real data.
+pub(crate) fn state_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("KILN_STATE_DIR") {
+        return PathBuf::from(dir).join("state.json");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Kiln")
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(|d| PathBuf::from(d).join("kiln"))
+            .unwrap_or_else(|| home.join(".local/share/kiln"))
+    };
+    base.join("state.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{policy::{Decision, PermissionMode}, Agent, Appearance, Effort, Settings};
+    use kiln_core::policy::{Decision, PermissionMode};
+    use kiln_core::{Agent, Appearance, Effort, Settings, Status};
+
+    fn sample_store() -> Store {
+        let mut store = Store::default();
+        let project = store.add_project(Path::new("/tmp/kiln-sample"));
+        store.add_thread(project, Agent::Claude, 0);
+        store.add_thread(project, Agent::Claude, 0);
+        store
+    }
 
     fn temp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kiln-test-{}-{name}", std::process::id()));
@@ -84,12 +104,12 @@ mod tests {
     #[test]
     fn round_trips_sessions_policy_and_settings() {
         let path = temp("roundtrip");
-        let mut store = Store::sample();
+        let mut store = sample_store();
         let id = store.projects[0].threads[0].id;
         let t = store.thread_mut(id).unwrap();
         t.session_id = Some("sess-1".into());
         t.model = Some("claude-sonnet-5-5".into());
-        t.policy.network = crate::policy::Decision::Allow;
+        t.policy.network = Decision::Allow;
         t.updated_at = 42;
         t.settled = true;
         store.settled_collapsed = true;
@@ -98,11 +118,11 @@ mod tests {
             appearance: Appearance::Dark,
             permission_mode: PermissionMode::FullAccess,
             web: Decision::Deny,
-            branch_prefix: crate::checkout::BranchPrefix::Custom("me".into()),
-            fetch: crate::Fetch::Always,
-            follow_up: crate::FollowUp::Steer,
+            branch_prefix: kiln_core::checkout::BranchPrefix::Custom("me".into()),
+            fetch: kiln_core::Fetch::Always,
+            follow_up: kiln_core::FollowUp::Steer,
             new_project_root: Some("/projects".into()),
-            spelling: crate::settings::SpellingSettings {
+            spelling: kiln_core::settings::SpellingSettings {
                 english: false,
                 languages: vec!["pl_PL".into()],
             },
@@ -118,7 +138,7 @@ mod tests {
         assert_eq!(t.session_id.as_deref(), Some("sess-1"));
         assert_eq!(t.model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(t.permission_mode, PermissionMode::Manual);
-        assert_eq!(t.policy.network, crate::policy::Decision::Allow);
+        assert_eq!(t.policy.network, Decision::Allow);
         assert_eq!((t.updated_at, t.settled), (42, true));
         assert!(back.settled_collapsed);
         assert_eq!(back.projects[0].icon.as_deref(), Some(Path::new("/pictures/mark.png")));
@@ -132,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_projectless_thread_is_saved_and_can_move_without_losing_history() {
-        use crate::{Message, Prompt};
+        use kiln_core::{Message, Prompt};
 
         let path = temp("projectless");
         let mut store = Store::default();
@@ -166,10 +186,10 @@ mod tests {
 
     #[test]
     fn round_trips_visualization_source_and_preview() {
-        use crate::{Attachment, AttachmentContent, Message};
+        use kiln_core::{Attachment, AttachmentContent, Message};
 
         let path = temp("visualization");
-        let mut store = Store::sample();
+        let mut store = sample_store();
         let id = store.projects[0].threads[0].id;
         let mut message = Message::agent("");
         let attachment = Attachment {
@@ -192,7 +212,7 @@ mod tests {
     #[test]
     fn threads_saved_without_a_permission_mode_load_as_manual() {
         let path = temp("legacy-permissions");
-        let store = Store::sample();
+        let store = sample_store();
         let id = store.projects[0].threads[0].id;
         save(&path, &store).unwrap();
         let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -205,12 +225,15 @@ mod tests {
     #[test]
     fn running_threads_restore_as_idle() {
         let path = temp("running");
-        let mut store = Store::sample();
+        let mut store = sample_store();
         let id = store.projects[0].threads[0].id;
+        let projectless = store.add_projectless_thread(Agent::Codex, 0);
         store.thread_mut(id).unwrap().status = Status::Running;
+        store.thread_mut(projectless).unwrap().status = Status::Running;
         save(&path, &store).unwrap();
         let Loaded::Ok(back) = load(&path).unwrap() else { panic!() };
         assert_eq!(back.thread(id).unwrap().status, Status::Idle);
+        assert_eq!(back.thread(projectless).unwrap().status, Status::Idle);
     }
 
     #[test]

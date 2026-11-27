@@ -1,6 +1,10 @@
 //! Which rows the conversation shows. Once the agent has replied, what it sent
 //! on the way there is folded under one "Worked" row.
 
+pub(crate) mod markdown;
+pub(crate) mod selection;
+pub(crate) mod shell;
+
 use chrono::{DateTime, Datelike, TimeZone};
 use kiln_core::checkout::{MOVE_REQUEST, PROJECT_REQUEST};
 use kiln_core::title::TITLE_REQUEST;

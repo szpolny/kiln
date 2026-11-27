@@ -1,9 +1,9 @@
 //! A project's icon file turned into the small picture Kiln draws.
 
+use crate::media::{straighten, svg};
 use gpui::RenderImage;
 use image::{imageops, Frame, ImageReader, Limits, RgbaImage};
 use kiln_agent::project;
-use resvg::{tiny_skia, usvg};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -66,37 +66,6 @@ fn raster(bytes: &[u8]) -> Option<RgbaImage> {
         imageops::resize(&pixels, fit(width), fit(height), imageops::FilterType::Triangle);
     small.pixels_mut().for_each(|p| straighten(&mut p.0));
     Some(small)
-}
-
-pub(crate) fn svg(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
-    let options = usvg::Options {
-        // An SVG may name other files. Only what it embeds is drawn.
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_string: Box::new(|_, _| None),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
-    let size = tree.size();
-    let scale = max_side as f32 / size.width().max(size.height());
-    let fit = |side: f32| ((side * scale).round() as u32).clamp(1, max_side);
-    let mut canvas = tiny_skia::Pixmap::new(fit(size.width()), fit(size.height()))?;
-    let transform = tiny_skia::Transform::from_scale(scale, scale);
-    resvg::render(&tree, transform, &mut canvas.as_mut());
-    let mut pixels = RgbaImage::from_raw(canvas.width(), canvas.height(), canvas.take())?;
-    pixels.pixels_mut().for_each(|p| straighten(&mut p.0));
-    Some(pixels)
-}
-
-/// Undo premultiplied alpha.
-fn straighten(pixel: &mut [u8; 4]) {
-    let alpha = u32::from(pixel[3]);
-    if alpha > 0 {
-        pixel[..3].iter_mut().for_each(|c| {
-            *c = ((u32::from(*c) * 255 + alpha / 2) / alpha).min(255) as u8;
-        });
-    }
 }
 
 #[cfg(test)]

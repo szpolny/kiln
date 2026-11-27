@@ -1,10 +1,12 @@
 //! Manage the composer dictionaries from the Settings dialog.
 
+use super::{hint, row_icon, setting_row};
 use crate::{
     assets::{icon, Icon},
-    settings::{hint, row_icon, setting_row},
-    spelling::Dictionaries,
-    spelling_download::{Language, LANGUAGES},
+    spelling::{
+        download::{Language, LANGUAGES},
+        Dictionaries,
+    },
     theme::Theme,
     workspace::Workspace,
 };

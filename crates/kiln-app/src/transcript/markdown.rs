@@ -2,7 +2,8 @@
 //!
 //! Images load locally from the thread checkout. Links open only on click.
 
-use crate::{assets, file_reference::{self, ChipColors}, media, output_selection::Document, tooltip::tip};
+use super::selection::Document;
+use crate::{assets, file_reference::{self, ChipColors}, media, tooltip::tip};
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc};
 use crate::theme::{Theme, MONO};
 use gpui::{

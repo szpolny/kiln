@@ -2,7 +2,6 @@
 //! so the privacy policy can be tested without a window.
 
 pub mod checkout;
-pub mod persist;
 pub mod policy;
 pub mod settings;
 pub mod store;
