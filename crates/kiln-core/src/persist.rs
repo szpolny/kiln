@@ -55,7 +55,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
             let mut store = f.store;
             store.normalize();
             // Child processes do not survive a restart.
-            for t in store.projects.iter_mut().flat_map(|p| &mut p.threads) {
+            for t in store.threads_mut() {
                 if t.status == Status::Running {
                     t.status = Status::Idle;
                 }
@@ -101,6 +101,7 @@ mod tests {
             branch_prefix: crate::checkout::BranchPrefix::Custom("me".into()),
             fetch: crate::Fetch::Always,
             follow_up: crate::FollowUp::Steer,
+            new_project_root: Some("/projects".into()),
         };
         let second = store.projects[0].threads[1].id;
         store.thread_mut(second).unwrap().permission_mode = PermissionMode::Auto;
@@ -123,6 +124,40 @@ mod tests {
         let new_thread = back.thread(new_id).unwrap();
         assert_eq!((new_thread.model(), new_thread.effort()), ("claude-haiku-5-5", Effort::High));
         assert_eq!(new_thread.permission_mode, PermissionMode::FullAccess);
+    }
+
+    #[test]
+    fn a_projectless_thread_is_saved_and_can_move_without_losing_history() {
+        use crate::{Message, Prompt};
+
+        let path = temp("projectless");
+        let mut store = Store::default();
+        let id = store.add_projectless_thread(Agent::Codex, 7);
+        let thread = store.thread_mut(id).unwrap();
+        thread.status = Status::Running;
+        thread.session_id = Some("old-session".into());
+        thread.messages.push(Message::user("Build a timer"));
+        thread.enqueue(Prompt { body: "Add a pause button".into(), attachments: vec![] });
+        save(&path, &store).unwrap();
+
+        let Loaded::Ok(mut back) = load(&path).unwrap() else { panic!("expected a saved thread") };
+        assert_eq!(back.first_thread_id(), Some(id));
+        assert_eq!(back.thread(id).unwrap().status, Status::Idle);
+        assert_eq!(back.thread(id).unwrap().session_id.as_deref(), Some("old-session"));
+        assert!(back.project_of(id).is_none());
+
+        let project = Path::new("/projects/timer");
+        assert!(back.attach_to_project(id, project));
+        assert!(!back.attach_to_project(id, Path::new("/projects/another")));
+        save(&path, &back).unwrap();
+        let Loaded::Ok(back) = load(&path).unwrap() else { panic!("expected the moved thread") };
+        assert_eq!(back.thread_ids(false), vec![id]);
+        assert_eq!(back.checkout_dir_of(id).as_deref(), Some(project));
+        let thread = back.thread(id).unwrap();
+        assert_eq!(thread.session_id, None);
+        assert!(thread.handoff);
+        assert_eq!(thread.messages[0].body, "Build a timer");
+        assert_eq!(thread.queue[0].body, "Add a pause button");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use kiln_agent::{
     claude, codex, process::Process, project, worktree, AgentEvent, ApprovalId, ApprovalRequest,
     Client,
 };
-use kiln_core::checkout::{self, Checkout, MoveRequest, Sharing, DEFAULT_COMMIT_TYPE};
+use kiln_core::checkout::{self, Checkout, MoveRequest, ProjectRequest, Sharing, DEFAULT_COMMIT_TYPE};
 use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::persist::{self, Loaded};
 use kiln_core::title;
@@ -56,10 +56,15 @@ struct RunningTurn {
     client: Client,
     /// Requests the agent is waiting on, oldest first.
     approvals: Vec<ApprovalRequest>,
-    /// The agent asked to move the thread to a worktree; the turn is stopped.
-    move_request: Option<MoveRequest>,
+    /// The agent asked to change the working directory; the turn is stopped.
+    move_request: Option<ThreadMove>,
     /// The message the agent is writing.
     stream: Stream,
+}
+
+enum ThreadMove {
+    Worktree(MoveRequest),
+    Project(ProjectRequest),
 }
 
 /// A message arriving in pieces, shown a finished word at a time.
@@ -430,7 +435,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let p = this.store.add_project(&dir);
                 if this.store.projects[p].threads.is_empty() {
-                    this.new_thread(p, cx);
+                    this.new_thread(Some(p), cx);
                 } else {
                     this.save();
                 }
@@ -440,11 +445,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Start a thread in project `p` with the last provider chosen; the
-    /// composer can change it until the first message is sent.
-    pub(crate) fn new_thread(&mut self, p: usize, cx: &mut Context<Self>) {
+    /// Start a thread with the last provider chosen.
+    pub(crate) fn new_thread(&mut self, p: Option<usize>, cx: &mut Context<Self>) {
         let agent = self.store.last_agent();
-        if let Some(id) = self.store.add_thread(p, agent, now()) {
+        let thread = match p {
+            Some(p) => self.store.add_thread(p, agent, now()),
+            None => Some(self.store.add_projectless_thread(agent, now())),
+        };
+        if let Some(id) = thread {
             self.select(Some(id), cx);
         }
     }
@@ -476,7 +484,7 @@ impl Workspace {
         self.dismissed_file_query = None;
         let draft = self.selected.and_then(|id| self.store.thread(id)).map_or("", |t| &t.draft);
         let draft = draft.to_owned();
-        let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
+        let checkout = self.selected.and_then(|id| self.checkout_dir(id));
         let scratch = self.selected.map(|id| self.scratch_dir(id));
         self.input.update(cx, |input, cx| {
             input.set_reference_paths(checkout, scratch);
@@ -543,10 +551,10 @@ impl Workspace {
 
     pub(crate) fn remove_project(&mut self, p: usize, cx: &mut Context<Self>) {
         if self.store.remove_project(p) {
-            self.open_tools.retain(|&(id, _)| self.store.locate(id).is_some());
-            self.open_tool_groups.retain(|&(id, _)| self.store.locate(id).is_some());
-            self.attachment_errors.retain(|id, _| self.store.locate(*id).is_some());
-            if self.selected.is_some_and(|id| self.store.locate(id).is_none()) {
+            self.open_tools.retain(|&(id, _)| self.store.thread(id).is_some());
+            self.open_tool_groups.retain(|&(id, _)| self.store.thread(id).is_some());
+            self.attachment_errors.retain(|id, _| self.store.thread(*id).is_some());
+            if self.selected.is_some_and(|id| self.store.thread(id).is_none()) {
                 self.select(self.store.first_thread_id(), cx);
             }
             self.save();
@@ -605,10 +613,9 @@ impl Workspace {
         }
     }
 
-    fn checkout_dir(&self, id: u64) -> Option<&Path> {
-        let (p, t) = self.store.locate(id)?;
-        let project = &self.store.projects[p];
-        Some(project.threads[t].checkout.dir(&project.dir))
+    fn checkout_dir(&self, id: u64) -> Option<PathBuf> {
+        self.store.checkout_dir_of(id)
+            .or_else(|| self.store.thread(id).map(|_| self.scratch_dir(id)))
     }
 
     fn scratch_dir(&self, id: u64) -> PathBuf {
@@ -624,7 +631,7 @@ impl Workspace {
         self.file_suggestions.clear();
         cx.notify();
         let Some(query) = query else { return };
-        let Some(root) = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf) else { return };
+        let Some(root) = self.selected.and_then(|id| self.checkout_dir(id)) else { return };
         if let Some(index) = self.file_index.as_ref().filter(|index| index.root == root) {
             match &index.files {
                 Some(files) => {
@@ -656,7 +663,7 @@ impl Workspace {
     fn suggestions_visible(&self, window: &Window, cx: &Context<Self>) -> bool {
         !self.file_suggestions.is_empty() && self.menu.is_none()
             && self.input.focus_handle(cx).is_focused(window)
-            && self.selected.and_then(|id| self.checkout_dir(id))
+            && self.selected.and_then(|id| self.checkout_dir(id)).as_deref()
                 == self.file_index.as_ref().map(|index| index.root.as_path())
     }
 
@@ -664,7 +671,7 @@ impl Workspace {
         if self.selected != Some(id) || self.input.read(cx).reference_query() != Some(query.clone()) {
             return;
         }
-        let exists = self.checkout_dir(id).and_then(|root| media::scoped_path(root, Path::new(path)))
+        let exists = self.checkout_dir(id).and_then(|root| media::scoped_path(&root, Path::new(path)))
             .is_some_and(|path| path.is_file());
         if exists {
             self.input.update(cx, |input, cx| input.replace_reference(query, path, cx));
@@ -830,7 +837,7 @@ impl Workspace {
     }
 
     fn send(&mut self, id: u64, prompt: Prompt, cx: &mut Context<Self>) {
-        let checkout = self.checkout_dir(id).map(Path::to_path_buf);
+        let checkout = self.checkout_dir(id);
         let Some(thread) = self.store.thread_mut(id) else { return };
         if thread.title == NEW_THREAD_TITLE {
             let label = if prompt.body.is_empty() {
@@ -855,7 +862,7 @@ impl Workspace {
             Some(turn) => turn.client.steer(&prompt.body, &prompt.attachments),
             None => Err(std::io::Error::other("the turn is ending")),
         };
-        let checkout = self.checkout_dir(id).map(Path::to_path_buf);
+        let checkout = self.checkout_dir(id);
         let Some(thread) = self.store.thread_mut(id) else { return };
         match sent {
             Ok(()) => {
@@ -942,20 +949,19 @@ impl Workspace {
     /// Run one agent turn and fold its events into the thread. A turn in the
     /// shared project checkout first learns what else is working there.
     fn start_turn(&mut self, id: u64, request: Prompt, cx: &mut Context<Self>) {
-        let Some((p, t)) = self.store.locate(id) else {
+        let Some(thread) = self.store.thread(id) else {
             return;
         };
-        let project = &self.store.projects[p];
-        let thread = &project.threads[t];
-        let dir = thread.checkout.dir(&project.dir).to_path_buf();
-        let shared = thread.checkout == Checkout::Project;
-        let project_dir = project.dir.clone();
+        let project_dir = self.store.project_dir_of(id);
+        let scratch_dir = self.scratch_dir(id);
+        let dir = project_dir.as_deref().map(|project| thread.checkout.dir(project).to_path_buf());
+        let shared = project_dir.is_some() && thread.checkout == Checkout::Project;
         let agent = thread.agent;
         // Changes already there cannot be this thread's before its first reply.
         let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
         let Prompt { body: prompt, attachments } = request;
-        let prompt = if thread.handoff {
-            checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(&project.dir))
+        let prompt = if let Some(project) = project_dir.as_deref().filter(|_| thread.handoff) {
+            checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(project))
         } else if first {
             format!("{}\n\n{prompt}", title::title_note())
         } else {
@@ -964,13 +970,22 @@ impl Workspace {
         let running = if shared { self.store.running_beside(id) } else { vec![] };
         let prefix = self.store.settings.branch_prefix.clone();
         let fetches = self.store.settings.fetch == Fetch::Always;
-        let scratch_dir = self.scratch_dir(id);
         if matches!(self.menu, Some(Menu::Permissions | Menu::Checkout)) {
             self.menu = None;
         }
-        self.store.projects[p].threads[t].status = Status::Running;
+        if let Some(thread) = self.store.thread_mut(id) {
+            thread.status = Status::Running;
+        }
         cx.notify();
         let prepare = cx.background_executor().spawn(async move {
+            let scratch = std::fs::create_dir_all(&scratch_dir)
+                .ok().and_then(|()| media::scratch_root(&scratch_dir));
+            let dir = match dir {
+                Some(dir) => dir,
+                None => scratch.clone().ok_or_else(|| format!(
+                    "Could not open the thread's scratch directory at {}.", scratch_dir.display()
+                ))?,
+            };
             if !dir.is_dir() {
                 return Err(format!(
                     "The checkout at {} is missing. Choose where this thread runs from its branch \
@@ -985,17 +1000,27 @@ impl Workspace {
                     sharing.changed_files = worktree::changed_files(&dir).unwrap_or(0);
                 }
             }
-            let note = if shared {
-                checkout::sharing_note(&sharing, &prefix, fetches)
-            } else {
-                worktree::local_instructions(&project_dir, &dir, agent).map_err(|e| e.to_string())?
+            let note = match project_dir {
+                Some(_) if shared => checkout::sharing_note(&sharing, &prefix, fetches),
+                Some(project_dir) => worktree::local_instructions(&project_dir, &dir, agent)
+                    .map_err(|e| e.to_string())?,
+                None => Some(format!(
+                    "<kiln-context>\n\
+                     This thread has no project and runs in its own scratch folder. If the task would benefit \
+                     from a new project, end your reply with this line before creating any project files:\n\
+                     {} {{\"name\": \"my-project\"}}\n\
+                     Use up to 80 letters, numbers, hyphens, or underscores, starting with a letter or number. \
+                     Kiln uses the user's preferred folder if one is set. Otherwise it asks the user to \
+                     choose a parent folder for this repository. After a folder is chosen, Kiln creates a \
+                     new Git repository and continues this request there. Scratch files stay in the scratch \
+                     folder.\n</kiln-context>",
+                    checkout::PROJECT_REQUEST,
+                )),
             };
             let prompt = match note {
                 Some(note) => format!("{note}\n\n{prompt}"),
                 None => prompt,
             };
-            let scratch = std::fs::create_dir_all(&scratch_dir)
-                .ok().and_then(|()| media::scratch_root(&scratch_dir));
             let prompt = if let Some(scratch_dir) = scratch {
                 let path = scratch_dir.display();
                 format!(
@@ -1105,10 +1130,11 @@ impl Workspace {
                     let mut move_request = None;
                     if done {
                         let turn = this.turns.remove(&id);
+                        let projectless = this.store.project_of(id).is_none();
                         if let (Some(turn), Some(thread)) = (turn, this.store.thread_mut(id)) {
                             thread.record_work(turn.started.elapsed());
                             // A reply cut short by a stop or a failure keeps what was written.
-                            let partial = shown_reply(&turn.stream.text, &thread.checkout);
+                            let partial = shown_reply(&turn.stream.text, &thread.checkout, projectless);
                             if !partial.is_empty() {
                                 let mut message = Message::agent(partial).at(now());
                                 message.checkout_dir = Some(dir.clone());
@@ -1134,15 +1160,20 @@ impl Workspace {
                         // The turn may have switched branches.
                         this.refresh(cx);
                     }
-                    if let Some(request) = move_request {
-                        let fetch = this.store.settings.fetch == Fetch::Always;
-                        this.move_to_worktree(id, Some(request), fetch, cx);
-                    } else if done && !this.send_queued(id, cx) && this.selected != Some(id) {
-                        // The result waits for the user in a thread out of view.
-                        if let Some(thread) = this.store.thread_mut(id) {
-                            thread.unread = true;
-                            this.save();
+                    match move_request {
+                        Some(ThreadMove::Worktree(request)) => {
+                            let fetch = this.store.settings.fetch == Fetch::Always;
+                            this.move_to_worktree(id, Some(request), fetch, cx);
                         }
+                        Some(ThreadMove::Project(request)) => this.create_thread_project(id, request, cx),
+                        None if done && !this.send_queued(id, cx) && this.selected != Some(id) => {
+                            // The result waits for the user in a thread out of view.
+                            if let Some(thread) = this.store.thread_mut(id) {
+                                thread.unread = true;
+                                this.save();
+                            }
+                        }
+                        None => {}
                     }
                     cx.notify();
                 });
@@ -1150,6 +1181,72 @@ impl Workspace {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Make a project for this thread and continue its request in the new checkout.
+    fn create_thread_project(&mut self, id: u64, request: ProjectRequest, cx: &mut Context<Self>) {
+        if self.store.project_of(id).is_some() {
+            return;
+        }
+        let root = self.store.settings.new_project_root.clone();
+        let Some(thread) = self.store.thread_mut(id) else { return };
+        let Some(message) = thread.messages.iter().rev().find(|m| m.role == Role::User) else { return };
+        let prompt = Prompt { body: message.body.clone(), attachments: message.attachments.clone() };
+        thread.status = Status::Running;
+        let choose_folder = root.is_none().then(|| cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose Project Folder".into()),
+        }));
+        cx.spawn(async move |this, cx| {
+            let root = match choose_folder {
+                Some(chooser) => match chooser.await {
+                    Ok(Ok(paths)) => Ok(paths.and_then(|paths| paths.into_iter().next())),
+                    Ok(Err(error)) => Err(format!("Could not open the folder picker: {error}")),
+                    Err(_) => Ok(None),
+                },
+                None => Ok(root),
+            };
+            let created = match root {
+                Ok(Some(root)) => cx.background_executor().spawn(async move {
+                    worktree::init_project(&root, &request.name)
+                        .map(Some)
+                        .map_err(|error| format!("Could not create the project: {error}"))
+                }).await,
+                other => other,
+            };
+            let _ = this.update(cx, |this, cx| {
+                match created {
+                    Ok(Some(dir)) => {
+                        if !this.store.attach_to_project(id, &dir) {
+                            return;
+                        }
+                        let Some(thread) = this.store.thread_mut(id) else { return };
+                        thread.messages.push(Message::notice(format!("Created project at {}", dir.display())));
+                        this.save();
+                        this.refresh(cx);
+                        if this.selected == Some(id) {
+                            this.suggest_files(cx);
+                        }
+                        this.start_turn(id, prompt, cx);
+                    }
+                    result => {
+                        let Some(thread) = this.store.thread_mut(id) else { return };
+                        let (status, note) = match result {
+                            Err(error) => (Status::NeedsInput, error),
+                            _ => (Status::Idle, "Project creation canceled.".into()),
+                        };
+                        thread.status = status;
+                        thread.unread = this.selected != Some(id);
+                        thread.messages.push(Message::notice(note));
+                        this.save();
+                        cx.notify();
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -1321,10 +1418,11 @@ impl Workspace {
     /// Fold one event of a running turn into its thread.
     fn apply(&mut self, id: u64, ev: AgentEvent, permission_mode: PermissionMode) {
         let root = if matches!(ev, AgentEvent::Text(_)) {
-            self.checkout_dir(id).map(Path::to_path_buf)
+            self.checkout_dir(id)
         } else {
             None
         };
+        let projectless = matches!(ev, AgentEvent::Text(_)) && self.store.project_of(id).is_none();
         let Some(thread) = self.store.thread_mut(id) else { return };
         match ev {
             AgentEvent::Session(id) => {
@@ -1345,9 +1443,12 @@ impl Workspace {
                 if let Some(title) = title {
                     thread.title = title;
                 }
-                // Only a thread in the shared checkout is offered the move.
-                let (text, request) = if thread.checkout == Checkout::Project {
-                    checkout::take_move_request(&text)
+                let (text, request) = if projectless {
+                    let (text, request) = checkout::take_project_request(&text);
+                    (text, request.map(ThreadMove::Project))
+                } else if thread.checkout == Checkout::Project {
+                    let (text, request) = checkout::take_move_request(&text);
+                    (text, request.map(ThreadMove::Worktree))
                 } else {
                     (text, None)
                 };
@@ -1938,23 +2039,18 @@ impl Workspace {
 
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let (msg, action) = if self.store.projects.is_empty() {
-            ("Add a project folder to start working with an agent.", "Add Project")
-        } else {
-            ("Select a thread, or start one with the new thread button.", "")
-        };
         div().flex().flex_col().flex_1().h_full().items_center().justify_center().gap_3()
             .bg(theme.window)
             .child(img(theme.logo).flex_shrink_0().size(px(assets::LOGO_SIZE)))
-            .child(div().text_sm().text_color(theme.muted).child(msg))
-            .when(!action.is_empty(), |d| {
-                d.child(
-                    div().id("empty-add").px_4().py_1p5().rounded_lg().text_sm()
-                        .font_weight(FontWeight::MEDIUM).cursor_pointer()
-                        .bg(theme.accent).text_color(theme.on_accent).child(action)
-                        .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))),
-                )
-            })
+            .child(
+                div().id("empty-new-thread").px_4().py_1p5().rounded_lg().text_sm()
+                    .font_weight(FontWeight::MEDIUM).cursor_pointer()
+                    .bg(theme.accent).text_color(theme.on_accent).child("New thread")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_thread(None, cx);
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    })),
+            )
     }
 
     fn entry(&mut self, id: u64, row: usize, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2036,7 +2132,7 @@ impl Workspace {
             return div().into_any_element();
         };
         let body = div().min_w_0().text_sm().line_height(relative(1.55));
-        let root = m.checkout_dir.as_deref().or_else(|| self.checkout_dir(id)).map(Path::to_path_buf);
+        let root = m.checkout_dir.clone().or_else(|| self.checkout_dir(id));
         let scratch_dir = self.scratch_dir(id);
         let mut document = output_selection::Document::new(self.output_selection.clone(), ix);
         let content = match (&m.tool, m.role) {
@@ -2259,11 +2355,12 @@ impl Workspace {
         // The streamed reply takes the index its whole message will have.
         let (key, checkout) = self.store.thread(id)
             .map_or((0, Checkout::Project), |t| (t.messages.len(), t.checkout.clone()));
-        let root = self.checkout_dir(id).map(Path::to_path_buf);
+        let root = self.checkout_dir(id);
+        let projectless = self.store.project_of(id).is_none();
         let streamed = self.turns.get_mut(&id).filter(|turn| turn.stream.shown > 0).map(|turn| {
             let stream = &mut turn.stream;
             stream.blocks.get_or_insert_with(|| {
-                markdown::parse_at(&shown_reply(&stream.text[..stream.shown], &checkout), root.as_deref()).into()
+                markdown::parse_at(&shown_reply(&stream.text[..stream.shown], &checkout, projectless), root.as_deref()).into()
             }).clone()
         });
         let stopping = self.is_stopping(id);
@@ -2398,13 +2495,16 @@ impl Workspace {
 
     fn toolbar(&self, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let project = self.store.locate(thread.id).map(|(p, _)| &self.store.projects[p]);
+        let project = self.store.project_of(thread.id);
         div().flex().flex_shrink_0().items_center().gap_3().px_5().h(px(TOOLBAR))
             .border_b_1().border_color(theme.border)
             .child(
                 div().flex().flex_col().flex_1().min_w_0()
                     .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text).child(thread.title.clone()))
+                    .when(project.is_none(), |d| {
+                        d.child(div().text_xs().text_color(theme.muted).child(crate::sidebar::NO_PROJECT))
+                    })
                     .when_some(project, |d, project| {
                         d.child(div().flex().min_w_0().items_center().gap_1()
                             .child(self.project_picker(project, window, cx))
@@ -2482,10 +2582,12 @@ pub(crate) fn permission_label(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// Agent text as the thread shows it: never the title line, and in the
-/// project checkout never the line that asks to move the thread.
-fn shown_reply(text: &str, place: &Checkout) -> String {
+/// Agent text with Kiln's control lines removed.
+fn shown_reply(text: &str, place: &Checkout, projectless: bool) -> String {
     let text = title::take_title(text).0;
+    if projectless {
+        return checkout::take_project_request(&text).0;
+    }
     match place {
         Checkout::Project => checkout::take_move_request(&text).0,
         Checkout::Worktree { .. } => text,
@@ -2525,7 +2627,7 @@ impl Render for Workspace {
         self.theme = Theme::new(window.appearance(), self.store.settings.appearance, self.theme.font);
         let theme = self.theme;
         let selection = gpui::Rgba { a: 0.3, ..theme.accent };
-        let checkout = self.selected.and_then(|id| self.checkout_dir(id)).map(Path::to_path_buf);
+        let checkout = self.selected.and_then(|id| self.checkout_dir(id));
         let scratch = self.selected.map(|id| self.scratch_dir(id));
         self.input.update(cx, |input, _| input.set_reference_paths(checkout, scratch));
         for input in [&self.input, &self.prefix_input, &self.palette_input] {

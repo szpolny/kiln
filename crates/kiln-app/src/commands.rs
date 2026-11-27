@@ -224,17 +224,15 @@ impl Workspace {
         cx.quit();
     }
 
-    /// Start a thread in the project of the shown one, or else the first project.
+    /// Start a thread alongside the shown one, or in the first project when
+    /// nothing is selected.
     fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self
-            .selected
-            .and_then(|id| self.store.locate(id))
-            .map(|(p, _)| p)
-            .or_else(|| (!self.store.projects.is_empty()).then_some(0));
-        if let Some(p) = project {
-            self.new_thread(p, cx);
-            window.focus(&self.input.focus_handle(cx), cx);
-        }
+        let project = match self.selected {
+            Some(id) => self.store.locate(id).map(|(p, _)| p),
+            None => (!self.store.projects.is_empty()).then_some(0),
+        };
+        self.new_thread(project, cx);
+        window.focus(&self.input.focus_handle(cx), cx);
     }
 
     /// Show the thread `by` places down the sidebar, wrapping around.
@@ -285,14 +283,14 @@ impl Workspace {
         }
         for settled in [false, true] {
             for id in self.store.thread_ids(settled) {
-                let Some((p, t)) = self.store.locate(id) else { continue };
-                let project = &self.store.projects[p];
-                let title = &project.threads[t].title;
-                if matches(&format!("{title} {}", project.name)) {
+                let Some(thread) = self.store.thread(id) else { continue };
+                let project = self.store.project_of(id).map_or(crate::sidebar::NO_PROJECT, |p| &p.name);
+                let title = &thread.title;
+                if matches(&format!("{title} {project}")) {
                     choices.push((
                         Choice::Thread(id),
                         format!("Go to {title}").into(),
-                        Some(project.name.clone()),
+                        Some(project.to_owned()),
                     ));
                 }
             }

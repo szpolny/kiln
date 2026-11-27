@@ -44,6 +44,22 @@ impl Checkout {
 /// What starts the line an agent replies with to move its thread to a new
 /// worktree. A JSON [`MoveRequest`] follows it.
 pub const MOVE_REQUEST: &str = "KILN_MOVE_TO_WORKTREE";
+pub const PROJECT_REQUEST: &str = "KILN_CREATE_PROJECT";
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectRequest {
+    pub name: String,
+}
+
+/// A project request must be the last line of a reply, with a JSON payload.
+pub fn take_project_request(text: &str) -> (String, Option<ProjectRequest>) {
+    let text = text.trim_end();
+    let (body, line) = text.rsplit_once('\n').unwrap_or(("", text));
+    let request = line.strip_prefix(PROJECT_REQUEST)
+        .filter(|payload| payload.starts_with(char::is_whitespace))
+        .and_then(|payload| serde_json::from_str(payload).ok());
+    (if request.is_some() { body } else { text }.trim().to_owned(), request)
+}
 
 /// Conventional Commits types a branch can be named after.
 pub const COMMIT_TYPES: [&str; 11] =
@@ -278,6 +294,19 @@ pub fn moved_prompt(messages: &[Message], request: &str, place: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_request_is_a_final_control_line() {
+        let line = r#"KILN_CREATE_PROJECT {"name": "my-app"}"#;
+        let reply = format!("I’ll create a project.\n\n{line}\n");
+        let (body, request) = take_project_request(&reply);
+        assert_eq!(body, "I’ll create a project.");
+        assert_eq!(request.unwrap().name, "my-app");
+        for reply in [format!("```\n{line}\n```"), format!("> {line}"), "KILN_CREATE_PROJECT {}".into()] {
+            assert_eq!(take_project_request(&reply).0, reply);
+            assert!(take_project_request(&reply).1.is_none());
+        }
+    }
 
     #[test]
     fn checkouts_say_where_they_are() {

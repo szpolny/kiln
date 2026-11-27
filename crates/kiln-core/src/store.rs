@@ -468,6 +468,8 @@ pub struct Project {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
     pub projects: Vec<Project>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    projectless_threads: Vec<Thread>,
     #[serde(default)]
     next_id: u64,
     #[serde(default)]
@@ -489,14 +491,14 @@ impl Store {
     pub fn normalize(&mut self) {
         let mut max = self.next_id;
         let mut seen = std::collections::HashSet::new();
-        for t in self.projects.iter_mut().flat_map(|p| &mut p.threads) {
+        for t in self.threads_mut() {
             if t.id != 0 && seen.insert(t.id) {
                 max = max.max(t.id);
             } else {
                 t.id = 0;
             }
         }
-        for t in self.projects.iter_mut().flat_map(|p| &mut p.threads) {
+        for t in self.threads_mut() {
             if t.id == 0 {
                 max += 1;
                 t.id = max;
@@ -529,7 +531,21 @@ impl Store {
     /// with the last model and reasoning choices the agent supports, and the
     /// configured permission defaults.
     pub fn add_thread(&mut self, p: usize, agent: Agent, now: u64) -> Option<u64> {
-        let project = self.projects.get_mut(p)?;
+        self.projects.get(p)?;
+        let thread = self.new_thread(agent, now);
+        let id = thread.id;
+        self.projects[p].threads.push(thread);
+        Some(id)
+    }
+
+    pub fn add_projectless_thread(&mut self, agent: Agent, now: u64) -> u64 {
+        let thread = self.new_thread(agent, now);
+        let id = thread.id;
+        self.projectless_threads.push(thread);
+        id
+    }
+
+    fn new_thread(&mut self, agent: Agent, now: u64) -> Thread {
         self.next_id += 1;
         let id = self.next_id;
         let mut thread = Thread::new(id, agent, now);
@@ -543,8 +559,21 @@ impl Store {
             thread.permission_mode = self.settings.permission_mode;
         }
         thread.policy.network = self.settings.web;
-        project.threads.push(thread);
-        Some(id)
+        thread
+    }
+
+    /// Attach a projectless thread to its new checkout, keeping its history.
+    pub fn attach_to_project(&mut self, id: u64, dir: &Path) -> bool {
+        let Some((None, index)) = self.locate_thread(id) else { return false };
+        let mut thread = self.projectless_threads.remove(index);
+        thread.move_to(Checkout::Project);
+        let project = self.add_project(dir);
+        self.projects[project].threads.push(thread);
+        true
+    }
+
+    pub(crate) fn threads_mut(&mut self) -> impl Iterator<Item = &mut Thread> {
+        self.projects.iter_mut().flat_map(|p| &mut p.threads).chain(&mut self.projectless_threads)
     }
 
     /// Provider for a new thread: the last one chosen in the composer.
@@ -554,11 +583,15 @@ impl Store {
 
     /// Delete an idle thread. Running threads are refused.
     pub fn delete_thread(&mut self, id: u64) -> bool {
-        let Some((p, t)) = self.locate(id) else { return false };
-        if self.projects[p].threads[t].status == Status::Running {
+        let Some((p, t)) = self.locate_thread(id) else { return false };
+        let threads = match p {
+            Some(p) => &mut self.projects[p].threads,
+            None => &mut self.projectless_threads,
+        };
+        if threads[t].status == Status::Running {
             return false;
         }
-        self.projects[p].threads.remove(t);
+        threads.remove(t);
         true
     }
 
@@ -580,14 +613,31 @@ impl Store {
         })
     }
 
+    fn locate_thread(&self, id: u64) -> Option<(Option<usize>, usize)> {
+        self.locate(id).map(|(p, t)| (Some(p), t)).or_else(|| {
+            self.projectless_threads.iter().position(|t| t.id == id).map(|t| (None, t))
+        })
+    }
+
+    pub fn project_of(&self, id: u64) -> Option<&Project> {
+        let (p, _) = self.locate(id)?;
+        self.projects.get(p)
+    }
+
     pub fn thread(&self, id: u64) -> Option<&Thread> {
-        let (p, t) = self.locate(id)?;
-        Some(&self.projects[p].threads[t])
+        let (p, t) = self.locate_thread(id)?;
+        Some(match p {
+            Some(p) => &self.projects[p].threads[t],
+            None => &self.projectless_threads[t],
+        })
     }
 
     pub fn thread_mut(&mut self, id: u64) -> Option<&mut Thread> {
-        let (p, t) = self.locate(id)?;
-        Some(&mut self.projects[p].threads[t])
+        let (p, t) = self.locate_thread(id)?;
+        Some(match p {
+            Some(p) => &mut self.projects[p].threads[t],
+            None => &mut self.projectless_threads[t],
+        })
     }
 
     /// Apply an explicit composer choice to this thread and remember it for new ones.
@@ -604,8 +654,8 @@ impl Store {
         if !agent.models().iter().any(|choice| choice.id == model) {
             return None;
         }
-        let (p, t) = self.locate(id)?;
-        let source = &mut self.projects[p].threads[t];
+        let project = self.locate(id).map(|(p, _)| p);
+        let source = self.thread_mut(id)?;
         let target = if source.agent == agent {
             id
         } else if source.can_change_agent() {
@@ -613,7 +663,10 @@ impl Store {
             source.reported_model = None;
             id
         } else {
-            self.add_thread(p, agent, now)?
+            match project {
+                Some(p) => self.add_thread(p, agent, now)?,
+                None => self.add_projectless_thread(agent, now),
+            }
         };
         self.last_agent = Some(agent);
         self.select_model(target, model).then_some(target)
@@ -631,8 +684,7 @@ impl Store {
     }
 
     pub fn project_dir_of(&self, id: u64) -> Option<PathBuf> {
-        let (p, _) = self.locate(id)?;
-        Some(self.projects[p].dir.clone())
+        Some(self.project_of(id)?.dir.clone())
     }
 
     /// The folder the thread's turns run in.
@@ -668,13 +720,19 @@ impl Store {
             .collect()
     }
 
-    /// The active or the settled threads of every project, latest activity
+    fn threads(&self) -> impl Iterator<Item = &Thread> {
+        self.projects.iter().flat_map(|p| &p.threads).chain(&self.projectless_threads)
+    }
+
+    pub fn has_settled_threads(&self) -> bool {
+        self.threads().any(|t| t.settled)
+    }
+
+    /// The active or the settled threads, latest activity
     /// first and newer threads first among equals.
     pub fn thread_ids(&self, settled: bool) -> Vec<u64> {
         let mut threads: Vec<&Thread> = self
-            .projects
-            .iter()
-            .flat_map(|p| &p.threads)
+            .threads()
             .filter(|t| t.settled == settled)
             .collect();
         threads.sort_unstable_by_key(|t| std::cmp::Reverse((t.updated_at, t.id)));

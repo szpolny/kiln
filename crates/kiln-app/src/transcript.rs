@@ -2,7 +2,7 @@
 //! on the way there is folded under one "Worked" row.
 
 use chrono::{DateTime, Datelike, TimeZone};
-use kiln_core::checkout::MOVE_REQUEST;
+use kiln_core::checkout::{MOVE_REQUEST, PROJECT_REQUEST};
 use kiln_core::title::TITLE_REQUEST;
 use kiln_core::{Message, Role};
 use std::fmt::Display;
@@ -129,7 +129,7 @@ pub fn stream_shown(text: &str) -> usize {
         .map_or(0, |(at, c)| at + c.len_utf8());
     let line = text[..words].rfind('\n').map_or(0, |at| at + 1);
     let current = text[line..].trim_start();
-    if [MOVE_REQUEST, TITLE_REQUEST].iter().any(|kiln| current.starts_with(kiln)) {
+    if [MOVE_REQUEST, PROJECT_REQUEST, TITLE_REQUEST].iter().any(|kiln| current.starts_with(kiln)) {
         line
     } else {
         words

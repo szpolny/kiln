@@ -3,6 +3,7 @@
 use crate::checkout::BranchPrefix;
 use crate::policy::{Decision, PermissionMode, Policy};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Which palette the window uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -69,6 +70,8 @@ pub struct Settings {
     pub fetch: Fetch,
     /// What Enter does with a message typed while a turn runs.
     pub follow_up: FollowUp,
+    /// Preferred parent folder for new projects. When unset, ask where to put each project.
+    pub new_project_root: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -80,6 +83,7 @@ impl Default for Settings {
             branch_prefix: BranchPrefix::default(),
             fetch: Fetch::default(),
             follow_up: FollowUp::default(),
+            new_project_root: None,
         }
     }
 }

@@ -162,7 +162,9 @@ fn reply_image_path(checkout: Option<&Path>, scratch: &Path, path: &Path) -> Opt
     let scratch_parent = scratch.parent().and_then(|dir| dir.canonicalize().ok());
     // Even an enclosing checkout cannot expose another thread's scratch files.
     if scratch_parent.is_some_and(|parent| target.starts_with(parent)) {
-        return (path.is_absolute() && target.starts_with(scratch_root(scratch)?)).then_some(target);
+        let scratch = scratch_root(scratch)?;
+        return ((path.is_absolute() || checkout.as_ref() == Some(&scratch)) && target.starts_with(scratch))
+            .then_some(target);
     }
     checkout.is_some_and(|root| target.starts_with(root)).then_some(target)
 }
@@ -462,6 +464,8 @@ mod tests {
             Some(preview.canonicalize().unwrap())
         );
         assert_eq!(reply_image_path(Some(&dir), &scratch, &sibling_preview), None);
+        assert_eq!(reply_image_path(Some(&scratch), &scratch, Path::new("preview.png")), preview.canonicalize().ok());
+        assert_eq!(reply_image_path(Some(&scratch), &scratch, Path::new("../2/preview.png")), None);
         assert_eq!(reply_image_path(None, &aliased_scratch, &sibling_preview), None);
         for path in [
             PathBuf::from("preview.png"),

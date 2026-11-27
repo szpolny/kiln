@@ -1,4 +1,4 @@
-//! The sidebar: the threads of every project in one list, active ones as cards
+//! The sidebar: all threads in one list, active ones as cards
 //! above the settled ones.
 use crate::assets::{self, Icon};
 use crate::theme::Theme;
@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Hover group of a thread's row, which reveals its actions.
 const ROW: &str = "thread-row";
+pub(crate) const NO_PROJECT: &str = "No project";
 
 /// One entry of the virtualized list.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,9 +60,7 @@ impl Workspace {
             // Lines up with the thread cards below.
             .pl(px(18.)).pr_2p5()
             .child(img(theme.lockup).flex_shrink_0().w(px(width)).h(px(height)))
-            .when(!self.store.projects.is_empty(), |d| {
-                d.child(self.new_thread_picker(window, cx))
-            });
+            .child(self.new_thread_picker(window, cx));
         let this = cx.entity();
         let threads = list(self.thread_list.clone(), move |ix, _, cx| {
             this.update(cx, |this, cx| this.thread_row(ix, cx))
@@ -78,7 +77,7 @@ impl Workspace {
             .child(assets::icon(Icon::Settings, 14.)).child("Settings")
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
         let show_settled_disclosure = self.store.settled_collapsed
-            && self.store.projects.iter().any(|p| p.threads.iter().any(|t| t.settled));
+            && self.store.has_settled_threads();
         div().flex().flex_col().flex_shrink_0().gap_2().w(px(260.)).h_full().pt(px(top))
             .bg(theme.sidebar).border_r_1().border_color(theme.border)
             .child(brand)
@@ -130,7 +129,19 @@ impl Workspace {
             return picker;
         }
         let mut menu = self.menu_panel("new-thread-menu", "New thread in").mt_1()
-            .max_h(px(360.)).overflow_y_scroll();
+            .max_h(px(360.)).overflow_y_scroll()
+            .child(
+                div().id("new-thread-no-project").flex().flex_shrink_0().items_center()
+                    .gap_2().h(px(28.)).px_2().rounded_md().text_sm()
+                    .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
+                    .child(assets::icon(Icon::MessageSquare, 16.))
+                    .child(NO_PROJECT)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.menu = None;
+                        this.new_thread(None, cx);
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    })),
+            );
         for (p, project) in self.store.projects.iter().enumerate() {
             let busy = project.threads.iter().any(|t| t.status == Status::Running);
             menu = menu.child(
@@ -139,7 +150,7 @@ impl Workspace {
                     .text_color(theme.text).cursor_pointer().hover(|h| h.bg(theme.hover))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.menu = None;
-                        this.new_thread(p, cx);
+                        this.new_thread(Some(p), cx);
                         window.focus(&this.input.focus_handle(cx), cx);
                     }))
                     .child(self.project_mark(project))
@@ -179,16 +190,15 @@ impl Workspace {
                     .child(heading)
                     .into_any_element();
             }
-            Some(&Row::Thread { id, .. }) => self
-                .store
-                .locate(id)
-                .map(|(p, t)| (&self.store.projects[p], &self.store.projects[p].threads[t])),
+            Some(&Row::Thread { id, .. }) => self.store.thread(id),
             None => None,
         };
-        let Some((project, thread)) = row else {
+        let Some(thread) = row else {
             return div().into_any_element();
         };
         let id = thread.id;
+        let project = self.store.project_of(id);
+        let mark = project.map_or_else(|| assets::icon(Icon::MessageSquare, 16.), |p| self.project_mark(p));
         let theme = self.theme;
         let active = self.selected == Some(id);
         let base = div().id(("thread", id)).group(ROW).rounded(px(8.)).px_2().cursor_pointer()
@@ -205,7 +215,7 @@ impl Workspace {
         };
         let row = if thread.settled {
             base.flex().items_center().gap_2().h(px(30.))
-                .child(self.project_mark(project))
+                .child(mark)
                 .child(div().flex_1().min_w_0().truncate().text_sm().text_color(theme.muted)
                     .child(thread.title.clone()))
                 .child(self.row_end(thread, status(theme.muted).child(age), cx))
@@ -223,7 +233,7 @@ impl Workspace {
                 Status::Idle if thread.unread => status_icon(theme.accent, Icon::Check, "Done"),
                 Status::Idle => status(theme.muted).child(age),
             };
-            let branch = self.branches.get(thread.checkout.dir(&project.dir)).cloned();
+            let branch = project.and_then(|p| self.branches.get(thread.checkout.dir(&p.dir))).cloned();
             let branch_icon = match thread.checkout {
                 Checkout::Project => Icon::GitBranch,
                 Checkout::Worktree { .. } => Icon::GitFork,
@@ -231,9 +241,10 @@ impl Workspace {
             base.flex().flex_col().gap_1().py_2()
                 .child(
                     div().flex().items_center().gap_2()
-                        .child(self.project_mark(project))
+                        .child(mark)
                         .child(div().flex_1().min_w_0().truncate().text_xs()
-                            .text_color(theme.muted).child(project.name.clone()))
+                            .text_color(theme.muted)
+                            .child(project.map_or_else(|| NO_PROJECT.to_string(), |p| p.name.clone())))
                         .child(self.row_end(thread, state, cx)),
                 )
                 .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM)

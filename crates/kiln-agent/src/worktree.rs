@@ -38,6 +38,37 @@ pub fn is_repo(dir: &Path) -> bool {
     run(git(dir).args(["rev-parse", "--is-inside-work-tree"])).is_ok_and(|out| out == "true")
 }
 
+/// Create a repository in a new child directory. An existing folder is
+/// refused so a project request cannot claim or overwrite somebody's work.
+pub fn init_project(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let alphanumeric = |c: char| c.is_ascii_alphanumeric();
+    if !name.starts_with(alphanumeric)
+        || name.len() > 80
+        || !name.chars().all(|c| alphanumeric(c) || matches!(c, '-' | '_'))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "Use up to 80 letters, numbers, hyphens, or underscores, starting with a letter or number."));
+    }
+    let root = root.canonicalize().map_err(|error| {
+        io::Error::new(error.kind(), format!("Could not open {}: {error}", root.display()))
+    })?;
+    let dir = root.join(name);
+    fs::create_dir(&dir).map_err(|error| {
+        io::Error::new(error.kind(), format!("Could not create {}: {error}", dir.display()))
+    })?;
+    if let Err(error) = run(git(&dir)
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .args(["init", "--quiet", "--template="]))
+    {
+        // Removing only an empty directory preserves anything written here
+        // concurrently or left by Git if initialization failed partway.
+        let _ = fs::remove_dir(&dir);
+        return Err(error);
+    }
+    Ok(dir)
+}
+
 /// Load the provider's ignored instruction file from the project checkout when
 /// the worktree has no override of its own.
 pub fn local_instructions(repo: &Path, tree: &Path, agent: Agent) -> io::Result<Option<String>> {
@@ -256,6 +287,25 @@ pub fn root(data_dir: &Path, project: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_projects_use_fresh_folders_inside_the_configured_root() {
+        let existing = repo("new-project");
+        let root = existing.parent().unwrap();
+        let error = init_project(root, "repo").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(existing.join("a.txt")).unwrap(), "a");
+        assert_eq!(init_project(root, "../outside").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let missing = root.join("missing");
+        assert_eq!(init_project(&missing, "my-project").unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(!missing.exists());
+
+        let dir = init_project(root, "my-project").unwrap();
+        assert_eq!(dir.parent(), Some(root.canonicalize().unwrap().as_path()));
+        assert!(is_repo(&dir));
+        assert!(dir.join(".git/HEAD").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn repo(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!("kiln-worktree-{name}-{}", std::process::id()));

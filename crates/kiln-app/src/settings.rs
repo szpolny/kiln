@@ -3,7 +3,7 @@ use crate::theme::Theme;
 use crate::workspace::{permission_label, Workspace};
 use gpui::{
     actions, div, prelude::*, px, relative, rgba, App, Context, Div, FocusHandle, Focusable,
-    FontWeight, KeyBinding, KeyDownEvent, Window,
+    FontWeight, KeyBinding, KeyDownEvent, PathPromptOptions, Window,
 };
 use kiln_core::{checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, FollowUp, Settings};
 use std::time::Duration;
@@ -82,6 +82,25 @@ impl Workspace {
         }
     }
 
+    fn pick_new_project_root(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a folder for new projects".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.store.settings.new_project_root = Some(dir);
+                this.save();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn render_settings(&self, cx: &mut Context<Self>) -> Option<Div> {
         let modal = self.settings_modal.as_ref()?;
         let theme = self.theme;
@@ -117,6 +136,26 @@ impl Workspace {
             |s, value| s.web = value,
             cx,
         );
+        let projects = div().flex().flex_col().flex_shrink_0().gap_1p5()
+            .child(div().text_sm().text_color(theme.muted).child("Folder for new projects and repositories"))
+            .child(div().text_xs().text_color(theme.muted)
+                .child(settings.new_project_root.as_ref().map_or_else(
+                    || "Ask for a folder each time".into(),
+                    |dir| dir.display().to_string(),
+                )))
+            .child(div().flex().gap_1p5()
+                .child(settings_button("choose-project-folder", theme, false)
+                    .child("Choose folder…")
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_new_project_root(cx))))
+                .when(settings.new_project_root.is_some(), |d| {
+                    d.child(settings_button("reset-project-folder", theme, false)
+                        .child("Ask each time")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store.settings.new_project_root = None;
+                            this.save();
+                            cx.notify();
+                        })))
+                }));
 
         let kind = match &settings.branch_prefix {
             BranchPrefix::Kiln => PrefixKind::Kiln,
@@ -299,6 +338,7 @@ impl Workspace {
                                         .pt_4()
                                         .border_t_1()
                                         .border_color(theme.border)
+                                        .child(projects)
                                         .child(prefix)
                                         .child(fetch)
                                         .child(follow_up),
