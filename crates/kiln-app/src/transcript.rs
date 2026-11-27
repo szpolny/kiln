@@ -68,7 +68,11 @@ pub fn entries(
     // What the agent did between one user message and the next.
     for turn in messages.split_inclusive(|m| m.role == Role::User) {
         let end = start + turn.len();
-        let unfinished = running && end == messages.len();
+        // The final slice can end at the user message that starts the
+        // running turn, while that turn's output is still empty.
+        let unfinished = running
+            && end == messages.len()
+            && turn.last().is_some_and(|m| m.role != Role::User);
         let reply = if unfinished { None } else { reply(turn) };
         let mut shown = start;
         if let Some((first, last)) = reply.filter(|&(first, _)| first > 0) {
@@ -224,6 +228,14 @@ mod tests {
     fn a_running_turn_is_shown_in_full_and_earlier_ones_stay_folded() {
         let mut messages = turn();
         messages.extend(turn());
+        assert_eq!(
+            entries(&messages[..5], true, |_| false, |_| false),
+            [M(0), work(1, 3), M(3), M(4), Activity]
+        );
+        assert_eq!(
+            entries(&messages[..5], true, |at| at == 1, |_| false),
+            [M(0), work(1, 3), M(1), M(2), M(3), M(4), Activity]
+        );
         assert_eq!(
             entries(&messages, true, |_| false, |_| false),
             [M(0), work(1, 3), M(3), M(4), M(5), M(6), M(7), Activity]
