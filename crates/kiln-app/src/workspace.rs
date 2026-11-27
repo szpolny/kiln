@@ -2344,10 +2344,10 @@ impl Workspace {
                 )
                 .child(
                     div().flex().items_center().gap_3().pl_0p5()
-                        .child(composer_tool("attach-file", assets::Icon::Paperclip, theme)
-                            .tooltip(tip("Attach text files or images", theme))
-                            .on_click(cx.listener(move |this, _, _, cx| this.pick_files(id, cx))))
                         .child(div().flex().items_center().gap_0p5()
+                            .child(composer_tool("attach-file", assets::Icon::Paperclip, theme)
+                                .tooltip(tip("Attach text files or images", theme))
+                                .on_click(cx.listener(move |this, _, _, cx| this.pick_files(id, cx))))
                             .child(self.model_picker(thread, window, cx))
                             .child(self.effort_picker(thread, window, cx)))
                         .child(div().flex_1().min_w_0().truncate().text_xs()
