@@ -16,6 +16,7 @@ mod text_input;
 mod theme;
 mod tooltip;
 mod transcript;
+mod visualization;
 mod workspace;
 
 use gpui::{
@@ -24,6 +25,17 @@ use gpui::{
 };
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(kiln_agent::visualization::SERVER_ARG))
+    {
+        if let Err(error) = kiln_agent::visualization::serve(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+        ) {
+            eprintln!("kiln: visualization tool: {error}");
+        }
+        return;
+    }
     gpui_platform::application().with_assets(assets::Assets).run(|cx: &mut App| {
         assets::load_icon_font(cx).expect("failed to load the icon font");
         text_input::bind_keys(cx);

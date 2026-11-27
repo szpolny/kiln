@@ -1,7 +1,7 @@
 use crate::assets;
 use crate::commands::Palette;
 use crate::file_reference;
-use crate::{markdown, media, output_selection};
+use crate::{markdown, media, output_selection, visualization};
 use crate::project_icon;
 use crate::settings::SettingsModal;
 use crate::shell;
@@ -1067,6 +1067,26 @@ impl Workspace {
         let scratch_dir = self.scratch_dir(id);
         cx.spawn(async move |this, cx| {
             while let Ok(mut ev) = rx.recv().await {
+                if let AgentEvent::Visualization(visual) = ev {
+                    let preview = visualization::snapshot(&visual.html, false).await;
+                    let dark_preview = if preview.is_ok() {
+                        visualization::snapshot(&visual.html, true).await.ok()
+                    } else {
+                        None
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        let Some(thread) = this.store.thread_mut(id) else { return };
+                        let mut message = Message::agent("").at(now());
+                        message.attachments.push(Attachment {
+                            name: visual.title,
+                            content: AttachmentContent::Visualization { html: visual.html, preview, dark_preview },
+                        });
+                        thread.messages.push(message);
+                        this.save();
+                        cx.notify();
+                    });
+                    continue;
+                }
                 if let AgentEvent::ImageFile(path) = ev {
                     let root = dir.clone();
                     let scratch = scratch_dir.clone();
@@ -1355,6 +1375,7 @@ impl Workspace {
             AgentEvent::ImageFile(_) => {
                 thread.messages.push(Message::notice("The generated image is unavailable."));
             }
+            AgentEvent::Visualization(_) => unreachable!("visualizations render before applying events"),
             AgentEvent::TextDelta(delta) => {
                 let Some(turn) = self.turns.get_mut(&id) else { return };
                 let stream = &mut turn.stream;
@@ -2044,7 +2065,7 @@ impl Workspace {
                         AttachmentContent::Image { base64, .. } => {
                             Some((attachment.name.clone(), media::Picture::embedded(base64.clone())))
                         }
-                        AttachmentContent::Text(_) => None,
+                        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
                     }).collect()
                 });
                 body.when(!blocks.is_empty(), |d| {
@@ -2052,6 +2073,13 @@ impl Workspace {
                 })
                     .children(images.iter().enumerate().map(|(i, (name, picture))| {
                         media::inline(picture.clone(), name.clone(), format!("reply-image-{ix}-{i}").into(), theme)
+                    }))
+                    .children(m.attachments.iter().enumerate().filter_map(|(i, attachment)| {
+                        let AttachmentContent::Visualization { html, preview, dark_preview } = &attachment.content else { return None };
+                        Some(visualization::inline(
+                            format!("visualization-{ix}-{i}"), attachment.name.clone(), html.clone(), preview, theme,
+                            dark_preview.as_ref(),
+                        ))
                     }))
                     .into_any_element()
             }
@@ -2419,7 +2447,7 @@ fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui:
     let preview = attachment.clone();
     let icon = match attachment.content {
         AttachmentContent::Text(_) => assets::Icon::FileText,
-        AttachmentContent::Image { .. } => assets::Icon::Image,
+        AttachmentContent::Image { .. } | AttachmentContent::Visualization { .. } => assets::Icon::Image,
     };
     div().id(SharedString::from(id)).flex().items_center().gap_1()
         .rounded_md().px_2().py_1().max_w(px(250.)).text_xs()

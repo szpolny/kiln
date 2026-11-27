@@ -126,6 +126,31 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_visualization_source_and_preview() {
+        use crate::{Attachment, AttachmentContent, Message};
+
+        let path = temp("visualization");
+        let mut store = Store::sample();
+        let id = store.projects[0].threads[0].id;
+        let mut message = Message::agent("");
+        let attachment = Attachment {
+            name: "Weekly builds".into(),
+            content: AttachmentContent::Visualization {
+                html: "<svg></svg>".into(),
+                preview: Ok("AA==".into()),
+                dark_preview: Some("AQ==".into()),
+            },
+        };
+        message.attachments.push(attachment.clone());
+        store.thread_mut(id).unwrap().messages.push(message);
+        save(&path, &store).unwrap();
+
+        let Loaded::Ok(reopened) = load(&path).unwrap() else { panic!("expected state") };
+        let message = reopened.thread(id).unwrap().messages.last().unwrap();
+        assert_eq!(message.attachments, [attachment]);
+    }
+
+    #[test]
     fn threads_saved_without_a_permission_mode_load_as_manual() {
         let path = temp("legacy-permissions");
         let store = Store::sample();

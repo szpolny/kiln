@@ -24,6 +24,7 @@ pub fn ui_font(installed: &[String]) -> &'static str {
 pub struct Theme {
     /// Interface font family.
     pub font: &'static str,
+    pub dark: bool,
     pub window: Rgba,
     /// Slightly see-through on macOS so the blurred desktop shows behind it.
     pub sidebar: Rgba,
@@ -56,6 +57,7 @@ impl Theme {
         match appearance {
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self {
                 font,
+                dark: false,
                 window: rgb(0xfdfcfb),
                 sidebar: rgba(0xf3f1ee00 | sidebar_alpha),
                 card: rgb(0xffffff),
@@ -74,6 +76,7 @@ impl Theme {
             },
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self {
                 font,
+                dark: true,
                 window: rgb(0x1c1917),
                 sidebar: rgba(0x26221f00 | sidebar_alpha),
                 card: rgb(0x2b2624),

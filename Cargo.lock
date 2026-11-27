@@ -2565,7 +2565,9 @@ dependencies = [
 name = "kiln-app"
 version = "0.0.1"
 dependencies = [
+ "async-channel",
  "base64",
+ "cc",
  "chrono",
  "gpui",
  "gpui_platform",

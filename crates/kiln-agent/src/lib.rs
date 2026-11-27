@@ -4,6 +4,7 @@ pub mod claude;
 pub mod codex;
 pub mod process;
 pub mod project;
+pub mod visualization;
 pub mod worktree;
 
 use kiln_core::{Attachment, AttachmentContent};
@@ -25,6 +26,7 @@ pub enum AgentEvent {
     Image(Attachment),
     /// Generated output saved by the provider on this machine.
     ImageFile(std::path::PathBuf),
+    Visualization(visualization::Visualization),
     /// Text of the message being written, ahead of its `Text`, which repeats it whole.
     TextDelta(String),
     /// A tool call: the provider's tool name and what it was called with.

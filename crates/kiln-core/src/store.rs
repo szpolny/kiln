@@ -35,6 +35,12 @@ pub struct Attachment {
 pub enum AttachmentContent {
     Text(Arc<str>),
     Image { mime: String, base64: Arc<str> },
+    Visualization {
+        html: Arc<str>,
+        preview: Result<Arc<str>, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dark_preview: Option<Arc<str>>,
+    },
 }
 
 impl Attachment {
@@ -42,6 +48,10 @@ impl Attachment {
         match &self.content {
             AttachmentContent::Text(text) => text.len(),
             AttachmentContent::Image { base64, .. } => base64.len(),
+            AttachmentContent::Visualization { html, preview, dark_preview } => {
+                html.len() + preview.as_ref().map_or_else(|error| error.len(), |png| png.len())
+                    + dark_preview.as_ref().map_or(0, |png| png.len())
+            }
         }
     }
 }

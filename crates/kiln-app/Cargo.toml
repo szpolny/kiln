@@ -9,6 +9,7 @@ name = "kiln"
 path = "src/main.rs"
 
 [dependencies]
+async-channel = "2"
 base64 = "0.23"
 percent-encoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -23,3 +24,6 @@ tree-sitter-highlight = "0.26"
 unicode-segmentation = "1"
 kiln-core = { path = "../kiln-core" }
 kiln-agent = { path = "../kiln-agent" }
+
+[build-dependencies]
+cc = "1"

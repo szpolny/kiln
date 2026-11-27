@@ -4,11 +4,11 @@
 //! JSON, so Claude waits on a request while the user decides.
 
 use crate::process::{self, Process};
-use crate::{project, AgentEvent, ApprovalId, ApprovalRequest, Reply};
+use crate::{project, visualization, AgentEvent, ApprovalId, ApprovalRequest, Reply};
 use kiln_core::policy::{capability_for_tool, Capability, Decision, PermissionMode, Place, Policy};
 use kiln_core::{Attachment, AttachmentContent};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command};
@@ -71,7 +71,7 @@ fn parse_line(line: &str) -> Vec<AgentEvent> {
                         out.push(image);
                     }
                     Some("tool_use") => {
-                        if let Some(n) = block["name"].as_str() {
+                        if let Some(n) = block["name"].as_str().filter(|n| *n != visualization::CLAUDE_TOOL) {
                             let input = &block["input"];
                             out.push(AgentEvent::Tool {
                                 name: n.to_string(),
@@ -155,7 +155,7 @@ fn user_message(text: &str, attachments: &[Attachment]) -> Value {
         AttachmentContent::Image { mime, base64 } => Some(json!({
             "type": "image", "source": { "type": "base64", "media_type": mime, "data": base64.as_ref() }
         })),
-        AttachmentContent::Text(_) => None,
+        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
     }).collect::<Vec<_>>();
     let content = if images.is_empty() {
         json!(text)
@@ -264,13 +264,19 @@ fn command(turn: &Turn) -> Command {
         // Privacy: no telemetry or non-essential traffic from the child.
         .env("DISABLE_TELEMETRY", "1")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    let mut allowed = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        let config = json!({ "mcpServers": { (visualization::SERVER): {
+            "type": "stdio", "command": executable, "args": [visualization::SERVER_ARG]
+        }}});
+        cmd.args(["--mcp-config", &config.to_string()]);
+        allowed.push(visualization::CLAUDE_TOOL);
+    }
     if turn.permission_mode == PermissionMode::Manual {
         // Ask Kiln over stdin instead of refusing what would need a prompt.
         cmd.args(["--permission-prompt-tool", "stdio"]);
-        let (allowed, disallowed) = turn.policy.web_tool_rules();
-        if !allowed.is_empty() {
-            cmd.arg("--allowedTools").args(allowed);
-        }
+        let (web_allowed, disallowed) = turn.policy.web_tool_rules();
+        allowed.extend(web_allowed.iter().copied());
         if !disallowed.is_empty() {
             cmd.arg("--disallowedTools").args(disallowed);
         }
@@ -285,6 +291,9 @@ fn command(turn: &Turn) -> Command {
         // The variable outranks the flag and would silently undo the choice.
         cmd.args(["--effort", effort]).env_remove("CLAUDE_CODE_EFFORT_LEVEL");
     }
+    if !allowed.is_empty() {
+        cmd.arg("--allowedTools").args(allowed);
+    }
     cmd
 }
 
@@ -298,6 +307,7 @@ fn drive(
     wire.send(user_message(&turn.prompt, &turn.attachments))?;
     // Tool calls Claude asked about; it lists them again among its denials.
     let mut asked = HashSet::new();
+    let mut visualizations = HashMap::new();
     for line in output.lines() {
         let line = line?;
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -348,6 +358,33 @@ fn drive(
                 };
             }
             _ => {
+                if message["parent_tool_use_id"].is_null() {
+                    for block in message["message"]["content"].as_array().into_iter().flatten() {
+                        match (message["type"].as_str(), block["type"].as_str()) {
+                            (Some("assistant"), Some("tool_use")) if block["name"] == visualization::CLAUDE_TOOL => {
+                                if let (Some(id), Ok(visual)) = (
+                                    block["id"].as_str(),
+                                    visualization::Visualization::parse(&block["input"]),
+                                ) {
+                                    visualizations.insert(id.to_owned(), visual);
+                                }
+                            }
+                            (Some("user"), Some("tool_result")) => {
+                                if let Some(visual) = block["tool_use_id"].as_str().and_then(|id| visualizations.remove(id)) {
+                                    let accepted = match &block["content"] {
+                                        Value::String(text) => text == visualization::ACCEPTED,
+                                        Value::Array(content) => content.iter().any(|item| item["text"] == visualization::ACCEPTED),
+                                        _ => false,
+                                    };
+                                    if block["is_error"] != true && accepted {
+                                        emit(AgentEvent::Visualization(visual))?;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 for event in parse_line(&line) {
                     emit(event)?;
                 }
@@ -440,7 +477,8 @@ mod tests {
         let args: Vec<_> = command(&turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
         assert_eq!(args[at + 1..at + 3], ["WebFetch", "WebSearch"]);
-        assert!(!args.iter().any(|a| a == "--allowedTools"));
+        let at = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[at + 1..], [visualization::CLAUDE_TOOL]);
     }
 
     #[test]
@@ -520,6 +558,27 @@ mod tests {
         let (process, client, events) = run_command(cmd, turn).unwrap();
         assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Session("session".into()));
         (process, client, events)
+    }
+
+    #[test]
+    fn publishes_only_successful_visualization_calls() {
+        let (_, _, events) = fixture(
+            r#"
+            echo '{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"rejected","name":"mcp__kiln_visualization__publish_visualization","input":{"html":"<p>Rejected</p>"}},
+                {"type":"tool_use","id":"shown","name":"mcp__kiln_visualization__publish_visualization","input":{"html":"<p>Chart</p>","title":"Builds"}}
+            ]}}' | tr -d '\n'
+            echo
+            echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"rejected","is_error":true,"content":"Denied"}]}}'
+            echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"shown","content":[{"type":"text","text":"Visualization submitted for display in the conversation."}]}]}}'
+            echo '{"type":"result","is_error":false}'
+        "#,
+            turn(PermissionMode::Manual),
+        );
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Visualization(visualization::Visualization {
+            title: "Builds".into(), html: "<p>Chart</p>".into(),
+        }));
+        assert_eq!(events.recv_blocking().unwrap(), AgentEvent::Done { error: None });
     }
 
     #[test]

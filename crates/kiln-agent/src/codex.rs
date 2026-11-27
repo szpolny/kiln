@@ -2,7 +2,7 @@
 
 use crate::{
     process::{self, Process},
-    project, AgentEvent, ApprovalId, ApprovalRequest, Reply,
+    project, visualization, AgentEvent, ApprovalId, ApprovalRequest, Reply,
 };
 use kiln_core::policy::{Capability, Decision, PermissionMode, Place, Policy};
 use kiln_core::{Attachment, AttachmentContent};
@@ -37,7 +37,7 @@ fn turn_input(text: &str, attachments: &[Attachment]) -> Vec<Value> {
         AttachmentContent::Image { mime, base64 } => Some(json!({
             "type": "image", "url": format!("data:{mime};base64,{base64}")
         })),
-        AttachmentContent::Text(_) => None,
+        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
     }));
     input
 }
@@ -159,6 +159,15 @@ fn command(turn: &Turn) -> Command {
         "-c",
         "sandbox_workspace_write.exclude_slash_tmp=true",
     ]);
+    if let Ok(executable) = std::env::current_exe() {
+        let server = format!("mcp_servers.{}", visualization::SERVER);
+        cmd.args([
+            "-c", &format!("{server}.command={}", json!(executable.to_string_lossy())),
+            "-c", &format!("{server}.args={}", json!([visualization::SERVER_ARG])),
+            "-c", &format!("{server}.enabled=true"),
+            "-c", &format!("{server}.tools.{}.approval_mode=\"approve\"", visualization::TOOL),
+        ]);
+    }
     cmd
 }
 
@@ -390,6 +399,15 @@ fn notification(method: &str, params: &Value) -> Option<AgentEvent> {
         }
         ("item/started", Some("fileChange")) => {
             ("File change", file_paths(&item["changes"]).join("\n"))
+        }
+        (_, Some("mcpToolCall"))
+            if item["server"] == visualization::SERVER && item["tool"] == visualization::TOOL =>
+        {
+            return (method == "item/completed" && item["status"] == "completed"
+                && item["result"]["content"][0]["text"] == visualization::ACCEPTED)
+                .then(|| visualization::Visualization::parse(&item["arguments"]).ok())
+                .flatten()
+                .map(AgentEvent::Visualization);
         }
         ("item/started", Some("mcpToolCall" | "dynamicToolCall")) => {
             (item["tool"].as_str()?, item["arguments"].to_string())
@@ -631,6 +649,21 @@ mod tests {
         assert!(turn_result(&json!({ "status": "completed" })).is_ok());
         let error = json!({ "status": "failed", "error": { "message": "sign in" } });
         assert_eq!(turn_result(&error).unwrap_err().to_string(), "sign in");
+    }
+
+    #[test]
+    fn publishes_visualizations_after_the_tool_accepts_them() {
+        let mut call = json!({ "item": {
+            "type": "mcpToolCall", "server": visualization::SERVER, "tool": visualization::TOOL,
+            "status": "completed", "arguments": { "html": "<p>Chart</p>" },
+            "result": { "content": [{ "type": "text", "text": visualization::ACCEPTED }] }
+        }});
+        assert_eq!(notification("item/started", &call), None);
+        assert_eq!(notification("item/completed", &call), Some(AgentEvent::Visualization(visualization::Visualization {
+            title: "Visualization".into(), html: "<p>Chart</p>".into(),
+        })));
+        call["item"]["status"] = json!("failed");
+        assert_eq!(notification("item/completed", &call), None);
     }
 
     #[test]

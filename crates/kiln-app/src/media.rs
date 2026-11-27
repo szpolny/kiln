@@ -318,6 +318,7 @@ pub fn preview_attachment(attachment: &Attachment, theme: Theme, window: &mut Wi
         AttachmentContent::Image { base64, .. } => {
             crate::image_lightbox::open(attachment.name.clone(), Picture::embedded(base64.clone()), window, cx)
         }
+        AttachmentContent::Visualization { .. } => {}
     }
 }
 
