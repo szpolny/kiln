@@ -1,11 +1,18 @@
 //! The workspace's settings dialog.
 use crate::theme::Theme;
 use crate::workspace::{permission_label, Workspace};
-use gpui::{
-    actions, div, prelude::*, px, relative, rgba, App, Context, Div, FocusHandle, Focusable,
-    FontWeight, KeyBinding, KeyDownEvent, PathPromptOptions, Window,
+use crate::{
+    assets::{icon, Icon},
+    theme::MONO,
 };
-use kiln_core::{checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, FollowUp, Settings};
+use gpui::{
+    actions, div, prelude::*, px, relative, rgba, transparent_black, AnyElement, App, Context, Div,
+    FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, PathPromptOptions, SharedString,
+    Window,
+};
+use kiln_core::{
+    checkout::BranchPrefix, policy::Decision, Agent, Appearance, Fetch, FollowUp, Settings,
+};
 use std::time::Duration;
 
 /// How long typing pauses before a typed setting is written to disk.
@@ -46,7 +53,8 @@ impl Workspace {
             BranchPrefix::Custom(text) => text.clone(),
             _ => String::new(),
         };
-        self.prefix_input.update(cx, |input, cx| input.set_text(&custom, cx));
+        self.prefix_input
+            .update(cx, |input, cx| input.set_text(&custom, cx));
         let focus = cx.focus_handle();
         let previous_focus = window.focused(cx);
         window.focus(&focus, cx);
@@ -59,7 +67,9 @@ impl Workspace {
 
     /// Use the typed text as the branch prefix, and write it once typing pauses.
     pub(crate) fn keep_branch_prefix(&mut self, cx: &mut Context<Self>) {
-        let BranchPrefix::Custom(text) = &mut self.store.settings.branch_prefix else { return };
+        let BranchPrefix::Custom(text) = &mut self.store.settings.branch_prefix else {
+            return;
+        };
         let typed = self.prefix_input.read(cx).text().replace('\n', "");
         if *text == typed {
             return;
@@ -90,8 +100,12 @@ impl Workspace {
             prompt: Some("Choose a folder for new projects".into()),
         });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            let Some(dir) = paths.into_iter().next() else { return };
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
             let _ = this.update(cx, |this, cx| {
                 this.store.settings.new_project_root = Some(dir);
                 this.save();
@@ -105,82 +119,130 @@ impl Workspace {
         let modal = self.settings_modal.as_ref()?;
         let theme = self.theme;
         let settings = &self.store.settings;
-        let appearance = self.setting_choices(
+
+        let appearance = setting_row(
+            Some(row_icon(theme, Icon::SunMoon)),
             "Appearance",
-            settings.appearance,
-            [
-                (Appearance::System, "System"),
-                (Appearance::Light, "Light"),
-                (Appearance::Dark, "Dark"),
-            ],
-            |s, value| s.appearance = value,
-            cx,
+            None,
+            self.segmented(
+                "appearance",
+                settings.appearance,
+                [
+                    (Appearance::System, "System", Some(Icon::Monitor)),
+                    (Appearance::Light, "Light", Some(Icon::Sun)),
+                    (Appearance::Dark, "Dark", Some(Icon::Moon)),
+                ],
+                |s, value| s.appearance = value,
+                cx,
+            ),
         );
-        let permissions = self.setting_choices(
-            "Permission mode for new threads",
-            settings.permission_mode,
-            Agent::default().permission_modes().iter().copied().map(|mode| {
-                (mode, permission_label(mode))
-            }),
-            |s, value| s.permission_mode = value,
-            cx,
+        let follow_up = setting_row(
+            Some(row_icon(theme, Icon::CornerDownLeft)),
+            "While an agent works, Enter",
+            Some(hint(
+                theme,
+                match settings.follow_up {
+                    FollowUp::Queue => {
+                        "Enter saves the message for after the turn; Ctrl+Enter steers."
+                    }
+                    FollowUp::Steer => {
+                        "Enter sends the message to the running turn; Ctrl+Enter queues it."
+                    }
+                },
+            )),
+            self.segmented(
+                "follow-up",
+                settings.follow_up,
+                [
+                    (FollowUp::Queue, "Queues", None),
+                    (FollowUp::Steer, "Steers", None),
+                ],
+                |s, value| s.follow_up = value,
+                cx,
+            ),
         );
-        let web = self.setting_choices(
-            "Web access for new threads in Manual mode",
-            settings.web,
-            [
-                (Decision::Ask, "Ask first"),
-                (Decision::Allow, "Allow"),
-                (Decision::Deny, "Block"),
-            ],
-            |s, value| s.web = value,
-            cx,
+
+        let permissions = setting_row(
+            Some(row_icon(theme, Icon::ShieldCheck)),
+            "Permission mode",
+            None,
+            self.segmented(
+                "permission-mode",
+                settings.permission_mode,
+                Agent::default()
+                    .permission_modes()
+                    .iter()
+                    .copied()
+                    .map(|mode| (mode, permission_label(mode), None)),
+                |s, value| s.permission_mode = value,
+                cx,
+            ),
         );
-        let projects = div().flex().flex_col().flex_shrink_0().gap_1p5()
-            .child(div().text_sm().text_color(theme.muted).child("Folder for new projects and repositories"))
-            .child(div().text_xs().text_color(theme.muted)
-                .child(settings.new_project_root.as_ref().map_or_else(
-                    || "Ask for a folder each time".into(),
-                    |dir| dir.display().to_string(),
-                )))
-            .child(div().flex().gap_1p5()
-                .child(settings_button("choose-project-folder", theme, false)
-                    .child("Choose folder…")
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_new_project_root(cx))))
+        let web = setting_row(
+            Some(row_icon(theme, Icon::Globe)),
+            "Web access in Manual mode",
+            None,
+            self.segmented(
+                "web-access",
+                settings.web,
+                [
+                    (Decision::Ask, "Ask first", None),
+                    (Decision::Allow, "Allow", None),
+                    (Decision::Deny, "Block", None),
+                ],
+                |s, value| s.web = value,
+                cx,
+            ),
+        );
+
+        let folder = settings.new_project_root.as_ref().map_or_else(
+            || hint(theme, "Ask for a folder each time"),
+            |dir| {
+                div()
+                    .text_xs()
+                    .font_family(MONO)
+                    .text_color(theme.muted)
+                    .child(dir.display().to_string())
+                    .into_any_element()
+            },
+        );
+        let projects = setting_row(
+            Some(row_icon(theme, Icon::Folder)),
+            "Folder for new projects",
+            Some(folder),
+            div()
+                .flex()
+                .gap_1p5()
                 .when(settings.new_project_root.is_some(), |d| {
-                    d.child(settings_button("reset-project-folder", theme, false)
-                        .child("Ask each time")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.store.settings.new_project_root = None;
-                            this.save();
-                            cx.notify();
-                        })))
-                }));
+                    d.child(
+                        settings_button("reset-project-folder", theme, false)
+                            .child("Ask each time")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store.settings.new_project_root = None;
+                                this.save();
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(
+                    settings_button("choose-project-folder", theme, false)
+                        .gap_1p5()
+                        .child(icon(Icon::FolderOpen, 14.))
+                        .child(if settings.new_project_root.is_some() {
+                            "Change…"
+                        } else {
+                            "Choose…"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.pick_new_project_root(cx))),
+                ),
+        );
 
         let kind = match &settings.branch_prefix {
             BranchPrefix::Kiln => PrefixKind::Kiln,
             BranchPrefix::CommitType => PrefixKind::CommitType,
             BranchPrefix::Custom(_) => PrefixKind::Custom,
         };
-        let typed = self.prefix_input.read(cx).text().replace('\n', "");
-        let custom_text = typed.clone();
-        let prefix = self.setting_choices(
-            "Branch prefix for new worktrees",
-            kind,
-            [
-                (PrefixKind::Kiln, "kiln/"),
-                (PrefixKind::CommitType, "Commit type: feat/, fix/, …"),
-                (PrefixKind::Custom, "Custom"),
-            ],
-            move |s, kind| {
-                s.branch_prefix = match kind {
-                    PrefixKind::Kiln => BranchPrefix::Kiln,
-                    PrefixKind::CommitType => BranchPrefix::CommitType,
-                    PrefixKind::Custom => BranchPrefix::Custom(custom_text.clone()),
-                }
-            },
-            cx,
-        );
+        let custom_text = self.prefix_input.read(cx).text().replace('\n', "");
         let example = match kind {
             PrefixKind::CommitType => {
                 "The agent names the type of its work. Worktrees you make use feat/.".to_string()
@@ -190,43 +252,70 @@ impl Workspace {
                 p => format!("Branches look like {p}/add-sidebar."),
             },
         };
-        let prefix = prefix
-            .when(kind == PrefixKind::Custom, |d| {
-                d.child(
-                    div().id("branch-prefix-input")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            window.focus(&this.prefix_input.focus_handle(cx), cx)
-                        }))
-                        .px_2p5().py_1p5().rounded_md().border_1().border_color(theme.border)
-                        .bg(theme.fill).text_sm().child(self.prefix_input.clone()),
-                )
-            })
-            .child(div().text_xs().text_color(theme.muted).child(example));
-
-        let fetch = self.setting_choices(
-            "Fetch origin before a new worktree",
-            settings.fetch,
-            [(Fetch::Ask, "Ask each time"), (Fetch::Always, "Always"), (Fetch::Never, "Never")],
-            |s, value| s.fetch = value,
-            cx,
+        let prefix = setting_row(
+            Some(row_icon(theme, Icon::GitBranch)),
+            "Branch prefix",
+            Some(hint(theme, example)),
+            self.segmented(
+                "branch-prefix",
+                kind,
+                [
+                    (PrefixKind::Kiln, "kiln/", None),
+                    (PrefixKind::CommitType, "feat/, fix/, …", None),
+                    (PrefixKind::Custom, "Custom", None),
+                ],
+                move |s, kind| {
+                    s.branch_prefix = match kind {
+                        PrefixKind::Kiln => BranchPrefix::Kiln,
+                        PrefixKind::CommitType => BranchPrefix::CommitType,
+                        PrefixKind::Custom => BranchPrefix::Custom(custom_text.clone()),
+                    }
+                },
+                cx,
+            ),
         )
-        .child(div().text_xs().text_color(theme.muted).child(match settings.fetch {
-            Fetch::Ask => "The branch menu offers both. Agents' worktrees do not fetch.",
-            Fetch::Always => "Every new worktree, also an agent's, fetches origin first.",
-            Fetch::Never => "New worktrees start from what was fetched before.",
-        }));
+        .when(kind == PrefixKind::Custom, |d| {
+            d.child(
+                div()
+                    .id("branch-prefix-input")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.prefix_input.focus_handle(cx), cx)
+                    }))
+                    .px_2p5()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.window)
+                    .text_sm()
+                    .font_family(MONO)
+                    .child(self.prefix_input.clone()),
+            )
+        });
 
-        let follow_up = self.setting_choices(
-            "While an agent works, Enter",
-            settings.follow_up,
-            [(FollowUp::Queue, "Queues"), (FollowUp::Steer, "Steers")],
-            |s, value| s.follow_up = value,
-            cx,
-        )
-        .child(div().text_xs().text_color(theme.muted).child(match settings.follow_up {
-            FollowUp::Queue => "Enter saves the message for after the turn; Ctrl+Enter steers.",
-            FollowUp::Steer => "Enter sends the message to the running turn; Ctrl+Enter queues it.",
-        }));
+        let fetch = setting_row(
+            Some(row_icon(theme, Icon::CloudDownload)),
+            "Fetch origin first",
+            Some(hint(
+                theme,
+                match settings.fetch {
+                    Fetch::Ask => "The branch menu offers both. Agents' worktrees do not fetch.",
+                    Fetch::Always => "Every new worktree, also an agent's, fetches origin first.",
+                    Fetch::Never => "New worktrees start from what was fetched before.",
+                },
+            )),
+            self.segmented(
+                "fetch",
+                settings.fetch,
+                [
+                    (Fetch::Ask, "Ask each time", None),
+                    (Fetch::Always, "Always", None),
+                    (Fetch::Never, "Never", None),
+                ],
+                |s, value| s.fetch = value,
+                cx,
+            ),
+        );
 
         Some(
             div()
@@ -275,10 +364,10 @@ impl Workspace {
                         }))
                         .flex()
                         .flex_col()
-                        .w(px(520.))
+                        .w(px(580.))
                         .max_w(relative(1.))
                         .max_h(relative(1.))
-                        .rounded(px(12.))
+                        .rounded(px(14.))
                         .border_1()
                         .border_color(theme.border)
                         .bg(theme.card)
@@ -314,77 +403,180 @@ impl Workspace {
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
-                                .gap_4()
-                                .p_5()
-                                .child(appearance)
-                                .child(self.spelling_settings(cx))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_shrink_0()
-                                        .gap_4()
-                                        .pt_4()
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .child(permissions)
-                                        .child(web),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_shrink_0()
-                                        .gap_4()
-                                        .pt_4()
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .child(projects)
-                                        .child(prefix)
-                                        .child(fetch)
-                                        .child(follow_up),
-                                ),
+                                .gap_5()
+                                .px_5()
+                                .pt_4()
+                                .pb_5()
+                                .child(settings_section(
+                                    theme,
+                                    "General",
+                                    [appearance, follow_up, self.spelling_settings(cx)],
+                                ))
+                                .child(settings_section(theme, "New threads", [permissions, web]))
+                                .child(settings_section(
+                                    theme,
+                                    "Projects and worktrees",
+                                    [projects, prefix, fetch],
+                                )),
                         ),
                 ),
         )
     }
 
-    fn setting_choices<T: Copy + PartialEq + 'static>(
+    /// A segmented control that writes the chosen value to the settings.
+    fn segmented<T: Copy + PartialEq + 'static>(
         &self,
-        label: &'static str,
+        id: &'static str,
         current: T,
-        choices: impl IntoIterator<Item = (T, &'static str)>,
+        choices: impl IntoIterator<Item = (T, &'static str, Option<Icon>)>,
         set: impl Fn(&mut Settings, T) + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let theme = self.theme;
         div()
-            .id(label)
+            .id(id)
             .flex()
-            .flex_col()
             .flex_shrink_0()
-            .gap_1p5()
-            .child(div().text_sm().text_color(theme.muted).child(label))
-            .child(
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.window)
+            .children(choices.into_iter().map(|(value, name, glyph)| {
+                let set = set.clone();
+                let on = current == value;
                 div()
+                    .id(name)
+                    .tab_index(0)
                     .flex()
-                    .flex_wrap()
+                    .items_center()
                     .gap_1p5()
-                    .children(choices.into_iter().map(|(value, name)| {
-                        let set = set.clone();
-                        settings_button(name, theme, current == value)
-                            .child(name)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                set(&mut this.store.settings, value);
-                                this.save();
-                                cx.notify();
-                            }))
-                    })),
-            )
+                    .h(px(24.))
+                    .px_2p5()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(transparent_black())
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(theme.selected).text_color(theme.text))
+                    .when(!on, |d| {
+                        d.text_color(theme.muted)
+                            .hover(|d| d.text_color(theme.text))
+                    })
+                    .focus_visible(|d| d.border_color(theme.accent))
+                    .children(glyph.map(|glyph| icon(glyph, 13.)))
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        set(&mut this.store.settings, value);
+                        this.save();
+                        cx.notify();
+                    }))
+            }))
     }
 }
 
-pub(crate) fn settings_button(id: &'static str, theme: Theme, selected: bool) -> gpui::Stateful<Div> {
+/// A titled group of setting rows on one card.
+pub(crate) fn settings_section(
+    theme: Theme,
+    title: &'static str,
+    rows: impl IntoIterator<Item = Div>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap_2()
+        .child(
+            div()
+                .px_1()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted)
+                .child(title.to_uppercase()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.fill)
+                .children(rows.into_iter().enumerate().map(|(i, row)| {
+                    row.when(i > 0, |d| d.border_t_1().border_color(theme.border))
+                })),
+        )
+}
+
+/// One setting: an icon, its label and hint on the left, its control on the right.
+pub(crate) fn setting_row(
+    lead: Option<Div>,
+    label: impl IntoElement,
+    hint: Option<AnyElement>,
+    control: impl IntoElement,
+) -> Div {
+    div().flex().flex_col().gap_2().px_3p5().py_2p5().child(
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .children(lead)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .child(label)
+                    .children(hint),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .ml_1()
+                    .child(control),
+            ),
+    )
+}
+
+/// The tile at the start of a setting row.
+fn row_tile(theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(28.))
+        .rounded(px(7.))
+        .bg(theme.selected)
+        .text_color(theme.muted)
+}
+
+/// A row tile holding an icon.
+pub(crate) fn row_icon(theme: Theme, glyph: Icon) -> Div {
+    row_tile(theme).child(icon(glyph, 15.))
+}
+
+/// Muted explanatory text under a setting's label.
+pub(crate) fn hint(theme: Theme, text: impl Into<SharedString>) -> AnyElement {
+    div()
+        .text_xs()
+        .text_color(theme.muted)
+        .child(text.into())
+        .into_any_element()
+}
+
+pub(crate) fn settings_button(
+    id: &'static str,
+    theme: Theme,
+    selected: bool,
+) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .tab_index(0)

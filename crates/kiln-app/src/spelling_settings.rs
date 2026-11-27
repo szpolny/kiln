@@ -1,12 +1,14 @@
 //! Manage the composer dictionaries from the Settings dialog.
 
 use crate::{
-    settings::settings_button,
+    assets::{icon, Icon},
+    settings::{hint, row_icon, setting_row},
     spelling::Dictionaries,
     spelling_download::{Language, LANGUAGES},
+    theme::Theme,
     workspace::Workspace,
 };
-use gpui::{div, prelude::*, Context, Div};
+use gpui::{div, prelude::*, px, Context, Div};
 use spellbook::Dictionary;
 use std::{collections::HashMap, sync::Arc};
 
@@ -115,112 +117,132 @@ impl Workspace {
         .detach();
     }
 
+    /// The spell check row: one chip per language, toggled or downloaded in place.
     pub(crate) fn spelling_settings(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
         let settings = &self.store.settings.spelling;
-        let english = settings.english;
-        div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .gap_1p5()
-            .pt_4()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted)
-                    .child("Spell check languages"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child("Additional dictionaries download from LibreOffice and work offline."),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_sm()
-                            .child("English (US)")
-                            .child(div().text_xs().text_color(theme.muted).child("Built in")),
-                    )
-                    .child(
-                        settings_button("spelling-english", theme, english)
-                            .child(if english { "On" } else { "Off" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.store.settings.spelling.english =
-                                    !this.store.settings.spelling.english;
-                                this.save();
-                                this.update_spelling(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(LANGUAGES.iter().map(|language| {
+        let english = chip(
+            theme,
+            "spelling-english",
+            "English (US)",
+            Chip::Toggle(settings.english),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.store.settings.spelling.english = !this.store.settings.spelling.english;
+            this.save();
+            this.update_spelling(cx);
+            cx.notify();
+        }));
+        let languages =
+            LANGUAGES.iter().map(|language| {
                 let status = self.spelling.dictionaries.get(language.code);
-                let control = match status {
+                let state = match status {
                     Some(Status::Ready(_)) => {
-                        let enabled = settings.languages.iter().any(|code| code == language.code);
-                        settings_button(language.code, theme, enabled)
-                            .child(if enabled { "On" } else { "Off" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_spelling_language(language, cx)
-                            }))
-                            .into_any_element()
+                        Chip::Toggle(settings.languages.iter().any(|code| code == language.code))
                     }
-                    Some(Status::Downloading) => div()
-                        .px_2p5()
-                        .text_sm()
-                        .text_color(theme.muted)
-                        .child("Downloading…")
-                        .into_any_element(),
-                    _ if !self.spelling.restored => div()
-                        .px_2p5()
-                        .text_sm()
-                        .text_color(theme.muted)
-                        .child("Loading…")
-                        .into_any_element(),
-                    _ => settings_button(language.code, theme, false)
-                        .child(if matches!(status, Some(Status::Failed(_))) {
-                            "Retry"
-                        } else {
-                            "Download"
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    Some(Status::Downloading) => Chip::Busy,
+                    _ if !self.spelling.restored => Chip::Busy,
+                    Some(Status::Failed(_)) => Chip::Failed,
+                    None => Chip::Download,
+                };
+                let chip = chip(theme, language.code, language.name, state);
+                match state {
+                    Chip::Toggle(_) => chip.on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_spelling_language(language, cx)
+                    })),
+                    Chip::Download | Chip::Failed => {
+                        chip.on_click(cx.listener(move |this, _, _, cx| {
                             this.download_spelling_language(language, cx)
                         }))
-                        .into_any_element(),
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_sm().child(language.name))
-                            .child(control),
-                    )
-                    .when_some(
-                        status.and_then(|status| match status {
-                            Status::Failed(error) => Some(error),
-                            _ => None,
-                        }),
-                        |row, error| {
-                            row.child(div().text_xs().text_color(theme.warn).child(error.clone()))
-                        },
-                    )
-            }))
+                    }
+                    Chip::Busy => chip,
+                }
+            });
+        let errors = LANGUAGES.iter().filter_map(|language| {
+            match self.spelling.dictionaries.get(language.code) {
+                Some(Status::Failed(error)) => Some(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warn)
+                        .child(format!("{}: {error}", language.name)),
+                ),
+                _ => None,
+            }
+        });
+        setting_row(
+            Some(row_icon(theme, Icon::SpellCheck)),
+            "Spell check",
+            Some(hint(
+                theme,
+                "Click a language to turn it on or off. Others download from LibreOffice and then work offline.",
+            )),
+            div(),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1p5()
+                .pl(px(40.))
+                .child(english)
+                .children(languages),
+        )
+        .children(errors.map(|error| error.pl(px(40.))))
     }
+}
+
+/// What a language chip shows and does when clicked.
+#[derive(Clone, Copy)]
+enum Chip {
+    /// The dictionary is here; on or off.
+    Toggle(bool),
+    /// Not downloaded yet.
+    Download,
+    /// Downloading, or still checking what is downloaded.
+    Busy,
+    /// The download failed; clicking retries.
+    Failed,
+}
+
+fn chip(theme: Theme, id: &'static str, name: &'static str, state: Chip) -> gpui::Stateful<Div> {
+    let glyph = match state {
+        Chip::Toggle(true) => Some(Icon::Check),
+        Chip::Toggle(false) => None,
+        Chip::Download => Some(Icon::Download),
+        Chip::Busy => Some(Icon::LoaderCircle),
+        Chip::Failed => Some(Icon::RotateCw),
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_1()
+        .h(px(26.))
+        .px_2p5()
+        .rounded_full()
+        .border_1()
+        .text_sm()
+        .whitespace_nowrap()
+        .map(|d| match state {
+            Chip::Toggle(true) => d
+                .bg(theme.selected)
+                .border_color(theme.accent)
+                .text_color(theme.text),
+            Chip::Toggle(false) => d.border_color(theme.border).text_color(theme.text),
+            Chip::Download => d.border_color(theme.border).text_color(theme.muted),
+            Chip::Busy => d.border_color(theme.border).text_color(theme.muted),
+            Chip::Failed => d.border_color(theme.warn).text_color(theme.warn),
+        })
+        .when(!matches!(state, Chip::Busy), |d| {
+            d.tab_index(0)
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.hover))
+                .focus_visible(|d| d.border_color(theme.accent).underline())
+        })
+        .children(glyph.map(|glyph| {
+            icon(glyph, 12.).when(matches!(state, Chip::Toggle(true)), |d| {
+                d.text_color(theme.accent)
+            })
+        }))
+        .child(name)
 }
