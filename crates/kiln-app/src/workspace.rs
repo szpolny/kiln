@@ -793,6 +793,11 @@ impl Workspace {
         self.input.update(cx, |input, cx| input.clear(cx));
     }
 
+    fn follow_up_mode(&self, alternate: bool) -> FollowUp {
+        let mode = self.store.settings.follow_up;
+        if alternate { mode.other() } else { mode }
+    }
+
     /// Send a new turn or a follow-up to the thread that is running.
     fn submit(&mut self, alternate: bool, cx: &mut Context<Self>) {
         let Some(id) = self.selected else { return };
@@ -806,9 +811,9 @@ impl Workspace {
         }
         self.clear_composer(id, cx);
         if self.store.thread(id).is_some_and(|thread| thread.status == Status::Running) {
-            match self.store.settings.follow_up {
-                mode if alternate == (mode == FollowUp::Queue) => self.steer(id, prompt, cx),
-                _ => {
+            match self.follow_up_mode(alternate) {
+                FollowUp::Steer => self.steer(id, prompt, cx),
+                FollowUp::Queue => {
                     if let Some(thread) = self.store.thread_mut(id) {
                         thread.enqueue(prompt);
                     }
@@ -2285,13 +2290,12 @@ impl Workspace {
         let id = thread.id;
         let loading = self.attachment_jobs.contains(&id);
         let typed = self.composer_ready(thread, cx);
-        let mode = self.store.settings.follow_up;
         let button = if running && typed && !stopping {
-            let mark = match mode {
+            let mark = match self.follow_up_mode(window.modifiers().control) {
                 FollowUp::Steer => assets::Icon::CornerDownRight,
                 FollowUp::Queue => assets::Icon::ListEnd,
             };
-            let hint = match mode {
+            let hint = match self.store.settings.follow_up {
                 FollowUp::Steer => "Steer the running turn (Enter) · Ctrl+Enter to queue instead",
                 FollowUp::Queue => "Queue for after this turn (Enter) · Ctrl+Enter to steer instead",
             };
@@ -2505,9 +2509,15 @@ impl Render for Workspace {
             });
         }
         self.sync_transcript();
+        let control_held = window.modifiers().control;
         // No root background: the macOS sidebar lets the blur through.
         let root = div().relative().flex().size_full().font_family(self.theme.font).text_color(self.theme.text)
             .track_focus(&self.focus)
+            .on_modifiers_changed(cx.listener(move |_, ev: &gpui::ModifiersChangedEvent, _, cx| {
+                if ev.modifiers.control != control_held {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(|this, ev, window, cx| this.on_key(ev, window, cx)));
         self.command_handlers(root, cx)
             .child(self.sidebar(window, cx))
