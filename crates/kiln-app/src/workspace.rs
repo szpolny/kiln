@@ -729,9 +729,19 @@ impl Workspace {
         let agent = thread.agent;
         // Changes already there cannot be this thread's before its first reply.
         let first = thread.session_id.is_none() && !thread.messages.iter().any(|m| m.role == Role::Agent);
-        let Prompt { body: prompt, attachments } = request;
-        let prompt = if let Some(project) = project_dir.as_deref().filter(|_| thread.handoff) {
-            checkout::moved_prompt(&thread.messages, &prompt, &thread.checkout.describe(project))
+        let Prompt { body: prompt, mut attachments } = request;
+        if thread.handoff {
+            for message in thread.messages.iter().filter(|m| m.role == Role::User) {
+                for attachment in &message.attachments {
+                    if !attachments.contains(attachment) {
+                        attachments.push(attachment.clone());
+                    }
+                }
+            }
+        }
+        let prompt = if thread.handoff {
+            let place = dir.as_deref().unwrap_or(&scratch_dir).display().to_string();
+            checkout::handoff_prompt(&thread.messages, &prompt, &place)
         } else if first {
             format!("{}\n\n{prompt}", title::title_note())
         } else {

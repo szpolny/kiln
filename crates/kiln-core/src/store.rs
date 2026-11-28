@@ -213,28 +213,34 @@ impl Store {
         true
     }
 
-    /// Select a provider and model from the composer. A thread with history
-    /// keeps its provider and session, so a cross-provider choice starts a thread.
+    /// Select the next model in the same thread. Provider sessions cannot cross
+    /// providers, so a switch starts a fresh session with a conversation handoff.
     pub fn choose_model(&mut self, id: u64, agent: Agent, model: &str, now: u64) -> Option<u64> {
         if !agent.models().iter().any(|choice| choice.id == model) {
             return None;
         }
-        let project = self.locate(id).map(|(p, _)| p);
         let source = self.thread_mut(id)?;
-        let target = if source.agent == agent {
-            id
-        } else if source.can_change_agent() {
-            source.agent = agent;
-            source.reported_model = None;
-            id
-        } else {
-            match project {
-                Some(p) => self.add_thread(p, agent, now)?,
-                None => self.add_projectless_thread(agent, now),
+        let changed = source.agent != agent || source.model() != model;
+        let notice = (changed && !source.messages.is_empty()).then(|| format!(
+            "Switched from {} · {} to {} · {}",
+            source.agent.name(), source.agent.model_name(source.model()),
+            agent.name(), agent.model_name(model),
+        ));
+        if source.agent != agent {
+            if source.status == Status::Running {
+                return None;
             }
-        };
+            source.agent = agent;
+            source.session_id = None;
+            source.reported_model = None;
+            source.effort = None;
+            source.handoff = !source.messages.is_empty();
+        }
+        if let Some(notice) = notice {
+            source.messages.push(Message::notice(notice).at(now));
+        }
         self.last_agent = Some(agent);
-        self.select_model(target, model).then_some(target)
+        self.select_model(id, model).then_some(id)
     }
 
     /// Apply an explicit composer choice to this thread and remember it for new ones.
@@ -556,16 +562,69 @@ mod tests {
         thread.messages.push(Message::user("Existing prompt"));
         thread.session_id = Some("existing-session".into());
         let target = store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 1).unwrap();
-        assert_ne!(target, id);
-        assert_eq!(store.locate(target).unwrap().0, 0);
-        let original = store.thread(id).unwrap();
-        assert_eq!(original.agent, Agent::Claude);
-        assert_eq!(original.session_id.as_deref(), Some("existing-session"));
-        assert_eq!(original.messages[0].body, "Existing prompt");
-        let new_thread = store.thread(target).unwrap();
-        assert_eq!(new_thread.agent, Agent::Codex);
-        assert_eq!(new_thread.model(), "gpt-6.2-astra");
-        assert!(new_thread.messages.is_empty() && new_thread.session_id.is_none());
+        assert_eq!(target, id);
+        let thread = store.thread(id).unwrap();
+        assert_eq!(thread.agent, Agent::Codex);
+        assert_eq!(thread.model(), "gpt-6.2-astra");
+        assert_eq!(thread.messages[0].body, "Existing prompt");
+        assert!(thread.session_id.is_none() && thread.handoff);
+        let saved = serde_json::to_string(&store).unwrap();
+        let mut store: Store = serde_json::from_str(&saved).unwrap();
+        assert!(store.thread(id).unwrap().handoff);
+        store.thread_mut(id).unwrap().status = Status::Running;
+        assert_eq!(store.choose_model(id, Agent::Claude, Agent::Claude.default_model(), 2), None);
+        store.thread_mut(id).unwrap().status = Status::Idle;
+        assert_eq!(store.choose_model(id, Agent::Claude, Agent::Claude.default_model(), 3), Some(id));
+        assert!(store.thread(id).unwrap().handoff);
+
+    }
+
+    #[test]
+    fn model_switch_notices_record_only_changes_in_existing_conversations() {
+        let mut store = Store::default();
+        let id = store.add_projectless_thread(Agent::Claude, 0);
+        store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 1).unwrap();
+        assert!(store.thread(id).unwrap().messages.is_empty());
+        store.thread_mut(id).unwrap().messages.push(Message::user("Hello"));
+        store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 2).unwrap();
+        assert_eq!(store.thread(id).unwrap().messages.len(), 1);
+        store.thread_mut(id).unwrap().status = Status::Running;
+        assert!(store.choose_model(id, Agent::Claude, Agent::Claude.default_model(), 3).is_none());
+        assert_eq!(store.thread(id).unwrap().messages.len(), 1);
+        store.thread_mut(id).unwrap().status = Status::Idle;
+        store.choose_model(id, Agent::Codex, "gpt-6.2-sol", 4).unwrap();
+        let notice = &store.thread(id).unwrap().messages[1];
+        assert_eq!(notice.role, Role::Notice);
+        assert_eq!(notice.at, 4);
+        assert_eq!(notice.body, format!("Switched from Codex · {} to Codex · {}",
+            Agent::Codex.model_name("gpt-6.2-astra"), Agent::Codex.model_name("gpt-6.2-sol")));
+        store.choose_model(id, Agent::Claude, Agent::Claude.default_model(), 5).unwrap();
+        let restored: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        let notice = &restored.thread(id).unwrap().messages[2];
+        assert!(notice.body.starts_with("Switched from Codex · "));
+        assert!(notice.body.contains(" to Claude Code · "));
+        assert_eq!(notice.at, 5);
+    }
+
+    #[test]
+    fn same_provider_model_switch_keeps_native_context() {
+        let mut store = Store::sample();
+        let id = store.add_projectless_thread(Agent::Codex, 0);
+        let thread = store.thread_mut(id).unwrap();
+        thread.session_id = Some("session".into());
+        thread.messages.push(Message::user("Keep working"));
+        thread.draft = "next step".into();
+        thread.enqueue(Prompt { body: "queued".into(), attachments: vec![] });
+        assert_eq!(store.choose_model(id, Agent::Codex, "gpt-6.2-astra", 1), Some(id));
+        let thread = store.thread(id).unwrap();
+        assert_eq!(thread.session_id.as_deref(), Some("session"));
+        assert!(!thread.handoff);
+        assert_eq!(store.choose_model(id, Agent::Claude, Agent::Claude.default_model(), 2), Some(id));
+        let thread = store.thread(id).unwrap();
+        assert_eq!(thread.draft, "next step");
+        assert_eq!(thread.queue[0].body, "queued");
+        assert_eq!(thread.messages[0].body, "Keep working");
+        assert!(thread.handoff && thread.session_id.is_none());
     }
 
     #[test]

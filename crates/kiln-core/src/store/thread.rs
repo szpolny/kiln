@@ -57,7 +57,7 @@ pub struct Thread {
     /// Where the thread's turns run.
     #[serde(default, skip_serializing_if = "is_project_checkout")]
     pub checkout: Checkout,
-    /// The thread changed checkout, so the next turn starts a new session
+    /// The thread changed checkout or provider, so the next turn starts a new session
     /// and recaps the conversation to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handoff: bool,

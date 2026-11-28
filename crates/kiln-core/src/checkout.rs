@@ -257,6 +257,44 @@ pub fn branch_name(prefix: &str, name: &str, title: &str) -> String {
     }
 }
 
+/// Continue in a fresh provider session using the visible thread as context.
+/// Include tool activity and partial replies so stopped work can be continued.
+pub fn handoff_prompt(messages: &[Message], request: &str, place: &str) -> String {
+    use crate::store::AttachmentContent;
+    let latest = messages.iter().rposition(|m| m.role == Role::User);
+    let mut prompt = format!(
+        "<kiln-context>\nYou are continuing this same thread in a new provider session. \
+         The working directory is {place}. Continue the user's current task using the \
+         conversation below, including decisions, completed work, and unfinished steps. \
+         Earlier tool activity is historical context; verify current files before editing.\n\n"
+    );
+    for (i, message) in messages.iter().enumerate() {
+        if Some(i) == latest && message.body == request {
+            continue;
+        }
+        let who = match message.role {
+            Role::User => "User",
+            Role::Agent => "Agent",
+            Role::Notice => "Kiln notice",
+        };
+        prompt.push_str(&format!("{who}: {}\n", message.body));
+        if let Some(tool) = &message.tool {
+            prompt.push_str(&format!("Tool: {tool}\n"));
+        }
+        for attachment in &message.attachments {
+            prompt.push_str(&format!("Attachment: {}\n", attachment.name));
+            if let AttachmentContent::Text(text) = &attachment.content {
+                prompt.push_str(text);
+                prompt.push('\n');
+            }
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("</kiln-context>\n\n");
+    prompt.push_str(request);
+    prompt
+}
+
 /// Longest recap of earlier conversation sent to a new session, in characters.
 const RECAP_CHARS: usize = 12_000;
 
@@ -294,6 +332,22 @@ pub fn moved_prompt(messages: &[Message], request: &str, place: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_handoff_keeps_task_and_partial_work() {
+        let messages = vec![
+            Message::user("Implement the feature"),
+            Message::tool_call("Bash", "cargo test"),
+            Message::agent("Implementation done; tests still need fixing"),
+            Message::notice("Stopped"),
+        ];
+        let prompt = handoff_prompt(&messages, "Implement the feature", "/project");
+        assert!(prompt.contains("Tool: Bash"));
+        assert!(prompt.contains("tests still need fixing"));
+        assert!(prompt.contains("Stopped"));
+        assert_eq!(prompt.matches("Implement the feature").count(), 1);
+        assert!(prompt.ends_with("Implement the feature"));
+    }
 
     #[test]
     fn a_project_request_is_a_final_control_line() {

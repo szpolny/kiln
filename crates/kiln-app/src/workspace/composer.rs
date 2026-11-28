@@ -244,13 +244,6 @@ impl Workspace {
 
     fn set_model(&mut self, id: u64, agent: Agent, model: &str, cx: &mut Context<Self>) {
         if let Some(target) = self.store.choose_model(id, agent, model, now()) {
-            if target != id {
-                // The new thread is where the typed prompt will be sent.
-                let draft = self.store.thread_mut(id).map(|t| std::mem::take(&mut t.draft));
-                if let (Some(draft), Some(thread)) = (draft, self.store.thread_mut(target)) {
-                    thread.draft = draft;
-                }
-            }
             self.select(Some(target), cx);
         }
         cx.notify();
@@ -358,9 +351,14 @@ impl Workspace {
                 d.child(self.menu_surface("model-providers").absolute()
                     .top(px(PROVIDER_CHIP_HEIGHT + 8.)).right_2().w(px(152.)).bg(theme.fill)
                     .children(Agent::ALL.map(|provider| {
+                        let unavailable = thread.status == Status::Running && provider != thread.agent;
                         self.menu_item(provider.label(), Some(provider), provider.name(), None, provider == agent)
                             .when(provider == agent, |d| d.bg(theme.selected))
+                            .when(unavailable, |d| d.opacity(0.4))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if unavailable {
+                                    return;
+                                }
                                 if provider != agent {
                                     this.reset_model_scroll();
                                 }
