@@ -1575,5 +1575,6 @@ impl Render for Workspace {
             .children(self.render_settings(cx))
             .children(self.render_palette(cx))
             .children(self.render_image_lightbox(window, cx))
+            .children(self.render_file_drop(cx))
     }
 }

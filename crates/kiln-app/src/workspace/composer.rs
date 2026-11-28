@@ -4,15 +4,16 @@ use crate::theme::Theme;
 use crate::tooltip::tip;
 use crate::{assets, file_reference, media};
 use gpui::{
-    anchored, canvas, deferred, div, fill, point, prelude::*, px, rgb, size, Anchor, Bounds,
-    ClickEvent, Context, DispatchPhase, Focusable, FontWeight, HitboxBehavior, IntoElement,
+    anchored, canvas, deferred, div, ease_out_quint, fill, point, prelude::*, px, rgb, size, Anchor,
+    Animation, AnimationExt, Bounds, ClickEvent, Context, DispatchPhase, ExternalPaths, Focusable,
+    FontWeight, HitboxBehavior, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
     SharedString, Window,
 };
 use kiln_core::policy::{Decision, PermissionMode};
 use kiln_core::{Agent, Attachment, Effort, FollowUp, Prompt, Status, Thread};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const SCROLLBAR_GUTTER: f32 = 10.;
 
@@ -130,6 +131,49 @@ impl Workspace {
                     format!("{} · {error}", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
                 })).collect()
         }, cx);
+    }
+
+    /// A veil over the window while files from another app hover over it.
+    /// Dropping them anywhere attaches them to the open thread's draft.
+    pub(super) fn render_file_drop(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // Kiln starts no drags of its own, so any drag is a file drag from outside.
+        if !cx.has_active_drag() {
+            return None;
+        }
+        let id = self.selected.filter(|&id| self.store.thread(id).is_some())?;
+        let theme = self.theme;
+        let icon = assets::icon(assets::Icon::FileUp, 28.).relative().text_color(theme.accent).with_animation(
+            "file-drop-icon",
+            Animation::new(Duration::from_millis(1400)).repeat(),
+            |icon, phase| icon.top(px(-4. * (phase * std::f32::consts::TAU).sin())),
+        );
+        let card = div().flex().flex_col().items_center().gap_2().px_12().py_8()
+            .rounded_xl().border_2().border_dashed().bg(theme.card)
+            .child(icon)
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Drop files to attach"))
+            .child(div().text_xs().text_color(theme.muted)
+                .child(format!("Text files and images, up to {} per message", media::COUNT_LIMIT)))
+            .with_animation(
+                "file-drop-card",
+                Animation::new(Duration::from_millis(1400)).repeat(),
+                move |card, phase| {
+                    let glow = (1. - (phase * std::f32::consts::TAU).cos()) * 0.5;
+                    card.border_color(theme.accent.opacity(0.4 + 0.6 * glow))
+                },
+            );
+        Some(
+            div().absolute().inset_0().flex().items_center().justify_center()
+                .bg(theme.window.opacity(0.8))
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    this.add_files(id, paths.paths().to_vec(), cx);
+                }))
+                .child(card)
+                .with_animation(
+                    "file-drop-fade",
+                    Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
+                    |veil, delta| veil.opacity(delta),
+                ),
+        )
     }
 
     pub(super) fn set_attachment_error(&mut self, id: u64, error: Option<String>, cx: &mut Context<Self>) {
