@@ -152,7 +152,7 @@ impl Workspace {
             .child(icon)
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Drop files to attach"))
             .child(div().text_xs().text_color(theme.muted)
-                .child(format!("Text files and images, up to {} per message", media::COUNT_LIMIT)))
+                .child(format!("Text files, images and PDFs, up to {} per message", media::COUNT_LIMIT)))
             .with_animation(
                 "file-drop-card",
                 Animation::new(Duration::from_millis(1400)).repeat(),
@@ -780,7 +780,7 @@ impl Workspace {
                     div().flex().items_center().gap_3().pl_0p5()
                         .child(div().flex().items_center().gap_0p5()
                             .child(composer_tool("attach-file", assets::Icon::Paperclip, theme)
-                                .tooltip(tip("Attach text files or images", theme))
+                                .tooltip(tip("Attach text files, images or PDFs", theme))
                                 .on_click(cx.listener(move |this, _, _, cx| this.pick_files(id, cx))))
                             .child(self.model_picker(thread, window, cx))
                             .child(self.effort_picker(thread, window, cx)))

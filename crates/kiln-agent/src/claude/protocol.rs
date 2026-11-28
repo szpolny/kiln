@@ -137,20 +137,24 @@ fn target(tool: &str, input: &Value) -> Option<PathBuf> {
 
 pub(super) fn user_message(text: &str, attachments: &[Attachment]) -> Value {
     let text = crate::prompt_text(text, attachments);
-    let images = attachments.iter().filter_map(|attachment| match &attachment.content {
+    let files = attachments.iter().filter_map(|attachment| match &attachment.content {
         AttachmentContent::Image { mime, base64 } => Some(json!({
             "type": "image", "source": { "type": "base64", "media_type": mime, "data": base64.as_ref() }
         })),
+        AttachmentContent::Document { mime, base64 } => Some(json!({
+            "type": "document", "title": attachment.name,
+            "source": { "type": "base64", "media_type": mime, "data": base64.as_ref() }
+        })),
         AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
     }).collect::<Vec<_>>();
-    let content = if images.is_empty() {
+    let content = if files.is_empty() {
         json!(text)
     } else {
         let mut blocks = vec![];
         if !text.is_empty() {
             blocks.push(json!({ "type": "text", "text": text }));
         }
-        blocks.extend(images);
+        blocks.extend(files);
         json!(blocks)
     };
     json!({ "type": "user", "message": { "role": "user", "content": content } })
@@ -190,6 +194,10 @@ mod tests {
                 name: "screenshot.png".into(),
                 content: AttachmentContent::Image { mime: "image/png".into(), base64: "AA==".into() },
             },
+            Attachment {
+                name: "paper.pdf".into(),
+                content: AttachmentContent::Document { mime: "application/pdf".into(), base64: "JVBERg==".into() },
+            },
         ];
         let message = user_message("Look at these", &attachments);
         let blocks = message["message"]["content"].as_array().unwrap();
@@ -198,6 +206,10 @@ mod tests {
         assert_eq!(blocks[1], json!({
             "type": "image",
             "source": { "type": "base64", "media_type": "image/png", "data": "AA==" }
+        }));
+        assert_eq!(blocks[2], json!({
+            "type": "document", "title": "paper.pdf",
+            "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBERg==" }
         }));
         let reply = parse_line(&json!({"type": "assistant", "message": {"content": [blocks[1]]}}).to_string());
         assert!(matches!(reply.as_slice(), [AgentEvent::Image(_)]));

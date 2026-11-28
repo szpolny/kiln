@@ -173,7 +173,8 @@ impl Workspace {
                         AttachmentContent::Image { base64, .. } => {
                             Some((attachment.name.clone(), media::Picture::embedded(base64.clone())))
                         }
-                        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
+                        AttachmentContent::Text(_) | AttachmentContent::Document { .. }
+                        | AttachmentContent::Visualization { .. } => None,
                     }).collect()
                 });
                 body.when(!blocks.is_empty(), |d| {

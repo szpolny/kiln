@@ -15,7 +15,8 @@ pub(super) fn turn_input(text: &str, attachments: &[Attachment]) -> Vec<Value> {
         AttachmentContent::Image { mime, base64 } => Some(json!({
             "type": "image", "url": format!("data:{mime};base64,{base64}")
         })),
-        AttachmentContent::Text(_) | AttachmentContent::Visualization { .. } => None,
+        // Codex takes no PDF input, so Kiln saves PDFs where Codex can read them.
+        AttachmentContent::Text(_) | AttachmentContent::Document { .. } | AttachmentContent::Visualization { .. } => None,
     }));
     input
 }

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 const TEXT_LIMIT: usize = 64 * 1024;
 const IMAGE_LIMIT: usize = 5 * 1024 * 1024;
+const DOCUMENT_LIMIT: usize = 10 * 1024 * 1024;
 pub const TOTAL_LIMIT: usize = 20 * 1024 * 1024;
 pub const COUNT_LIMIT: usize = 8;
 const PREVIEW_LIMIT: usize = 10 * 1024 * 1024;
@@ -51,14 +52,23 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned();
-    let bytes = read(path, IMAGE_LIMIT)?;
+    let bytes = read(path, DOCUMENT_LIMIT)?;
+    if bytes.starts_with(b"%PDF-") {
+        return Ok(Attachment {
+            name,
+            content: AttachmentContent::Document {
+                mime: "application/pdf".into(),
+                base64: STANDARD.encode(&bytes).into(),
+            },
+        });
+    }
     if image::guess_format(&bytes).is_ok() {
         return attach_image(name, &bytes);
     }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "Choose a UTF-8 text file or a supported image.")?;
+    const UNSUPPORTED: &str = "Choose a UTF-8 text file, a supported image, or a PDF.";
+    let text = std::str::from_utf8(&bytes).map_err(|_| UNSUPPORTED)?;
     if text.contains('\0') {
-        return Err("Choose a UTF-8 text file or a supported image.".into());
+        return Err(UNSUPPORTED.into());
     }
     if bytes.len() > TEXT_LIMIT {
         return Err("Text files can be up to 64 KiB.".into());
@@ -67,6 +77,28 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         name,
         content: AttachmentContent::Text(text.into()),
     })
+}
+
+/// Save PDF attachments in the thread's scratch directory and name their
+/// paths in the prompt, for agents that cannot take PDFs as input.
+pub fn save_documents(scratch: &Path, prompt: &str, attachments: &[Attachment]) -> Result<String, String> {
+    use std::fmt::Write;
+    let mut prompt = prompt.to_owned();
+    for attachment in attachments {
+        let AttachmentContent::Document { base64, .. } = &attachment.content else { continue };
+        let bytes = STANDARD.decode(&**base64).map_err(|_| "Invalid PDF attachment data.")?;
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        // A folder per file keeps the original name without overwriting another PDF.
+        let dir = scratch.join("attachments").join(format!("{:016x}", hasher.finish()));
+        let name = Path::new(&attachment.name).file_name().unwrap_or("attachment.pdf".as_ref());
+        let path = dir.join(name);
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, &bytes))
+            .map_err(|err| format!("Could not save {} for the agent: {err}", attachment.name))?;
+        let _ = write!(prompt, "\n\nAttached PDF {:?} is saved at {}", attachment.name, path.display());
+    }
+    Ok(prompt)
 }
 
 fn image_info(bytes: &[u8]) -> Result<(ImageFormat, &'static str), String> {
@@ -353,7 +385,7 @@ pub fn preview_attachment(attachment: &Attachment, theme: Theme, window: &mut Wi
         AttachmentContent::Image { base64, .. } => {
             image_lightbox::open(attachment.name.clone(), Picture::embedded(base64.clone()), window, cx)
         }
-        AttachmentContent::Visualization { .. } => {}
+        AttachmentContent::Document { .. } | AttachmentContent::Visualization { .. } => {}
     }
 }
 
@@ -429,14 +461,18 @@ pub(crate) fn straighten(pixel: &mut [u8; 4]) {
 pub(crate) fn attachment_button(id: String, attachment: &Attachment, theme: Theme) -> gpui::Stateful<gpui::Div> {
     let preview = attachment.clone();
     let icon = match attachment.content {
-        AttachmentContent::Text(_) => assets::Icon::FileText,
+        AttachmentContent::Text(_) | AttachmentContent::Document { .. } => assets::Icon::FileText,
         AttachmentContent::Image { .. } | AttachmentContent::Visualization { .. } => assets::Icon::Image,
     };
-    div().id(SharedString::from(id)).flex().items_center().gap_1()
+    let button = div().id(SharedString::from(id)).flex().items_center().gap_1()
         .rounded_md().px_2().py_1().max_w(px(250.)).text_xs()
-        .cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
         .child(assets::icon(icon, 12.))
-        .child(div().min_w_0().truncate().child(attachment.name.clone()))
+        .child(div().min_w_0().truncate().child(attachment.name.clone()));
+    // Kiln has no PDF viewer, so a PDF is only named.
+    if matches!(attachment.content, AttachmentContent::Document { .. }) {
+        return button;
+    }
+    button.cursor_pointer().hover(|h| h.bg(theme.hover).text_color(theme.text))
         .tooltip(tip("Open attachment preview", theme))
         .on_click(move |_, window, cx| preview_attachment(&preview, theme, window, cx))
 }
@@ -459,6 +495,25 @@ mod tests {
         assert_eq!(mime, "image/png");
         assert_eq!(STANDARD.decode(&*base64).unwrap(), bytes);
         assert!(attach_image("Broken image".into(), &bytes[..8]).is_err());
+    }
+
+    #[test]
+    fn pdfs_attach_as_documents_and_save_for_agents_without_pdf_input() {
+        let dir = std::env::temp_dir().join(format!("kiln-pdf-attachment-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("paper.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7\n\x00\xff").unwrap();
+        let attachment = attach_file(&pdf).unwrap();
+        let AttachmentContent::Document { mime, .. } = &attachment.content else { panic!() };
+        assert_eq!(mime, "application/pdf");
+        let scratch = dir.join("scratch");
+        let prompt = save_documents(&scratch, "Summarize", std::slice::from_ref(&attachment)).unwrap();
+        let saved = prompt.rsplit_once(" is saved at ").unwrap().1;
+        assert!(Path::new(saved).starts_with(&scratch));
+        assert_eq!(std::fs::read(saved).unwrap(), std::fs::read(&pdf).unwrap());
+        std::fs::write(dir.join("binary.bin"), b"\xff\xfe").unwrap();
+        assert!(attach_file(&dir.join("binary.bin")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

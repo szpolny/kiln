@@ -20,6 +20,8 @@ pub struct Attachment {
 pub enum AttachmentContent {
     Text(Arc<str>),
     Image { mime: String, base64: Arc<str> },
+    /// A PDF, which agents read from its bytes rather than as pictures.
+    Document { mime: String, base64: Arc<str> },
     Visualization {
         html: Arc<str>,
         preview: Result<Arc<str>, String>,
@@ -32,7 +34,7 @@ impl Attachment {
     pub fn stored_bytes(&self) -> usize {
         match &self.content {
             AttachmentContent::Text(text) => text.len(),
-            AttachmentContent::Image { base64, .. } => base64.len(),
+            AttachmentContent::Image { base64, .. } | AttachmentContent::Document { base64, .. } => base64.len(),
             AttachmentContent::Visualization { html, preview, dark_preview } => {
                 html.len() + preview.as_ref().map_or_else(|error| error.len(), |png| png.len())
                     + dark_preview.as_ref().map_or(0, |png| png.len())

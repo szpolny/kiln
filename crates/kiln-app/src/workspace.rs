@@ -623,8 +623,13 @@ impl Workspace {
     }
 
     fn steer(&mut self, id: u64, prompt: Prompt, cx: &mut Context<Self>) {
+        let body = match self.store.thread(id).map(|thread| thread.agent) {
+            Some(Agent::Codex) => media::save_documents(&self.scratch_dir(id), &prompt.body, &prompt.attachments),
+            _ => Ok(prompt.body.clone()),
+        };
         let sent = match self.turns.get(&id).filter(|turn| !turn.process.stop_requested()) {
-            Some(turn) => turn.client.steer(&prompt.body, &prompt.attachments),
+            Some(turn) => body.map_err(std::io::Error::other)
+                .and_then(|body| turn.client.steer(&body, &prompt.attachments)),
             None => Err(std::io::Error::other("the turn is ending")),
         };
         let checkout = self.checkout_dir(id);
@@ -786,7 +791,7 @@ impl Workspace {
                 Some(note) => format!("{note}\n\n{prompt}"),
                 None => prompt,
             };
-            let prompt = if let Some(scratch_dir) = scratch {
+            let prompt = if let Some(scratch_dir) = &scratch {
                 let path = scratch_dir.display();
                 format!(
                     "This thread's scratch directory for temporary files, scripts, and previews is {path}. \
@@ -795,6 +800,10 @@ impl Workspace {
                 )
             } else {
                 prompt
+            };
+            let prompt = match &scratch {
+                Some(scratch) if agent == Agent::Codex => media::save_documents(scratch, &prompt, &attachments)?,
+                _ => prompt,
             };
             Ok((dir, Prompt { body: prompt, attachments }))
         });
